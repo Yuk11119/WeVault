@@ -15,4 +15,4 @@ Tools/
 *.log
 tmp/
 temp/
-
+.build/
