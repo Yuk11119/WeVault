@@ -1,26 +1,21 @@
 # WeVault
 
-WeVault helps keep WeChat lightweight by archiving large files and high-quality media to the cloud while preserving everyday chat access.
+WeVault helps reduce WeChat storage usage by moving large files and high-quality media to the cloud, while keeping everyday chats easy to browse.
 
-## What It Does
+## Why WeVault
 
-WeVault is designed to move storage-heavy WeChat assets into recoverable cloud storage while keeping local chat usable for daily viewing.
+WeChat can quietly take up a lot of space over time, especially from large files, original photos, and high-quality videos.
 
-Planned archive targets include:
+WeVault is designed to keep the things you use every day available locally, while moving the heavy originals into cloud storage so they can be restored when needed.
 
-- Large WeChat file attachments
-- High-quality image layers
-- Video raw layers used for high-quality export
+## What You Can Expect
 
-## Product Principles
-
-- Keep normal chat viewing and playback usable.
-- Archive large originals only after cloud verification.
-- Restore exact content by path, size, and SHA-256 when needed.
-- Do not modify WeChat message databases.
-- Do not replace original WeChat payloads with fake placeholder files.
+- Free up local storage used by WeChat.
+- Keep normal chat browsing, image viewing, and video playback usable.
+- Restore archived originals when you need them.
+- Avoid risky one-click deletion.
+- Keep you in control before anything is moved.
 
 ## Status
 
-Early product planning and prototype preparation.
-
+WeVault is currently in early product development.
