@@ -11,6 +11,29 @@ public enum ArchiveStatus: String, Codable, CaseIterable, Sendable {
     case hashed = "HASHED"
     case duplicateGrouped = "DUPLICATE_GROUPED"
     case notArchivable = "NOT_ARCHIVABLE"
+    case uploadPending = "UPLOAD_PENDING"
+    case uploading = "UPLOADING"
+    case uploaded = "UPLOADED"
+    case verified = "VERIFIED"
+    case uploadFailed = "UPLOAD_FAILED"
+    case verifyFailed = "VERIFY_FAILED"
+}
+
+public enum CloudVerifyStatus: String, Codable, CaseIterable, Sendable {
+    case uploaded = "UPLOADED"
+    case verified = "VERIFIED"
+    case uploadFailed = "UPLOAD_FAILED"
+    case verifyFailed = "VERIFY_FAILED"
+}
+
+public enum ArchiveBindingState: String, Codable, CaseIterable, Sendable {
+    case uploaded = "UPLOADED"
+    case verified = "VERIFIED"
+    case verifyFailed = "VERIFY_FAILED"
+}
+
+public enum LocalArchiveState: String, Codable, CaseIterable, Sendable {
+    case localPresent = "LOCAL_PRESENT"
 }
 
 public struct FileRecord: Identifiable, Codable, Hashable, Sendable {
@@ -166,20 +189,161 @@ public struct ScanResult: Codable, Sendable {
     public let summary: ScanSummary
 }
 
+public struct CloudObject: Identifiable, Codable, Hashable, Sendable {
+    public var id: String { cloudObjectID }
+
+    public let cloudObjectID: String
+    public let sha256: String
+    public let sizeBytes: Int64
+    public let storageProvider: String
+    public let bucketOrContainer: String
+    public let objectKey: String
+    public let uploadedAt: Date
+    public let verifiedAt: Date?
+    public let verifyStatus: CloudVerifyStatus
+    public let refCount: Int
+
+    public init(
+        cloudObjectID: String,
+        sha256: String,
+        sizeBytes: Int64,
+        storageProvider: String,
+        bucketOrContainer: String,
+        objectKey: String,
+        uploadedAt: Date,
+        verifiedAt: Date?,
+        verifyStatus: CloudVerifyStatus,
+        refCount: Int
+    ) {
+        self.cloudObjectID = cloudObjectID
+        self.sha256 = sha256
+        self.sizeBytes = sizeBytes
+        self.storageProvider = storageProvider
+        self.bucketOrContainer = bucketOrContainer
+        self.objectKey = objectKey
+        self.uploadedAt = uploadedAt
+        self.verifiedAt = verifiedAt
+        self.verifyStatus = verifyStatus
+        self.refCount = refCount
+    }
+}
+
+public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
+    public var id: String { bindingID }
+
+    public let bindingID: String
+    public let filePath: String
+    public let cloudObjectID: String
+    public let archiveState: ArchiveBindingState
+    public let localState: LocalArchiveState
+
+    public init(
+        bindingID: String,
+        filePath: String,
+        cloudObjectID: String,
+        archiveState: ArchiveBindingState,
+        localState: LocalArchiveState
+    ) {
+        self.bindingID = bindingID
+        self.filePath = filePath
+        self.cloudObjectID = cloudObjectID
+        self.archiveState = archiveState
+        self.localState = localState
+    }
+}
+
+public struct CloudArchiveSnapshot: Codable, Hashable, Sendable {
+    public let object: CloudObject
+    public let binding: ArchiveBinding
+
+    public init(object: CloudObject, binding: ArchiveBinding) {
+        self.object = object
+        self.binding = binding
+    }
+}
+
+public struct ArchivedFile: Identifiable, Codable, Hashable, Sendable {
+    public var id: String { filePath }
+
+    public let filePath: String
+    public let objectType: ArchiveObjectType
+    public let originalFilename: String
+    public let relativePath: String
+    public let accountHash: String
+    public let accountName: String
+    public let month: String?
+    public let sizeBytes: Int64
+    public let sha256: String
+    public let mtime: Date
+    public let familyID: String?
+    public let displayOrPlaybackPath: String?
+    public let bubbleOrThumbPath: String?
+    public let archivedAt: Date
+    public let updatedAt: Date
+
+    public init(
+        filePath: String,
+        objectType: ArchiveObjectType,
+        originalFilename: String,
+        relativePath: String,
+        accountHash: String,
+        accountName: String,
+        month: String?,
+        sizeBytes: Int64,
+        sha256: String,
+        mtime: Date,
+        familyID: String?,
+        displayOrPlaybackPath: String?,
+        bubbleOrThumbPath: String?,
+        archivedAt: Date,
+        updatedAt: Date
+    ) {
+        self.filePath = filePath
+        self.objectType = objectType
+        self.originalFilename = originalFilename
+        self.relativePath = relativePath
+        self.accountHash = accountHash
+        self.accountName = accountName
+        self.month = month
+        self.sizeBytes = sizeBytes
+        self.sha256 = sha256
+        self.mtime = mtime
+        self.familyID = familyID
+        self.displayOrPlaybackPath = displayOrPlaybackPath
+        self.bubbleOrThumbPath = bubbleOrThumbPath
+        self.archivedAt = archivedAt
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct ArchivedFileSnapshot: Codable, Hashable, Sendable {
+    public let archivedFile: ArchivedFile
+    public let binding: ArchiveBinding
+    public let object: CloudObject
+
+    public init(archivedFile: ArchivedFile, binding: ArchiveBinding, object: CloudObject) {
+        self.archivedFile = archivedFile
+        self.binding = binding
+        self.object = object
+    }
+}
+
 public struct S3CompatibleStorageConfig: Codable, Equatable, Sendable {
+    public var provider: String
     public var endpoint: String
     public var bucket: String
     public var region: String
-    public var accessKeyReference: String
-    public var secretKeyReference: String
+    public var accessKeyID: String
+    public var secretAccessKey: String
     public var pathStyle: Bool
 
-    public init(endpoint: String = "", bucket: String = "", region: String = "", accessKeyReference: String = "", secretKeyReference: String = "", pathStyle: Bool = true) {
+    public init(provider: String = "Aliyun OSS", endpoint: String = "https://s3.oss-cn-hangzhou.aliyuncs.com", bucket: String = "wevault-demo-yuk177", region: String = "cn-hangzhou", accessKeyID: String = "", secretAccessKey: String = "", pathStyle: Bool = false) {
+        self.provider = provider
         self.endpoint = endpoint
         self.bucket = bucket
         self.region = region
-        self.accessKeyReference = accessKeyReference
-        self.secretKeyReference = secretKeyReference
+        self.accessKeyID = accessKeyID
+        self.secretAccessKey = secretAccessKey
         self.pathStyle = pathStyle
     }
 }

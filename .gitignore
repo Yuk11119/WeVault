@@ -1,4 +1,5 @@
 .DS_Store
+.gitignore
 
 # Internal research and experiment artifacts
 Docs/

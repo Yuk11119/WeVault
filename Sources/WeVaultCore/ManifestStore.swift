@@ -123,12 +123,77 @@ public final class ManifestStore: @unchecked Sendable {
             updated_at REAL NOT NULL
         )
         """)
+        try execute("""
+        CREATE TABLE IF NOT EXISTS cloud_objects (
+            cloud_object_id TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            storage_provider TEXT NOT NULL,
+            bucket_or_container TEXT NOT NULL,
+            object_key TEXT NOT NULL,
+            uploaded_at REAL NOT NULL,
+            verified_at REAL,
+            verify_status TEXT NOT NULL,
+            ref_count INTEGER NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(storage_provider, bucket_or_container, object_key)
+        )
+        """)
+        try execute("""
+        CREATE TABLE IF NOT EXISTS archive_bindings (
+            binding_id TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            cloud_object_id TEXT NOT NULL,
+            archive_state TEXT NOT NULL,
+            local_state TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(file_path, cloud_object_id),
+            FOREIGN KEY(cloud_object_id) REFERENCES cloud_objects(cloud_object_id)
+        )
+        """)
+        try execute("""
+        CREATE TABLE IF NOT EXISTS archived_files (
+            file_path TEXT PRIMARY KEY,
+            object_type TEXT NOT NULL,
+            original_filename TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            account_hash TEXT NOT NULL,
+            account_name TEXT NOT NULL,
+            month TEXT,
+            size_bytes INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            mtime REAL NOT NULL,
+            family_id TEXT,
+            display_or_playback_path TEXT,
+            bubble_or_thumb_path TEXT,
+            archived_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """)
+        try backfillArchivedFilesFromCurrentSnapshot()
     }
 
     private func clearCurrentSnapshot() throws {
         try execute("DELETE FROM files")
         try execute("DELETE FROM families")
         try execute("DELETE FROM duplicate_groups")
+    }
+
+    private func backfillArchivedFilesFromCurrentSnapshot() throws {
+        try execute("""
+        INSERT OR IGNORE INTO archived_files (
+            file_path, object_type, original_filename, relative_path, account_hash, account_name,
+            month, size_bytes, sha256, mtime, family_id, display_or_playback_path,
+            bubble_or_thumb_path, archived_at, updated_at
+        )
+        SELECT f.path, f.object_type, f.original_filename, f.relative_path, f.account_hash, f.account_name,
+               f.month, f.size_bytes, f.sha256, f.mtime, fam.id, fam.display_or_playback_path,
+               fam.bubble_or_thumb_path, ab.updated_at, strftime('%s','now')
+        FROM archive_bindings ab
+        JOIN files f ON f.path = ab.file_path
+        LEFT JOIN families fam ON fam.high_or_raw_path = f.path
+        WHERE f.sha256 IS NOT NULL
+        """)
     }
 
     private func insert(_ file: FileRecord) throws {
@@ -209,13 +274,244 @@ public final class ManifestStore: @unchecked Sendable {
         }
     }
 
-    private func logOperation(_ event: String, detail: String?) throws {
+    public func verifiedCloudObject(sha256: String, provider: String, bucket: String, objectKey: String) throws -> CloudObject? {
+        let sql = """
+        SELECT cloud_object_id, sha256, size_bytes, storage_provider, bucket_or_container, object_key,
+               uploaded_at, verified_at, verify_status, ref_count
+        FROM cloud_objects
+        WHERE sha256 = ? AND storage_provider = ? AND bucket_or_container = ? AND object_key = ? AND verify_status = ?
+        LIMIT 1
+        """
+        var result: CloudObject?
+        try withStatement(sql) { stmt in
+            bindText(stmt, 1, sha256)
+            bindText(stmt, 2, provider)
+            bindText(stmt, 3, bucket)
+            bindText(stmt, 4, objectKey)
+            bindText(stmt, 5, CloudVerifyStatus.verified.rawValue)
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                result = readCloudObject(stmt)
+            }
+        }
+        return result
+    }
+
+    public func cloudArchiveSnapshots() throws -> [String: CloudArchiveSnapshot] {
+        let sql = """
+        SELECT co.cloud_object_id, co.sha256, co.size_bytes, co.storage_provider, co.bucket_or_container, co.object_key,
+               co.uploaded_at, co.verified_at, co.verify_status, co.ref_count,
+               ab.binding_id, ab.file_path, ab.archive_state, ab.local_state
+        FROM archive_bindings ab
+        JOIN cloud_objects co ON co.cloud_object_id = ab.cloud_object_id
+        """
+        var snapshots: [String: CloudArchiveSnapshot] = [:]
+        try withStatement(sql) { stmt in
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let object = readCloudObject(stmt)
+                let binding = ArchiveBinding(
+                    bindingID: columnText(stmt, 10),
+                    filePath: columnText(stmt, 11),
+                    cloudObjectID: object.cloudObjectID,
+                    archiveState: ArchiveBindingState(rawValue: columnText(stmt, 12)) ?? .uploaded,
+                    localState: LocalArchiveState(rawValue: columnText(stmt, 13)) ?? .localPresent
+                )
+                snapshots[binding.filePath] = CloudArchiveSnapshot(object: object, binding: binding)
+            }
+        }
+        return snapshots
+    }
+
+    public func archivedFileSnapshots() throws -> [String: ArchivedFileSnapshot] {
+        let sql = """
+        SELECT af.file_path, af.object_type, af.original_filename, af.relative_path, af.account_hash, af.account_name,
+               af.month, af.size_bytes, af.sha256, af.mtime, af.family_id, af.display_or_playback_path,
+               af.bubble_or_thumb_path, af.archived_at, af.updated_at,
+               ab.binding_id, ab.archive_state, ab.local_state,
+               co.cloud_object_id, co.sha256, co.size_bytes, co.storage_provider, co.bucket_or_container, co.object_key,
+               co.uploaded_at, co.verified_at, co.verify_status, co.ref_count
+        FROM archived_files af
+        JOIN archive_bindings ab ON ab.file_path = af.file_path
+        JOIN cloud_objects co ON co.cloud_object_id = ab.cloud_object_id
+        """
+        var snapshots: [String: ArchivedFileSnapshot] = [:]
+        try withStatement(sql) { stmt in
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let archivedFile = readArchivedFile(stmt)
+                let binding = ArchiveBinding(
+                    bindingID: columnText(stmt, 15),
+                    filePath: archivedFile.filePath,
+                    cloudObjectID: columnText(stmt, 18),
+                    archiveState: ArchiveBindingState(rawValue: columnText(stmt, 16)) ?? .uploaded,
+                    localState: LocalArchiveState(rawValue: columnText(stmt, 17)) ?? .localPresent
+                )
+                let object = readCloudObject(stmt, offset: 18)
+                snapshots[archivedFile.filePath] = ArchivedFileSnapshot(archivedFile: archivedFile, binding: binding, object: object)
+            }
+        }
+        return snapshots
+    }
+
+    public func saveCloudObject(_ object: CloudObject, binding: ArchiveBinding, archivedFile: ArchivedFile) throws {
+        try execute("BEGIN IMMEDIATE TRANSACTION")
+        do {
+            try upsert(object)
+            try upsert(binding)
+            try upsert(archivedFile)
+            try refreshRefCount(cloudObjectID: object.cloudObjectID)
+            try execute("COMMIT")
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    public func updateFileStatus(path: String, status: ArchiveStatus) throws {
+        try withStatement("UPDATE files SET status = ?, updated_at = ? WHERE path = ?") { stmt in
+            bindText(stmt, 1, status.rawValue)
+            sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
+            bindText(stmt, 3, path)
+            try stepDone(stmt)
+        }
+    }
+
+    public func logOperation(_ event: String, detail: String?) throws {
         try withStatement("INSERT INTO operations (event, detail, created_at) VALUES (?, ?, ?)") { stmt in
             bindText(stmt, 1, event)
             bindOptionalText(stmt, 2, detail)
             sqlite3_bind_double(stmt, 3, Date().timeIntervalSince1970)
             try stepDone(stmt)
         }
+    }
+
+    private func upsert(_ object: CloudObject) throws {
+        let sql = """
+        INSERT OR REPLACE INTO cloud_objects (
+            cloud_object_id, sha256, size_bytes, storage_provider, bucket_or_container, object_key,
+            uploaded_at, verified_at, verify_status, ref_count, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        try withStatement(sql) { stmt in
+            bindText(stmt, 1, object.cloudObjectID)
+            bindText(stmt, 2, object.sha256)
+            sqlite3_bind_int64(stmt, 3, object.sizeBytes)
+            bindText(stmt, 4, object.storageProvider)
+            bindText(stmt, 5, object.bucketOrContainer)
+            bindText(stmt, 6, object.objectKey)
+            sqlite3_bind_double(stmt, 7, object.uploadedAt.timeIntervalSince1970)
+            bindOptionalDate(stmt, 8, object.verifiedAt)
+            bindText(stmt, 9, object.verifyStatus.rawValue)
+            sqlite3_bind_int(stmt, 10, Int32(object.refCount))
+            sqlite3_bind_double(stmt, 11, Date().timeIntervalSince1970)
+            try stepDone(stmt)
+        }
+    }
+
+    private func upsert(_ binding: ArchiveBinding) throws {
+        let sql = """
+        INSERT OR REPLACE INTO archive_bindings (
+            binding_id, file_path, cloud_object_id, archive_state, local_state, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """
+        try withStatement(sql) { stmt in
+            bindText(stmt, 1, binding.bindingID)
+            bindText(stmt, 2, binding.filePath)
+            bindText(stmt, 3, binding.cloudObjectID)
+            bindText(stmt, 4, binding.archiveState.rawValue)
+            bindText(stmt, 5, binding.localState.rawValue)
+            sqlite3_bind_double(stmt, 6, Date().timeIntervalSince1970)
+            try stepDone(stmt)
+        }
+    }
+
+    private func upsert(_ archivedFile: ArchivedFile) throws {
+        let sql = """
+        INSERT INTO archived_files (
+            file_path, object_type, original_filename, relative_path, account_hash, account_name,
+            month, size_bytes, sha256, mtime, family_id, display_or_playback_path,
+            bubble_or_thumb_path, archived_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(file_path) DO UPDATE SET
+            object_type = excluded.object_type,
+            original_filename = excluded.original_filename,
+            relative_path = excluded.relative_path,
+            account_hash = excluded.account_hash,
+            account_name = excluded.account_name,
+            month = excluded.month,
+            size_bytes = excluded.size_bytes,
+            sha256 = excluded.sha256,
+            mtime = excluded.mtime,
+            family_id = excluded.family_id,
+            display_or_playback_path = excluded.display_or_playback_path,
+            bubble_or_thumb_path = excluded.bubble_or_thumb_path,
+            updated_at = excluded.updated_at
+        """
+        try withStatement(sql) { stmt in
+            bindText(stmt, 1, archivedFile.filePath)
+            bindText(stmt, 2, archivedFile.objectType.rawValue)
+            bindText(stmt, 3, archivedFile.originalFilename)
+            bindText(stmt, 4, archivedFile.relativePath)
+            bindText(stmt, 5, archivedFile.accountHash)
+            bindText(stmt, 6, archivedFile.accountName)
+            bindOptionalText(stmt, 7, archivedFile.month)
+            sqlite3_bind_int64(stmt, 8, archivedFile.sizeBytes)
+            bindText(stmt, 9, archivedFile.sha256)
+            sqlite3_bind_double(stmt, 10, archivedFile.mtime.timeIntervalSince1970)
+            bindOptionalText(stmt, 11, archivedFile.familyID)
+            bindOptionalText(stmt, 12, archivedFile.displayOrPlaybackPath)
+            bindOptionalText(stmt, 13, archivedFile.bubbleOrThumbPath)
+            sqlite3_bind_double(stmt, 14, archivedFile.archivedAt.timeIntervalSince1970)
+            sqlite3_bind_double(stmt, 15, archivedFile.updatedAt.timeIntervalSince1970)
+            try stepDone(stmt)
+        }
+    }
+
+    private func refreshRefCount(cloudObjectID: String) throws {
+        let sql = """
+        UPDATE cloud_objects
+        SET ref_count = (SELECT COUNT(*) FROM archive_bindings WHERE cloud_object_id = ?), updated_at = ?
+        WHERE cloud_object_id = ?
+        """
+        try withStatement(sql) { stmt in
+            bindText(stmt, 1, cloudObjectID)
+            sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
+            bindText(stmt, 3, cloudObjectID)
+            try stepDone(stmt)
+        }
+    }
+
+    private func readArchivedFile(_ stmt: OpaquePointer?) -> ArchivedFile {
+        ArchivedFile(
+            filePath: columnText(stmt, 0),
+            objectType: ArchiveObjectType(rawValue: columnText(stmt, 1)) ?? .ordinaryFile,
+            originalFilename: columnText(stmt, 2),
+            relativePath: columnText(stmt, 3),
+            accountHash: columnText(stmt, 4),
+            accountName: columnText(stmt, 5),
+            month: optionalText(stmt, 6),
+            sizeBytes: sqlite3_column_int64(stmt, 7),
+            sha256: columnText(stmt, 8),
+            mtime: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 9)),
+            familyID: optionalText(stmt, 10),
+            displayOrPlaybackPath: optionalText(stmt, 11),
+            bubbleOrThumbPath: optionalText(stmt, 12),
+            archivedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 13)),
+            updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 14))
+        )
+    }
+
+    private func readCloudObject(_ stmt: OpaquePointer?, offset: Int32 = 0) -> CloudObject {
+        CloudObject(
+            cloudObjectID: columnText(stmt, offset),
+            sha256: columnText(stmt, offset + 1),
+            sizeBytes: sqlite3_column_int64(stmt, offset + 2),
+            storageProvider: columnText(stmt, offset + 3),
+            bucketOrContainer: columnText(stmt, offset + 4),
+            objectKey: columnText(stmt, offset + 5),
+            uploadedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, offset + 6)),
+            verifiedAt: optionalDate(stmt, offset + 7),
+            verifyStatus: CloudVerifyStatus(rawValue: columnText(stmt, offset + 8)) ?? .uploaded,
+            refCount: Int(sqlite3_column_int(stmt, offset + 9))
+        )
     }
 
     private func execute(_ sql: String) throws {
@@ -268,6 +564,33 @@ private func bindOptionalText(_ stmt: OpaquePointer?, _ index: Int32, _ value: S
     } else {
         sqlite3_bind_null(stmt, index)
     }
+}
+
+private func bindOptionalDate(_ stmt: OpaquePointer?, _ index: Int32, _ value: Date?) {
+    if let value {
+        sqlite3_bind_double(stmt, index, value.timeIntervalSince1970)
+    } else {
+        sqlite3_bind_null(stmt, index)
+    }
+}
+
+private func optionalDate(_ stmt: OpaquePointer?, _ index: Int32) -> Date? {
+    if sqlite3_column_type(stmt, index) == SQLITE_NULL {
+        return nil
+    }
+    return Date(timeIntervalSince1970: sqlite3_column_double(stmt, index))
+}
+
+private func columnText(_ stmt: OpaquePointer?, _ index: Int32) -> String {
+    guard let value = sqlite3_column_text(stmt, index) else { return "" }
+    return String(cString: value)
+}
+
+private func optionalText(_ stmt: OpaquePointer?, _ index: Int32) -> String? {
+    if sqlite3_column_type(stmt, index) == SQLITE_NULL {
+        return nil
+    }
+    return columnText(stmt, index)
 }
 
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)

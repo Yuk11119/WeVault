@@ -4,6 +4,7 @@ import WeVaultCore
 struct DetailView: View {
     let file: FileRecord?
     let families: [FamilyRecord]
+    let cloudSnapshot: CloudArchiveSnapshot?
 
     var family: FamilyRecord? {
         guard let file else { return nil }
@@ -37,6 +38,21 @@ struct DetailView: View {
                             row("inode / nlink", "\(file.inode) / \(file.nlink)")
                             row("mtime", file.mtime.formatted(date: .numeric, time: .standard))
                             row("重复组", file.duplicateGroupID ?? "-")
+                        }
+
+                        if let cloudSnapshot {
+                            detailSection("云端") {
+                                row("Cloud Object ID", cloudSnapshot.object.cloudObjectID)
+                                row("Provider", cloudSnapshot.object.storageProvider)
+                                row("Bucket", cloudSnapshot.object.bucketOrContainer)
+                                row("Object Key", cloudSnapshot.object.objectKey)
+                                row("上传时间", cloudSnapshot.object.uploadedAt.formatted(date: .numeric, time: .standard))
+                                row("校验时间", cloudSnapshot.object.verifiedAt?.formatted(date: .numeric, time: .standard) ?? "-")
+                                row("校验状态", cloudSnapshot.object.verifyStatus.rawValue)
+                                row("引用数量", "\(cloudSnapshot.object.refCount)")
+                                row("Binding", cloudSnapshot.binding.bindingID)
+                                row("本地状态", cloudSnapshot.binding.localState.rawValue)
+                            }
                         }
 
                         if let family {

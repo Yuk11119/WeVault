@@ -5,6 +5,7 @@ public enum WeVaultError: Error, LocalizedError {
     case invalidScanRoot(String)
     case sqlite(String)
     case fileSystem(String)
+    case cloud(String)
 
     public var errorDescription: String? {
         switch self {
@@ -14,6 +15,8 @@ public enum WeVaultError: Error, LocalizedError {
             return "SQLite error: \(value)"
         case .fileSystem(let value):
             return "File system error: \(value)"
+        case .cloud(let value):
+            return "Cloud error: \(value)"
         }
     }
 }

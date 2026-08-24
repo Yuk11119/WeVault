@@ -19,7 +19,7 @@ struct ContentView: View {
             recordList
                 .frame(minWidth: 440, idealWidth: 680)
                 .frame(maxHeight: .infinity, alignment: .topLeading)
-            DetailView(file: selectedFile, families: viewModel.result?.families ?? [])
+            DetailView(file: selectedFile, families: viewModel.result?.families ?? [], cloudSnapshot: selectedFile.flatMap { viewModel.cloudSnapshots[$0.path] })
                 .frame(minWidth: 280, idealWidth: 420)
                 .frame(maxHeight: .infinity, alignment: .topLeading)
         }
@@ -74,6 +74,26 @@ struct ContentView: View {
                     ProgressView("只读扫描中...")
                 }
 
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("云端上传")
+                        .font(.headline)
+                    Text(viewModel.uploadScopeSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("上传本次扫描的可归档对象", action: viewModel.uploadHashedCandidates)
+                        .disabled(!viewModel.canUpload)
+                    if viewModel.isUploading {
+                        ProgressView("上传并校验中...")
+                    }
+                    if !viewModel.uploadMessage.isEmpty {
+                        Text(viewModel.uploadMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
                 if let result = viewModel.result {
                     SummaryGrid(summary: result.summary)
                     Text("Manifest: \(viewModel.manifestURL.path)")
@@ -84,7 +104,7 @@ struct ContentView: View {
                         .textSelection(.enabled)
                 }
 
-                Text("本 demo 不上传、不释放、不移动微信文件，不修改微信数据库。")
+                Text("本 demo 会上传并校验云端副本；不释放、不移动、不删除微信文件，不修改微信数据库。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -167,8 +187,13 @@ struct ContentView: View {
                         Text(file.status.rawValue)
                     }
                     .width(130)
+
+                    TableColumn("云端") { file in
+                        Text(viewModel.cloudStatus(for: file))
+                    }
+                    .width(92)
                 }
-                .frame(minWidth: 914)
+                .frame(minWidth: 1006)
             }
         }
     }
@@ -208,11 +233,15 @@ final class ScanViewModel: ObservableObject {
     @Published var alertMessage: String?
     @Published var largeFileThresholdMB: Double = 50
     @Published var filter: RecordFilter = .all
+    @Published var storageConfig = LocalStorageConfig.load()
+    @Published var cloudSnapshots: [String: CloudArchiveSnapshot] = [:]
+    @Published var isUploading = false
+    @Published var uploadMessage = ""
 
     let manifestURL = ManifestStore.defaultDatabaseURL()
 
     init() {
-        selectedRoot = WeChatDirectory.defaultXWeChatFilesURL()
+        selectedRoot = nil
     }
 
     var filteredFiles: [FileRecord] {
@@ -231,6 +260,32 @@ final class ScanViewModel: ObservableObject {
         }
     }
 
+    var canUpload: Bool {
+        result != nil &&
+            !isScanning &&
+            !isUploading &&
+            !storageConfig.endpoint.isEmpty &&
+            !storageConfig.bucket.isEmpty &&
+            !storageConfig.accessKeyID.isEmpty &&
+            !storageConfig.secretAccessKey.isEmpty
+    }
+
+    var uploadScopeSummary: String {
+        guard let files = result?.files else {
+            return "扫描后可上传已有 SHA 的可归档对象；普通重复文件云端只保存一份。"
+        }
+        let uploadable = uploadableFiles(from: files)
+        guard !uploadable.isEmpty else {
+            return "当前没有可上传对象。普通文件只有重复 size 组会在 Phase 1 计算 SHA；图片高清层和视频 Raw 候选会计算 SHA。"
+        }
+        let ordinary = uploadable.filter { $0.objectType == .ordinaryFile }.count
+        let image = uploadable.filter { $0.objectType == .imageHighLayer }.count
+        let video = uploadable.filter { $0.objectType == .videoRawLayer }.count
+        let uniqueObjects = Dictionary(grouping: uploadable, by: { $0.sha256 ?? $0.path }).values.compactMap(\.first)
+        let uniqueBytes = uniqueObjects.reduce(Int64(0)) { $0 + $1.sizeBytes }
+        return "将上传本次扫描中已有 SHA 且可归档的对象：普通文件 \(ordinary) 项、图片高清层 \(image) 项、视频 Raw 层 \(video) 项；按 SHA 去重后云端对象 \(uniqueObjects.count) 个，约 \(humanBytes(uniqueBytes))。不会上传无 SHA、不可归档项，也不会移动或删除本地文件。"
+    }
+
     func scan() {
         guard let selectedRoot else { return }
         isScanning = true
@@ -244,14 +299,66 @@ final class ScanViewModel: ObservableObject {
                     let result = try scanner.scan(root: selectedRoot, options: ScanOptions(largeFileThresholdBytes: threshold))
                     let store = try ManifestStore()
                     try store.save(scanResult: result)
-                    return result
+                    let snapshots = try store.cloudArchiveSnapshots()
+                    return (result, snapshots)
                 }.value
-                result = scanResult
+                result = scanResult.0
+                cloudSnapshots = scanResult.1
             } catch {
                 alertMessage = error.localizedDescription
             }
             isScanning = false
         }
+    }
+
+    func uploadHashedCandidates() {
+        guard let files = result?.files else { return }
+        isUploading = true
+        alertMessage = nil
+        uploadMessage = "准备上传：\(uploadableFiles(from: files).count) 项绑定"
+        let config = storageConfig
+
+        Task {
+            do {
+                let service = CloudUploadService()
+                let snapshots = try await service.upload(files: files, families: result?.families ?? [], config: config, store: ManifestStore()) { [weak self] progress in
+                    await MainActor.run {
+                        self?.apply(progress)
+                    }
+                }
+                cloudSnapshots = snapshots
+                uploadMessage = "上传完成：已校验 \(snapshots.values.filter { $0.object.verifyStatus == .verified }.count) 项绑定"
+            } catch {
+                alertMessage = error.localizedDescription
+            }
+            isUploading = false
+        }
+    }
+
+    func cloudStatus(for file: FileRecord) -> String {
+        if let snapshot = cloudSnapshots[file.path] {
+            return snapshot.object.verifyStatus.rawValue
+        }
+        if file.sha256 == nil {
+            return "无 SHA"
+        }
+        if file.status == .notArchivable {
+            return "不可归档"
+        }
+        return "未上传"
+    }
+
+    private func apply(_ progress: CloudUploadProgress) {
+        uploadMessage = progress.message ?? "\(URL(fileURLWithPath: progress.filePath).lastPathComponent): \(progress.status.rawValue)"
+        guard var current = result else { return }
+        if let index = current.files.firstIndex(where: { $0.path == progress.filePath }) {
+            current.files[index].status = progress.status
+            result = current
+        }
+    }
+
+    private func uploadableFiles(from files: [FileRecord]) -> [FileRecord] {
+        files.filter { $0.sha256 != nil && $0.status != .notArchivable }
     }
 }
 
