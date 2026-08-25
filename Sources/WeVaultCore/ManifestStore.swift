@@ -146,11 +146,15 @@ public final class ManifestStore: @unchecked Sendable {
             cloud_object_id TEXT NOT NULL,
             archive_state TEXT NOT NULL,
             local_state TEXT NOT NULL,
+            restored_at REAL,
+            last_restore_check_at REAL,
             updated_at REAL NOT NULL,
             UNIQUE(file_path, cloud_object_id),
             FOREIGN KEY(cloud_object_id) REFERENCES cloud_objects(cloud_object_id)
         )
         """)
+        try addColumnIfNeeded(table: "archive_bindings", definition: "restored_at REAL")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "last_restore_check_at REAL")
         try execute("""
         CREATE TABLE IF NOT EXISTS archived_files (
             file_path TEXT PRIMARY KEY,
@@ -300,7 +304,7 @@ public final class ManifestStore: @unchecked Sendable {
         let sql = """
         SELECT co.cloud_object_id, co.sha256, co.size_bytes, co.storage_provider, co.bucket_or_container, co.object_key,
                co.uploaded_at, co.verified_at, co.verify_status, co.ref_count,
-               ab.binding_id, ab.file_path, ab.archive_state, ab.local_state
+               ab.binding_id, ab.file_path, ab.archive_state, ab.local_state, ab.restored_at, ab.last_restore_check_at
         FROM archive_bindings ab
         JOIN cloud_objects co ON co.cloud_object_id = ab.cloud_object_id
         """
@@ -313,7 +317,9 @@ public final class ManifestStore: @unchecked Sendable {
                     filePath: columnText(stmt, 11),
                     cloudObjectID: object.cloudObjectID,
                     archiveState: ArchiveBindingState(rawValue: columnText(stmt, 12)) ?? .uploaded,
-                    localState: LocalArchiveState(rawValue: columnText(stmt, 13)) ?? .localPresent
+                    localState: LocalArchiveState(rawValue: columnText(stmt, 13)) ?? .localPresent,
+                    restoredAt: optionalDate(stmt, 14),
+                    lastRestoreCheckAt: optionalDate(stmt, 15)
                 )
                 snapshots[binding.filePath] = CloudArchiveSnapshot(object: object, binding: binding)
             }
@@ -326,7 +332,7 @@ public final class ManifestStore: @unchecked Sendable {
         SELECT af.file_path, af.object_type, af.original_filename, af.relative_path, af.account_hash, af.account_name,
                af.month, af.size_bytes, af.sha256, af.mtime, af.family_id, af.display_or_playback_path,
                af.bubble_or_thumb_path, af.archived_at, af.updated_at,
-               ab.binding_id, ab.archive_state, ab.local_state,
+               ab.binding_id, ab.archive_state, ab.local_state, ab.restored_at, ab.last_restore_check_at,
                co.cloud_object_id, co.sha256, co.size_bytes, co.storage_provider, co.bucket_or_container, co.object_key,
                co.uploaded_at, co.verified_at, co.verify_status, co.ref_count
         FROM archived_files af
@@ -340,15 +346,33 @@ public final class ManifestStore: @unchecked Sendable {
                 let binding = ArchiveBinding(
                     bindingID: columnText(stmt, 15),
                     filePath: archivedFile.filePath,
-                    cloudObjectID: columnText(stmt, 18),
+                    cloudObjectID: columnText(stmt, 20),
                     archiveState: ArchiveBindingState(rawValue: columnText(stmt, 16)) ?? .uploaded,
-                    localState: LocalArchiveState(rawValue: columnText(stmt, 17)) ?? .localPresent
+                    localState: LocalArchiveState(rawValue: columnText(stmt, 17)) ?? .localPresent,
+                    restoredAt: optionalDate(stmt, 18),
+                    lastRestoreCheckAt: optionalDate(stmt, 19)
                 )
-                let object = readCloudObject(stmt, offset: 18)
+                let object = readCloudObject(stmt, offset: 20)
                 snapshots[archivedFile.filePath] = ArchivedFileSnapshot(archivedFile: archivedFile, binding: binding, object: object)
             }
         }
         return snapshots
+    }
+
+    public func updateRestoreState(bindingID: String, archiveState: ArchiveBindingState, localState: LocalArchiveState, restoredAt: Date?, lastRestoreCheckAt: Date?) throws {
+        try withStatement("""
+        UPDATE archive_bindings
+        SET archive_state = ?, local_state = ?, restored_at = ?, last_restore_check_at = ?, updated_at = ?
+        WHERE binding_id = ?
+        """) { stmt in
+            bindText(stmt, 1, archiveState.rawValue)
+            bindText(stmt, 2, localState.rawValue)
+            bindOptionalDate(stmt, 3, restoredAt)
+            bindOptionalDate(stmt, 4, lastRestoreCheckAt)
+            sqlite3_bind_double(stmt, 5, Date().timeIntervalSince1970)
+            bindText(stmt, 6, bindingID)
+            try stepDone(stmt)
+        }
     }
 
     public func saveCloudObject(_ object: CloudObject, binding: ArchiveBinding, archivedFile: ArchivedFile) throws {
@@ -409,8 +433,8 @@ public final class ManifestStore: @unchecked Sendable {
     private func upsert(_ binding: ArchiveBinding) throws {
         let sql = """
         INSERT OR REPLACE INTO archive_bindings (
-            binding_id, file_path, cloud_object_id, archive_state, local_state, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            binding_id, file_path, cloud_object_id, archive_state, local_state, restored_at, last_restore_check_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """
         try withStatement(sql) { stmt in
             bindText(stmt, 1, binding.bindingID)
@@ -418,7 +442,9 @@ public final class ManifestStore: @unchecked Sendable {
             bindText(stmt, 3, binding.cloudObjectID)
             bindText(stmt, 4, binding.archiveState.rawValue)
             bindText(stmt, 5, binding.localState.rawValue)
-            sqlite3_bind_double(stmt, 6, Date().timeIntervalSince1970)
+            bindOptionalDate(stmt, 6, binding.restoredAt)
+            bindOptionalDate(stmt, 7, binding.lastRestoreCheckAt)
+            sqlite3_bind_double(stmt, 8, Date().timeIntervalSince1970)
             try stepDone(stmt)
         }
     }

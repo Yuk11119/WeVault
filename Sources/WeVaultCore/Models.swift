@@ -30,10 +30,15 @@ public enum ArchiveBindingState: String, Codable, CaseIterable, Sendable {
     case uploaded = "UPLOADED"
     case verified = "VERIFIED"
     case verifyFailed = "VERIFY_FAILED"
+    case restorePending = "RESTORE_PENDING"
+    case restored = "RESTORED"
+    case restoreFailed = "RESTORE_FAILED"
 }
 
 public enum LocalArchiveState: String, Codable, CaseIterable, Sendable {
     case localPresent = "LOCAL_PRESENT"
+    case restored = "RESTORED"
+    case restoreFailed = "RESTORE_FAILED"
 }
 
 public struct FileRecord: Identifiable, Codable, Hashable, Sendable {
@@ -236,19 +241,25 @@ public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
     public let cloudObjectID: String
     public let archiveState: ArchiveBindingState
     public let localState: LocalArchiveState
+    public let restoredAt: Date?
+    public let lastRestoreCheckAt: Date?
 
     public init(
         bindingID: String,
         filePath: String,
         cloudObjectID: String,
         archiveState: ArchiveBindingState,
-        localState: LocalArchiveState
+        localState: LocalArchiveState,
+        restoredAt: Date? = nil,
+        lastRestoreCheckAt: Date? = nil
     ) {
         self.bindingID = bindingID
         self.filePath = filePath
         self.cloudObjectID = cloudObjectID
         self.archiveState = archiveState
         self.localState = localState
+        self.restoredAt = restoredAt
+        self.lastRestoreCheckAt = lastRestoreCheckAt
     }
 }
 

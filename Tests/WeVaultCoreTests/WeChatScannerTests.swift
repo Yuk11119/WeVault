@@ -29,6 +29,20 @@ struct WeChatScannerTests {
         #expect(duplicateFiles.allSatisfy { $0.sha256 != nil })
     }
 
+    @Test("hashes unique ordinary files at or above large threshold")
+    func hashesLargeUniqueOrdinaryFiles() throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+
+        let result = try WeChatScanner().scan(root: fixture.root, options: ScanOptions(largeFileThresholdBytes: 20))
+        let largeUnique = try #require(result.files.first { $0.filename == "c.zip" })
+
+        #expect(result.summary.largeOrdinaryCount == 1)
+        #expect(largeUnique.sha256 != nil)
+        #expect(largeUnique.status == .hashed)
+        #expect(largeUnique.candidateReason == "普通大文件候选：达到当前阈值 20 B")
+    }
+
     @Test("manifest can be saved repeatedly")
     func manifestCanBeSavedRepeatedly() throws {
         let fixture = try Fixture()
@@ -108,6 +122,32 @@ struct WeChatScannerTests {
         #expect(!uploadedPaths.contains("solo_raw.mp4"))
     }
 
+    @Test("cloud upload includes unique ordinary files at large threshold")
+    func cloudUploadIncludesLargeUniqueOrdinaryFiles() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root, options: ScanOptions(largeFileThresholdBytes: 20))
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+
+        let client = MockObjectStorageClient()
+        _ = try await CloudUploadService { _ in client }.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+
+        let uploadedPaths = Set(client.uploadedLocalURLs.map(\.lastPathComponent))
+        #expect(uploadedPaths.contains("c.zip"))
+        #expect(try fixture.countRows(table: "archived_files", whereClause: "original_filename = 'c.zip'") == 1)
+
+        let archive = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.originalFilename == "c.zip" })
+        let restored = try await CloudRestoreService { _ in client }.restore(
+            snapshot: archive,
+            destination: .directory(fixture.restoreRoot),
+            config: fixture.storageConfig,
+            store: store
+        )
+        #expect(restored.destinationURL.lastPathComponent == "c.zip")
+        #expect(try sha256File(restored.destinationURL) == archive.archivedFile.sha256)
+    }
+
     @Test("manifest scan refresh preserves cloud archive records")
     func manifestScanRefreshPreservesCloudRecords() async throws {
         let fixture = try Fixture()
@@ -155,17 +195,158 @@ struct WeChatScannerTests {
         #expect(removedArchive?.binding.localState == .localPresent)
         #expect(removedArchive?.object.verifyStatus == .verified)
     }
+
+    @Test("cloud restore downloads verified object and checks sha")
+    func cloudRestoreDownloadsVerifiedObject() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+
+        let client = MockObjectStorageClient()
+        let uploadService = CloudUploadService { _ in client }
+        _ = try await uploadService.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+
+        let archived = try store.archivedFileSnapshots()
+        let source = try #require(archived.values.first { $0.archivedFile.originalFilename == "photo_h.dat" })
+        let restored = try await CloudRestoreService { _ in client }.restore(
+            snapshot: source,
+            destination: .directory(fixture.restoreRoot),
+            config: fixture.storageConfig,
+            store: store
+        )
+
+        #expect(restored.destinationURL.lastPathComponent == "photo_h.dat")
+        #expect(restored.sha256 == source.archivedFile.sha256)
+        #expect(try sha256File(restored.destinationURL) == source.archivedFile.sha256)
+        #expect(try fixture.countRows(table: "archive_bindings", whereClause: "archive_state = 'RESTORED'") == 1)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RESTORE_FINISHED'") == 1)
+    }
+
+    @Test("cloud restore records failure when downloaded sha mismatches")
+    func cloudRestoreRecordsHashFailure() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+
+        let client = MockObjectStorageClient(downloadOverride: Data("wrong-content".utf8))
+        let uploadService = CloudUploadService { _ in client }
+        _ = try await uploadService.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+
+        let source = try #require(try store.archivedFileSnapshots().values.first)
+        await #expect(throws: WeVaultError.self) {
+            _ = try await CloudRestoreService { _ in client }.restore(
+                snapshot: source,
+                destination: .directory(fixture.restoreRoot),
+                config: fixture.storageConfig,
+                store: store
+            )
+        }
+
+        #expect(try fixture.countRows(table: "archive_bindings", whereClause: "archive_state = 'RESTORE_FAILED'") == 1)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RESTORE_FAILED'") == 1)
+    }
+
+    @Test("cloud restore rejects unverified archive objects")
+    func cloudRestoreRejectsUnverifiedObjects() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+
+        let client = MockObjectStorageClient(headSizeDelta: 1)
+        let uploadService = CloudUploadService { _ in client }
+        _ = try await uploadService.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+
+        let source = try #require(try store.archivedFileSnapshots().values.first)
+        await #expect(throws: WeVaultError.self) {
+            _ = try await CloudRestoreService { _ in client }.restore(
+                snapshot: source,
+                destination: .directory(fixture.restoreRoot),
+                config: fixture.storageConfig,
+                store: store
+            )
+        }
+
+        #expect(client.downloadedKeys.isEmpty)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RESTORE_STARTED'") == 0)
+    }
+
+    @Test("cloud restore duplicate bindings use their own filenames")
+    func cloudRestoreDuplicateBindingsUseOwnFilenames() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+
+        let client = MockObjectStorageClient()
+        _ = try await CloudUploadService { _ in client }.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+
+        let duplicates = try store.archivedFileSnapshots().values
+            .filter { $0.archivedFile.sha256 == result.duplicateGroups[0].sha256 }
+            .sorted { $0.archivedFile.originalFilename < $1.archivedFile.originalFilename }
+        #expect(duplicates.count == 2)
+
+        let restoreService = CloudRestoreService { _ in client }
+        let first = try await restoreService.restore(snapshot: duplicates[0], destination: .directory(fixture.restoreRoot), config: fixture.storageConfig, store: store)
+        let second = try await restoreService.restore(snapshot: duplicates[1], destination: .directory(fixture.restoreRoot), config: fixture.storageConfig, store: store)
+
+        #expect(Set([first.destinationURL.lastPathComponent, second.destinationURL.lastPathComponent]) == Set(["a.pdf", "b.pdf"]))
+        let firstSHA = try sha256File(first.destinationURL)
+        let secondSHA = try sha256File(second.destinationURL)
+        #expect(firstSHA == secondSHA)
+        #expect(client.downloadedKeys.count == 2)
+    }
+
+    @Test("cloud restore media layers keep family targets")
+    func cloudRestoreMediaLayersKeepFamilyTargets() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+
+        let client = MockObjectStorageClient()
+        _ = try await CloudUploadService { _ in client }.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+        let archived = try store.archivedFileSnapshots()
+        let image = try #require(archived.values.first { $0.archivedFile.objectType == .imageHighLayer })
+        let video = try #require(archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
+
+        #expect(image.archivedFile.displayOrPlaybackPath?.hasSuffix("photo.dat") == true)
+        #expect(video.archivedFile.displayOrPlaybackPath?.hasSuffix("clip.mp4") == true)
+
+        try FileManager.default.removeItem(atPath: image.archivedFile.filePath)
+        try FileManager.default.removeItem(atPath: video.archivedFile.filePath)
+
+        let restoreService = CloudRestoreService { _ in client }
+        let restoredImage = try await restoreService.restore(snapshot: image, destination: .originalPath, config: fixture.storageConfig, store: store)
+        let restoredVideo = try await restoreService.restore(snapshot: video, destination: .originalPath, config: fixture.storageConfig, store: store)
+
+        #expect(restoredImage.destinationURL.path == image.archivedFile.filePath)
+        #expect(restoredImage.destinationURL.lastPathComponent == "photo_h.dat")
+        #expect(restoredVideo.destinationURL.path == video.archivedFile.filePath)
+        #expect(restoredVideo.destinationURL.lastPathComponent == "clip_raw.mp4")
+        #expect(try sha256File(restoredImage.destinationURL) == image.archivedFile.sha256)
+        #expect(try sha256File(restoredVideo.destinationURL) == video.archivedFile.sha256)
+    }
 }
 
 private struct Fixture {
     let temp: URL
     let root: URL
     let account: URL
+    let restoreRoot: URL
 
     init() throws {
         temp = FileManager.default.temporaryDirectory.appendingPathComponent("WeVaultTests-\(UUID().uuidString)", isDirectory: true)
         root = temp.appendingPathComponent("xwechat_files", isDirectory: true)
         account = root.appendingPathComponent("wxid_demo", isDirectory: true)
+        restoreRoot = temp.appendingPathComponent("restores", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
 
@@ -228,20 +409,34 @@ private final class MockObjectStorageClient: ObjectStorageClient, @unchecked Sen
     var putKeys: [String] = []
     var uploadedLocalURLs: [URL] = []
     var sizesByKey: [String: Int64] = [:]
+    var dataByKey: [String: Data] = [:]
+    var downloadedKeys: [String] = []
     let headSizeDelta: Int64
+    let downloadOverride: Data?
 
-    init(headSizeDelta: Int64 = 0) {
+    init(headSizeDelta: Int64 = 0, downloadOverride: Data? = nil) {
         self.headSizeDelta = headSizeDelta
+        self.downloadOverride = downloadOverride
     }
 
     func putObject(localURL: URL, objectKey: String, sha256: String, sizeBytes: Int64) async throws {
         putKeys.append(objectKey)
         uploadedLocalURLs.append(localURL)
         sizesByKey[objectKey] = sizeBytes
+        dataByKey[objectKey] = try Data(contentsOf: localURL)
     }
 
     func headObject(objectKey: String) async throws -> StoredObjectHead {
         StoredObjectHead(sizeBytes: (sizesByKey[objectKey] ?? 0) + headSizeDelta)
+    }
+
+    func getObject(objectKey: String, destinationURL: URL) async throws {
+        downloadedKeys.append(objectKey)
+        guard let data = downloadOverride ?? dataByKey[objectKey] else {
+            throw WeVaultError.cloud("missing mock object \(objectKey)")
+        }
+        try FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: destinationURL)
     }
 }
 

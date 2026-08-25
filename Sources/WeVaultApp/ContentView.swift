@@ -11,6 +11,11 @@ struct ContentView: View {
         return viewModel.result?.files.first { $0.id == selection }
     }
 
+    var selectedArchiveSnapshot: ArchivedFileSnapshot? {
+        guard let selection else { return nil }
+        return viewModel.archivedSnapshots[selection]
+    }
+
     var body: some View {
         HSplitView {
             sidebar
@@ -19,7 +24,26 @@ struct ContentView: View {
             recordList
                 .frame(minWidth: 440, idealWidth: 680)
                 .frame(maxHeight: .infinity, alignment: .topLeading)
-            DetailView(file: selectedFile, families: viewModel.result?.families ?? [], cloudSnapshot: selectedFile.flatMap { viewModel.cloudSnapshots[$0.path] })
+            DetailView(
+                file: selectedFile,
+                families: viewModel.result?.families ?? [],
+                cloudSnapshot: selectedFile.flatMap { viewModel.cloudSnapshots[$0.path] },
+                archivedSnapshot: selectedArchiveSnapshot,
+                isRestoring: viewModel.isRestoring,
+                onRestoreDefault: {
+                    if let selectedArchiveSnapshot {
+                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .defaultDownloads)
+                    }
+                },
+                onRestoreToDirectory: {
+                    chooseRestoreDirectory()
+                },
+                onRestoreOriginalPath: {
+                    if let selectedArchiveSnapshot {
+                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .originalPath)
+                    }
+                }
+            )
                 .frame(minWidth: 280, idealWidth: 420)
                 .frame(maxHeight: .infinity, alignment: .topLeading)
         }
@@ -94,6 +118,22 @@ struct ContentView: View {
                     }
                 }
 
+                if !viewModel.restoreMessage.isEmpty || viewModel.isRestoring {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("云端恢复")
+                            .font(.headline)
+                        if viewModel.isRestoring {
+                            ProgressView("下载并校验中...")
+                        }
+                        if !viewModel.restoreMessage.isEmpty {
+                            Text(viewModel.restoreMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+
                 if let result = viewModel.result {
                     SummaryGrid(summary: result.summary)
                     Text("Manifest: \(viewModel.manifestURL.path)")
@@ -104,7 +144,7 @@ struct ContentView: View {
                         .textSelection(.enabled)
                 }
 
-                Text("本 demo 会上传并校验云端副本；不释放、不移动、不删除微信文件，不修改微信数据库。")
+                Text("本 demo 可上传、校验并恢复云端副本；不释放、不移动、不删除微信文件，不修改微信数据库。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -211,6 +251,19 @@ struct ContentView: View {
             viewModel.selectedRoot = panel.url
         }
     }
+
+    private func chooseRestoreDirectory() {
+        guard let selectedArchiveSnapshot else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "恢复到此处"
+        panel.directoryURL = CloudRestoreService.defaultRestoreDirectory()
+        if panel.runModal() == .OK, let url = panel.url {
+            viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .directory(url))
+        }
+    }
 }
 
 enum WeChatDirectory {
@@ -235,8 +288,11 @@ final class ScanViewModel: ObservableObject {
     @Published var filter: RecordFilter = .all
     @Published var storageConfig = LocalStorageConfig.load()
     @Published var cloudSnapshots: [String: CloudArchiveSnapshot] = [:]
+    @Published var archivedSnapshots: [String: ArchivedFileSnapshot] = [:]
     @Published var isUploading = false
     @Published var uploadMessage = ""
+    @Published var isRestoring = false
+    @Published var restoreMessage = ""
 
     let manifestURL = ManifestStore.defaultDatabaseURL()
 
@@ -272,18 +328,18 @@ final class ScanViewModel: ObservableObject {
 
     var uploadScopeSummary: String {
         guard let files = result?.files else {
-            return "扫描后可上传已有 SHA 的可归档对象；普通重复文件云端只保存一份。"
+            return "扫描后可上传已有 SHA 的可归档对象；上传前会按当前阈值刷新扫描，普通大文件和重复文件会计算 SHA，重复对象云端只保存一份。"
         }
         let uploadable = uploadableFiles(from: files)
         guard !uploadable.isEmpty else {
-            return "当前没有可上传对象。普通文件只有重复 size 组会在 Phase 1 计算 SHA；图片高清层和视频 Raw 候选会计算 SHA。"
+            return "当前没有可上传对象。普通文件需达到当前大文件阈值或进入重复识别；图片高清层和视频 Raw 候选会计算 SHA。"
         }
         let ordinary = uploadable.filter { $0.objectType == .ordinaryFile }.count
         let image = uploadable.filter { $0.objectType == .imageHighLayer }.count
         let video = uploadable.filter { $0.objectType == .videoRawLayer }.count
         let uniqueObjects = Dictionary(grouping: uploadable, by: { $0.sha256 ?? $0.path }).values.compactMap(\.first)
         let uniqueBytes = uniqueObjects.reduce(Int64(0)) { $0 + $1.sizeBytes }
-        return "将上传本次扫描中已有 SHA 且可归档的对象：普通文件 \(ordinary) 项、图片高清层 \(image) 项、视频 Raw 层 \(video) 项；按 SHA 去重后云端对象 \(uniqueObjects.count) 个，约 \(humanBytes(uniqueBytes))。不会上传无 SHA、不可归档项，也不会移动或删除本地文件。"
+        return "将上传本次扫描中已有 SHA 且可归档的对象：普通文件 \(ordinary) 项、图片高清层 \(image) 项、视频 Raw 层 \(video) 项；按 SHA 去重后云端对象 \(uniqueObjects.count) 个，约 \(humanBytes(uniqueBytes))。上传前会按当前阈值刷新扫描；不会上传无 SHA、不可归档项，也不会移动或删除本地文件。"
     }
 
     func scan() {
@@ -300,10 +356,12 @@ final class ScanViewModel: ObservableObject {
                     let store = try ManifestStore()
                     try store.save(scanResult: result)
                     let snapshots = try store.cloudArchiveSnapshots()
-                    return (result, snapshots)
+                    let archived = try store.archivedFileSnapshots()
+                    return (result, snapshots, archived)
                 }.value
                 result = scanResult.0
                 cloudSnapshots = scanResult.1
+                archivedSnapshots = scanResult.2
             } catch {
                 alertMessage = error.localizedDescription
             }
@@ -312,26 +370,70 @@ final class ScanViewModel: ObservableObject {
     }
 
     func uploadHashedCandidates() {
-        guard let files = result?.files else { return }
+        guard let selectedRoot else { return }
         isUploading = true
         alertMessage = nil
-        uploadMessage = "准备上传：\(uploadableFiles(from: files).count) 项绑定"
+        uploadMessage = "按当前阈值刷新扫描..."
+        let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
         let config = storageConfig
 
         Task {
             do {
+                let refreshed = try await Task.detached(priority: .userInitiated) {
+                    let scanner = WeChatScanner()
+                    let scanResult = try scanner.scan(root: selectedRoot, options: ScanOptions(largeFileThresholdBytes: threshold))
+                    let store = try ManifestStore()
+                    try store.save(scanResult: scanResult)
+                    let cloudSnapshots = try store.cloudArchiveSnapshots()
+                    let archivedSnapshots = try store.archivedFileSnapshots()
+                    return (scanResult, cloudSnapshots, archivedSnapshots)
+                }.value
+                result = refreshed.0
+                cloudSnapshots = refreshed.1
+                archivedSnapshots = refreshed.2
+                uploadMessage = "准备上传：\(uploadableFiles(from: refreshed.0.files).count) 项绑定"
+
                 let service = CloudUploadService()
-                let snapshots = try await service.upload(files: files, families: result?.families ?? [], config: config, store: ManifestStore()) { [weak self] progress in
+                let store = try ManifestStore()
+                let snapshots = try await service.upload(files: refreshed.0.files, families: refreshed.0.families, config: config, store: store) { [weak self] progress in
                     await MainActor.run {
                         self?.apply(progress)
                     }
                 }
                 cloudSnapshots = snapshots
+                archivedSnapshots = try store.archivedFileSnapshots()
                 uploadMessage = "上传完成：已校验 \(snapshots.values.filter { $0.object.verifyStatus == .verified }.count) 项绑定"
             } catch {
                 alertMessage = error.localizedDescription
             }
             isUploading = false
+        }
+    }
+
+    func restore(snapshot: ArchivedFileSnapshot, destination: RestoreDestination) {
+        guard !isRestoring else { return }
+        isRestoring = true
+        alertMessage = nil
+        restoreMessage = "准备恢复：\(snapshot.archivedFile.originalFilename)"
+        let config = storageConfig
+
+        Task {
+            do {
+                let store = try ManifestStore()
+                let result = try await CloudRestoreService().restore(snapshot: snapshot, destination: destination, config: config, store: store)
+                archivedSnapshots = try store.archivedFileSnapshots()
+                cloudSnapshots = try store.cloudArchiveSnapshots()
+                restoreMessage = "恢复完成并通过 SHA-256 校验：\(result.destinationURL.path)"
+                NSWorkspace.shared.activateFileViewerSelecting([result.destinationURL])
+            } catch {
+                alertMessage = error.localizedDescription
+                restoreMessage = "恢复失败：\(error.localizedDescription)"
+                if let store = try? ManifestStore() {
+                    archivedSnapshots = (try? store.archivedFileSnapshots()) ?? archivedSnapshots
+                    cloudSnapshots = (try? store.cloudArchiveSnapshots()) ?? cloudSnapshots
+                }
+            }
+            isRestoring = false
         }
     }
 

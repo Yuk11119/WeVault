@@ -14,6 +14,7 @@ public struct StoredObjectHead: Equatable, Sendable {
 public protocol ObjectStorageClient: Sendable {
     func putObject(localURL: URL, objectKey: String, sha256: String, sizeBytes: Int64) async throws
     func headObject(objectKey: String) async throws -> StoredObjectHead
+    func getObject(objectKey: String, destinationURL: URL) async throws
 }
 
 public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
@@ -49,6 +50,17 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
             metadata[String(header.dropFirst("x-amz-meta-".count))] = String(describing: value)
         }
         return StoredObjectHead(sizeBytes: contentLength, metadata: metadata)
+    }
+
+    public func getObject(objectKey: String, destinationURL: URL) async throws {
+        let request = try signedRequest(method: "GET", objectKey: objectKey, payloadHash: Self.emptyPayloadHash, metadata: [:])
+        let (temporaryURL, response) = try await session.download(for: request)
+        try validate(response: response, acceptedStatusCodes: 200...299)
+        try FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
+        }
+        try FileManager.default.moveItem(at: temporaryURL, to: destinationURL)
     }
 
     private func signedRequest(method: String, objectKey: String, payloadHash: String, metadata: [String: String]) throws -> URLRequest {

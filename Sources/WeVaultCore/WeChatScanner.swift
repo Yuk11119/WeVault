@@ -42,6 +42,7 @@ public final class WeChatScanner: Sendable {
         files.append(contentsOf: try recordsForCandidateFamilies(imageFamilies))
         files.append(contentsOf: try recordsForCandidateFamilies(videoFamilies))
 
+        hashLargeOrdinaryCandidates(&files, threshold: options.largeFileThresholdBytes)
         hashMediaCandidates(&files)
         let duplicateGroups = try hashAndGroupOrdinaryDuplicates(&files)
         let families = imageFamilies + videoFamilies
@@ -272,6 +273,16 @@ public final class WeChatScanner: Sendable {
             if let digest = try? sha256File(URL(fileURLWithPath: files[index].path)) {
                 files[index].sha256 = digest
                 files[index].status = .hashed
+            }
+        }
+    }
+
+    private func hashLargeOrdinaryCandidates(_ files: inout [FileRecord], threshold: Int64) {
+        for index in files.indices where files[index].objectType == .ordinaryFile && files[index].sizeBytes >= threshold {
+            if let digest = try? sha256File(URL(fileURLWithPath: files[index].path)) {
+                files[index].sha256 = digest
+                files[index].status = .hashed
+                files[index].candidateReason = "普通大文件候选：达到当前阈值 \(humanBytes(threshold))"
             }
         }
     }
