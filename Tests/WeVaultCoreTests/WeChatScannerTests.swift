@@ -334,6 +334,375 @@ struct WeChatScannerTests {
         #expect(try sha256File(restoredImage.destinationURL) == image.archivedFile.sha256)
         #expect(try sha256File(restoredVideo.destinationURL) == video.archivedFile.sha256)
     }
+
+    @Test("local release writes tombstone by default for verified ordinary files")
+    func localReleaseWritesTombstoneByDefault() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let ordinary = try #require(context.archived.values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
+
+        let result = try service.quarantine(snapshot: ordinary, store: context.store, userConfirmed: true, skipRestoreTest: true)
+
+        #expect(FileManager.default.fileExists(atPath: ordinary.archivedFile.filePath))
+        #expect(Tombstone.isTombstone(URL(fileURLWithPath: ordinary.archivedFile.filePath)))
+        let placeholderHeader = Data(try Data(contentsOf: URL(fileURLWithPath: ordinary.archivedFile.filePath)).prefix(4))
+        #expect(String(data: placeholderHeader, encoding: .ascii) == "%PDF")
+        #expect(FileManager.default.fileExists(atPath: try #require(result.quarantineURL).path))
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .tombstoned)
+        #expect(refreshed.binding.archiveState == .verified)
+        #expect(refreshed.binding.quarantinePath == result.quarantineURL?.path)
+        #expect(refreshed.binding.placeholderPath == ordinary.archivedFile.filePath)
+        #expect(refreshed.binding.placeholderFormat == "pdf")
+        let placeholderSHA = try sha256File(URL(fileURLWithPath: ordinary.archivedFile.filePath))
+        #expect(refreshed.binding.placeholderSHA256 == placeholderSHA)
+        #expect(refreshed.binding.placeholderSize != nil)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_RESTORE_TEST_SKIPPED'") == 1)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_TOMBSTONE_WRITTEN'") == 1)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_QUARANTINE_FINISHED'") == 1)
+    }
+
+    @Test("tombstone payloads keep supported file container types")
+    func tombstonePayloadsKeepSupportedContainerTypes() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let ordinary = try #require(context.archived.values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        let createdAt = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let textPayload = try #require(try Tombstone.payload(for: renamedSnapshot(ordinary, filename: "note.txt"), createdAt: createdAt))
+        #expect(textPayload.format == "text")
+        #expect(String(data: textPayload.data.prefix(Tombstone.magic.utf8.count), encoding: .utf8) == Tombstone.magic)
+
+        let pdfPayload = try #require(try Tombstone.payload(for: renamedSnapshot(ordinary, filename: "deck.pdf"), createdAt: createdAt))
+        #expect(pdfPayload.format == "pdf")
+        #expect(String(data: Data(pdfPayload.data.prefix(4)), encoding: .ascii) == "%PDF")
+        #expect(pdfPayload.data.range(of: Data(Tombstone.magic.utf8)) != nil)
+
+        let officeExpectations = [
+            ("docx", "word/document.xml"),
+            ("pptx", "ppt/slides/slide1.xml"),
+            ("xlsx", "xl/worksheets/sheet1.xml")
+        ]
+        for (ext, requiredPart) in officeExpectations {
+            let payload = try #require(try Tombstone.payload(for: renamedSnapshot(ordinary, filename: "placeholder.\(ext)"), createdAt: createdAt))
+            #expect(payload.format == ext)
+            #expect(String(data: Data(payload.data.prefix(2)), encoding: .ascii) == "PK")
+            #expect(payload.data.range(of: Data(requiredPart.utf8)) != nil)
+            #expect(payload.data.range(of: Data(Tombstone.magic.utf8)) != nil)
+            #expect(payload.data.range(of: Data("查看归档内容".utf8)) != nil)
+            #expect(payload.data.range(of: Data("https://wevault.example/archive/\(ordinary.binding.bindingID)".utf8)) != nil)
+        }
+
+        let zipPayload = try #require(try Tombstone.payload(for: renamedSnapshot(ordinary, filename: "archive.zip"), createdAt: createdAt))
+        #expect(zipPayload.format == "zip")
+        #expect(String(data: Data(zipPayload.data.prefix(2)), encoding: .ascii) == "PK")
+        #expect(zipPayload.data.range(of: Data("\(Tombstone.magic).txt".utf8)) != nil)
+        #expect(zipPayload.data.range(of: Data(Tombstone.magic.utf8)) != nil)
+
+        let unsupported = try Tombstone.payload(for: renamedSnapshot(ordinary, filename: "payload.bin"), createdAt: createdAt)
+        #expect(unsupported == nil)
+    }
+
+    @Test("tombstone detection reads deflated office containers")
+    func tombstoneDetectionReadsDeflatedOfficeContainers() async throws {
+        let fixture = try Fixture()
+        let deflated = fixture.temp.appendingPathComponent("deflated.pptx")
+        try runPythonDeflatedTombstone(destination: deflated)
+        let data = try Data(contentsOf: deflated)
+
+        #expect(data.range(of: Data(Tombstone.magic.utf8)) == nil)
+        #expect(Tombstone.isTombstone(deflated))
+    }
+
+    @Test("local release can quarantine without tombstone when disabled")
+    func localReleaseCanDisableTombstone() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let ordinary = try #require(context.archived.values.first { $0.archivedFile.originalFilename == "a.pdf" })
+
+        _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantine(
+            snapshot: ordinary,
+            store: context.store,
+            userConfirmed: true,
+            skipRestoreTest: true,
+            createTombstone: false
+        )
+
+        #expect(!FileManager.default.fileExists(atPath: ordinary.archivedFile.filePath))
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .quarantined)
+        #expect(refreshed.binding.placeholderPath == nil)
+        #expect(refreshed.binding.placeholderSHA256 == nil)
+    }
+
+    @Test("local release rejects changed local sha and records failure")
+    func localReleaseRejectsChangedSHA() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let ordinary = try #require(context.archived.values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        try fixture.write("changed-content", to: URL(fileURLWithPath: ordinary.archivedFile.filePath))
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantine(
+                snapshot: ordinary,
+                store: context.store,
+                userConfirmed: true,
+                skipRestoreTest: true
+            )
+        }
+
+        #expect(FileManager.default.fileExists(atPath: ordinary.archivedFile.filePath))
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .releaseFailed)
+        #expect(refreshed.binding.archiveState == .releaseFailed)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_FAILED'") == 1)
+    }
+
+    @Test("local release rejects unverified cloud objects")
+    func localReleaseRejectsUnverifiedCloudObjects() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+        _ = try await CloudUploadService { _ in MockObjectStorageClient(headSizeDelta: 1) }.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+        let ordinary = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.originalFilename == "a.pdf" })
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantine(
+                snapshot: ordinary,
+                store: store,
+                userConfirmed: true,
+                skipRestoreTest: true
+            )
+        }
+        #expect(FileManager.default.fileExists(atPath: ordinary.archivedFile.filePath))
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_FAILED'") == 1)
+    }
+
+    @Test("local release rejects image and video media layers in phase five")
+    func localReleaseRejectsMediaLayers() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let image = try #require(context.archived.values.first { $0.archivedFile.objectType == .imageHighLayer })
+        let video = try #require(context.archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
+        let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
+
+        #expect(throws: WeVaultError.self) {
+            _ = try service.quarantine(snapshot: image, store: context.store, userConfirmed: true, skipRestoreTest: true)
+        }
+        #expect(throws: WeVaultError.self) {
+            _ = try service.quarantine(snapshot: video, store: context.store, userConfirmed: true, skipRestoreTest: true)
+        }
+        #expect(FileManager.default.fileExists(atPath: image.archivedFile.filePath))
+        #expect(FileManager.default.fileExists(atPath: video.archivedFile.filePath))
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_FAILED'") == 2)
+    }
+
+    @Test("local release rollback restores quarantined file to original path")
+    func localReleaseRollbackRestoresQuarantinedFile() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let ordinary = try #require(context.archived.values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
+        _ = try service.quarantine(snapshot: ordinary, store: context.store, userConfirmed: true, skipRestoreTest: true)
+        let quarantined = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+
+        let rollback = try service.rollback(snapshot: quarantined, store: context.store)
+
+        #expect(FileManager.default.fileExists(atPath: ordinary.archivedFile.filePath))
+        #expect(try sha256File(rollback.originalURL) == ordinary.archivedFile.sha256)
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .localPresent)
+        #expect(refreshed.binding.archiveState == .verified)
+        #expect(refreshed.binding.quarantinePath == nil)
+        #expect(refreshed.binding.placeholderPath == nil)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_ROLLBACK_FINISHED'") == 1)
+    }
+
+    @Test("local release rollback refuses to overwrite original path")
+    func localReleaseRollbackRejectsExistingOriginal() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let ordinary = try #require(context.archived.values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
+        _ = try service.quarantine(snapshot: ordinary, store: context.store, userConfirmed: true, skipRestoreTest: true, createTombstone: false)
+        let quarantined = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        try fixture.write("replacement", to: URL(fileURLWithPath: ordinary.archivedFile.filePath))
+
+        #expect(throws: WeVaultError.self) {
+            _ = try service.rollback(snapshot: quarantined, store: context.store)
+        }
+
+        #expect(try String(contentsOf: URL(fileURLWithPath: ordinary.archivedFile.filePath), encoding: .utf8) == "replacement")
+        #expect(FileManager.default.fileExists(atPath: try #require(quarantined.binding.quarantinePath)))
+    }
+
+    @Test("local release final delete preserves manifest and cloud records")
+    func localReleaseFinalDeletePreservesArchiveRecords() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let ordinary = try #require(context.archived.values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
+        let quarantine = try service.quarantine(snapshot: ordinary, store: context.store, userConfirmed: true, skipRestoreTest: true)
+        let quarantined = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+
+        _ = try service.finalizeRelease(snapshot: quarantined, store: context.store)
+
+        #expect(FileManager.default.fileExists(atPath: ordinary.archivedFile.filePath))
+        #expect(Tombstone.isTombstone(URL(fileURLWithPath: ordinary.archivedFile.filePath)))
+        #expect(!FileManager.default.fileExists(atPath: try #require(quarantine.quarantineURL).path))
+        #expect(try fixture.countRows(table: "cloud_objects") == 3)
+        #expect(try fixture.countRows(table: "archive_bindings") == 4)
+        #expect(try fixture.countRows(table: "archived_files") == 4)
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .tombstoned)
+        #expect(refreshed.binding.archiveState == .localReleased)
+        #expect(refreshed.binding.releasedAt != nil)
+        #expect(refreshed.binding.quarantinePath == nil)
+        #expect(refreshed.binding.placeholderPath == ordinary.archivedFile.filePath)
+    }
+
+    @Test("local released archive remains queryable after scan refresh")
+    func localReleasedArchiveRemainsQueryableAfterScanRefresh() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let ordinary = try #require(context.archived.values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
+        _ = try service.quarantine(snapshot: ordinary, store: context.store, userConfirmed: true, skipRestoreTest: true)
+        let quarantined = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        _ = try service.finalizeRelease(snapshot: quarantined, store: context.store)
+
+        let knownPlaceholders = try context.store.archivedFileSnapshots().values.compactMap(\.binding.placeholderPath)
+        let refreshedScan = try WeChatScanner().scan(root: fixture.root, options: ScanOptions(knownPlaceholderPaths: Set(knownPlaceholders)))
+        try context.store.save(scanResult: refreshedScan)
+
+        #expect(!refreshedScan.files.contains { $0.path == ordinary.archivedFile.filePath })
+        #expect(try fixture.countRows(table: "files", whereClause: "path = '\(ordinary.archivedFile.filePath)'") == 0)
+        #expect(try fixture.countRows(table: "cloud_objects") == 3)
+        #expect(try fixture.countRows(table: "archive_bindings") == 4)
+        #expect(try fixture.countRows(table: "archived_files") == 4)
+        let archived = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        #expect(archived.binding.localState == .tombstoned)
+        #expect(archived.object.verifyStatus == .verified)
+    }
+
+    @Test("scanner flags copied tombstone as suspicious and skips upload")
+    func scannerFlagsCopiedTombstone() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let ordinary = try #require(context.archived.values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantine(snapshot: ordinary, store: context.store, userConfirmed: true, skipRestoreTest: true)
+        let copied = fixture.account.appendingPathComponent("msg/file/2026-03/copied.pdf")
+        try FileManager.default.createDirectory(at: copied.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: ordinary.archivedFile.filePath), to: copied)
+
+        let knownPlaceholders = try context.store.archivedFileSnapshots().values.compactMap(\.binding.placeholderPath)
+        let scan = try WeChatScanner().scan(root: fixture.root, options: ScanOptions(knownPlaceholderPaths: Set(knownPlaceholders)))
+        let suspicious = try #require(scan.files.first { $0.filename == "copied.pdf" })
+
+        #expect(suspicious.status == .notArchivable)
+        #expect(suspicious.candidateReason?.contains("疑似转发") == true)
+        #expect(suspicious.sha256 == nil)
+    }
+
+    @Test("scanner skips manifest placeholder path even when magic is not directly detectable")
+    func scannerSkipsKnownPlaceholderPathBeforeMagicDetection() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let ordinary = try #require(context.archived.values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantine(snapshot: ordinary, store: context.store, userConfirmed: true, skipRestoreTest: true)
+        try fixture.write("edited placeholder without detectable magic", to: URL(fileURLWithPath: ordinary.archivedFile.filePath))
+
+        let knownPlaceholders = try context.store.archivedFileSnapshots().values.compactMap(\.binding.placeholderPath)
+        let scan = try WeChatScanner().scan(root: fixture.root, options: ScanOptions(knownPlaceholderPaths: Set(knownPlaceholders)))
+        try context.store.save(scanResult: scan)
+
+        #expect(!scan.files.contains { $0.path == ordinary.archivedFile.filePath })
+        let archived = try #require(try context.store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        #expect(archived.binding.localState == .tombstoned)
+        #expect(archived.binding.placeholderPath == ordinary.archivedFile.filePath)
+    }
+
+    @Test("cloud restore to original path overwrites matching tombstone only")
+    func cloudRestoreOverwritesMatchingTombstone() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+        let client = MockObjectStorageClient()
+        _ = try await CloudUploadService { _ in client }.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+        let ordinary = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantine(snapshot: ordinary, store: store, userConfirmed: true, skipRestoreTest: true)
+        let tombstoned = try #require(try store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+
+        let restored = try await CloudRestoreService { _ in client }.restore(snapshot: tombstoned, destination: .originalPath, config: fixture.storageConfig, store: store)
+
+        #expect(restored.destinationURL.path == ordinary.archivedFile.filePath)
+        #expect(try sha256File(restored.destinationURL) == ordinary.archivedFile.sha256)
+        let refreshed = try #require(try store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .restored)
+        #expect(refreshed.binding.placeholderPath == nil)
+    }
+
+    @Test("cloud restore refuses edited tombstone at original path")
+    func cloudRestoreRejectsEditedTombstone() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+        let client = MockObjectStorageClient()
+        _ = try await CloudUploadService { _ in client }.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+        let ordinary = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.originalFilename == "a.pdf" })
+        _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantine(snapshot: ordinary, store: store, userConfirmed: true, skipRestoreTest: true)
+        let tombstoned = try #require(try store.archivedFileSnapshots()[ordinary.archivedFile.filePath])
+        try fixture.write("\(Tombstone.magic)\nedited", to: URL(fileURLWithPath: ordinary.archivedFile.filePath))
+
+        await #expect(throws: WeVaultError.self) {
+            _ = try await CloudRestoreService { _ in client }.restore(snapshot: tombstoned, destination: .originalPath, config: fixture.storageConfig, store: store)
+        }
+    }
+}
+
+private func renamedSnapshot(_ snapshot: ArchivedFileSnapshot, filename: String) -> ArchivedFileSnapshot {
+    let archivedFile = ArchivedFile(
+        filePath: URL(fileURLWithPath: snapshot.archivedFile.filePath).deletingLastPathComponent().appendingPathComponent(filename).path,
+        objectType: snapshot.archivedFile.objectType,
+        originalFilename: filename,
+        relativePath: filename,
+        accountHash: snapshot.archivedFile.accountHash,
+        accountName: snapshot.archivedFile.accountName,
+        month: snapshot.archivedFile.month,
+        sizeBytes: snapshot.archivedFile.sizeBytes,
+        sha256: snapshot.archivedFile.sha256,
+        mtime: snapshot.archivedFile.mtime,
+        familyID: snapshot.archivedFile.familyID,
+        displayOrPlaybackPath: snapshot.archivedFile.displayOrPlaybackPath,
+        bubbleOrThumbPath: snapshot.archivedFile.bubbleOrThumbPath,
+        archivedAt: snapshot.archivedFile.archivedAt,
+        updatedAt: snapshot.archivedFile.updatedAt
+    )
+    return ArchivedFileSnapshot(archivedFile: archivedFile, binding: snapshot.binding, object: snapshot.object)
+}
+
+private func runPythonDeflatedTombstone(destination: URL) throws {
+    let script = """
+    import sys, zipfile
+    dst = sys.argv[1]
+    with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zout:
+        zout.writestr('ppt/slides/slide1.xml', '<root>WEVAULT_TOMBSTONE_V1</root>')
+    """
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+    process.arguments = ["-c", script, destination.path]
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw WeVaultError.fileSystem("python zip deflate failed")
+    }
 }
 
 private struct Fixture {
@@ -341,12 +710,14 @@ private struct Fixture {
     let root: URL
     let account: URL
     let restoreRoot: URL
+    let quarantineRoot: URL
 
     init() throws {
         temp = FileManager.default.temporaryDirectory.appendingPathComponent("WeVaultTests-\(UUID().uuidString)", isDirectory: true)
         root = temp.appendingPathComponent("xwechat_files", isDirectory: true)
         account = root.appendingPathComponent("wxid_demo", isDirectory: true)
         restoreRoot = temp.appendingPathComponent("restores", isDirectory: true)
+        quarantineRoot = temp.appendingPathComponent("quarantine", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
 
@@ -402,6 +773,15 @@ private struct Fixture {
             throw WeVaultError.sqlite("count failed")
         }
         return Int(sqlite3_column_int(stmt, 0))
+    }
+
+    func uploadedArchiveContext() async throws -> (store: ManifestStore, archived: [String: ArchivedFileSnapshot]) {
+        try writeWeChatTree()
+        let result = try WeChatScanner().scan(root: root)
+        let store = try ManifestStore(databaseURL: temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+        _ = try await CloudUploadService { _ in MockObjectStorageClient() }.upload(files: result.files, families: result.families, config: storageConfig, store: store)
+        return (store, try store.archivedFileSnapshots())
     }
 }
 

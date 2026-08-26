@@ -8,7 +8,7 @@ struct ContentView: View {
 
     var selectedFile: FileRecord? {
         guard let selection else { return nil }
-        return viewModel.result?.files.first { $0.id == selection }
+        return viewModel.displayFiles.first { $0.id == selection }
     }
 
     var selectedArchiveSnapshot: ArchivedFileSnapshot? {
@@ -30,6 +30,7 @@ struct ContentView: View {
                 cloudSnapshot: selectedFile.flatMap { viewModel.cloudSnapshots[$0.path] },
                 archivedSnapshot: selectedArchiveSnapshot,
                 isRestoring: viewModel.isRestoring,
+                isReleasing: viewModel.isReleasing,
                 onRestoreDefault: {
                     if let selectedArchiveSnapshot {
                         viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .defaultDownloads)
@@ -41,6 +42,21 @@ struct ContentView: View {
                 onRestoreOriginalPath: {
                     if let selectedArchiveSnapshot {
                         viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .originalPath)
+                    }
+                },
+                onQuarantineLocal: {
+                    if let selectedArchiveSnapshot {
+                        viewModel.quarantineLocal(snapshot: selectedArchiveSnapshot, createTombstone: $0)
+                    }
+                },
+                onRollbackLocal: {
+                    if let selectedArchiveSnapshot {
+                        viewModel.rollbackLocal(snapshot: selectedArchiveSnapshot)
+                    }
+                },
+                onFinalizeLocalRelease: {
+                    if let selectedArchiveSnapshot {
+                        viewModel.finalizeLocalRelease(snapshot: selectedArchiveSnapshot)
                     }
                 }
             )
@@ -134,6 +150,22 @@ struct ContentView: View {
                     }
                 }
 
+                if !viewModel.releaseMessage.isEmpty || viewModel.isReleasing {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("本地释放")
+                            .font(.headline)
+                        if viewModel.isReleasing {
+                            ProgressView("更新本地副本状态中...")
+                        }
+                        if !viewModel.releaseMessage.isEmpty {
+                            Text(viewModel.releaseMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+
                 if let result = viewModel.result {
                     SummaryGrid(summary: result.summary)
                     Text("Manifest: \(viewModel.manifestURL.path)")
@@ -144,7 +176,7 @@ struct ContentView: View {
                         .textSelection(.enabled)
                 }
 
-                Text("本 demo 可上传、校验并恢复云端副本；不释放、不移动、不删除微信文件，不修改微信数据库。")
+                Text("默认不会自动释放本地副本；支持同类型 tombstone 的普通文件经确认释放后，会在微信原路径生成 WeVault 占位文件，占位不是原件。不支持或关闭 tombstone 时原路径为空。不修改微信数据库。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -175,60 +207,60 @@ struct ContentView: View {
             .padding()
 
             ScrollView(.horizontal) {
-                Table(viewModel.filteredFiles, selection: $selection) {
-                    TableColumn("类型") { file in
+                Table(viewModel.filteredFiles, selection: $selection, sortOrder: $viewModel.sortOrder) {
+                    TableColumn("类型", value: \.sortTypeTitle) { file in
                         Text(file.objectType.displayName)
                     }
                     .width(min: 90, ideal: 110)
 
-                    TableColumn("文件名") { file in
+                    TableColumn("文件名", value: \.filename) { file in
                         Text(file.filename)
                             .lineLimit(1)
                     }
                     .width(min: 180, ideal: 260)
 
-                    TableColumn("会话/来源") { file in
+                    TableColumn("会话/来源", value: \.sortConversationTitle) { file in
                         Text(file.conversationName ?? "未解析")
                             .foregroundStyle(file.conversationName == nil ? .secondary : .primary)
                     }
                     .width(min: 110, ideal: 150)
 
-                    TableColumn("月份") { file in
+                    TableColumn("月份", value: \.sortMonthTitle) { file in
                         Text(file.month ?? "-")
                             .monospacedDigit()
                     }
                     .width(70)
 
-                    TableColumn("大小") { file in
+                    TableColumn("大小", value: \.sizeBytes) { file in
                         Text(humanBytes(file.sizeBytes))
                             .monospacedDigit()
                     }
                     .width(90)
 
-                    TableColumn("Allocated") { file in
+                    TableColumn("Allocated", value: \.allocatedBytes) { file in
                         Text(humanBytes(file.allocatedBytes))
                             .monospacedDigit()
                     }
                     .width(100)
 
-                    TableColumn("SHA") { file in
+                    TableColumn("SHA", value: \.sortSHATitle) { file in
                         Text(file.sha256 == nil ? "未计算" : "已计算")
                             .foregroundStyle(file.sha256 == nil ? .secondary : .primary)
                     }
                     .width(72)
 
-                    TableColumn("重复") { file in
+                    TableColumn("重复", value: \.sortDuplicateTitle) { file in
                         Text(file.duplicateGroupID ?? "-")
                             .monospaced()
                     }
                     .width(72)
 
-                    TableColumn("状态") { file in
+                    TableColumn("状态", value: \.sortStatusTitle) { file in
                         Text(file.status.rawValue)
                     }
                     .width(130)
 
-                    TableColumn("云端") { file in
+                    TableColumn("云端", value: \.path) { file in
                         Text(viewModel.cloudStatus(for: file))
                     }
                     .width(92)
@@ -293,6 +325,9 @@ final class ScanViewModel: ObservableObject {
     @Published var uploadMessage = ""
     @Published var isRestoring = false
     @Published var restoreMessage = ""
+    @Published var isReleasing = false
+    @Published var releaseMessage = ""
+    @Published var sortOrder = [KeyPathComparator(\FileRecord.filename, comparator: .localizedStandard)]
 
     let manifestURL = ManifestStore.defaultDatabaseURL()
 
@@ -302,18 +337,23 @@ final class ScanViewModel: ObservableObject {
 
     var filteredFiles: [FileRecord] {
         guard let files = result?.files else { return [] }
-        switch filter {
+        let filtered: [FileRecord] = switch filter {
         case .all:
-            return files
+            files
         case .ordinary:
-            return files.filter { $0.objectType == .ordinaryFile }
+            files.filter { $0.objectType == .ordinaryFile }
         case .image:
-            return files.filter { $0.objectType == .imageHighLayer }
+            files.filter { $0.objectType == .imageHighLayer }
         case .video:
-            return files.filter { $0.objectType == .videoRawLayer }
+            files.filter { $0.objectType == .videoRawLayer }
         case .duplicates:
-            return files.filter { $0.duplicateGroupID != nil }
+            files.filter { $0.duplicateGroupID != nil }
         }
+        return filtered.sorted(using: sortOrder)
+    }
+
+    var displayFiles: [FileRecord] {
+        result?.files ?? []
     }
 
     var canUpload: Bool {
@@ -352,11 +392,13 @@ final class ScanViewModel: ObservableObject {
             do {
                 let scanResult = try await Task.detached(priority: .userInitiated) {
                     let scanner = WeChatScanner()
-                    let result = try scanner.scan(root: selectedRoot, options: ScanOptions(largeFileThresholdBytes: threshold))
                     let store = try ManifestStore()
-                    try store.save(scanResult: result)
+                    let knownPlaceholders = try store.archivedFileSnapshots().values.compactMap(\.binding.placeholderPath)
+                    let scanned = try scanner.scan(root: selectedRoot, options: ScanOptions(largeFileThresholdBytes: threshold, knownPlaceholderPaths: Set(knownPlaceholders)))
+                    try store.save(scanResult: scanned)
                     let snapshots = try store.cloudArchiveSnapshots()
                     let archived = try store.archivedFileSnapshots()
+                    let result = Self.scanResultByAddingArchivedDisplayRecords(scanned, archived: archived, under: selectedRoot)
                     return (result, snapshots, archived)
                 }.value
                 result = scanResult.0
@@ -381,11 +423,13 @@ final class ScanViewModel: ObservableObject {
             do {
                 let refreshed = try await Task.detached(priority: .userInitiated) {
                     let scanner = WeChatScanner()
-                    let scanResult = try scanner.scan(root: selectedRoot, options: ScanOptions(largeFileThresholdBytes: threshold))
                     let store = try ManifestStore()
-                    try store.save(scanResult: scanResult)
+                    let knownPlaceholders = try store.archivedFileSnapshots().values.compactMap(\.binding.placeholderPath)
+                    let scanned = try scanner.scan(root: selectedRoot, options: ScanOptions(largeFileThresholdBytes: threshold, knownPlaceholderPaths: Set(knownPlaceholders)))
+                    try store.save(scanResult: scanned)
                     let cloudSnapshots = try store.cloudArchiveSnapshots()
                     let archivedSnapshots = try store.archivedFileSnapshots()
+                    let scanResult = Self.scanResultByAddingArchivedDisplayRecords(scanned, archived: archivedSnapshots, under: selectedRoot)
                     return (scanResult, cloudSnapshots, archivedSnapshots)
                 }.value
                 result = refreshed.0
@@ -437,6 +481,88 @@ final class ScanViewModel: ObservableObject {
         }
     }
 
+    func quarantineLocal(snapshot: ArchivedFileSnapshot, createTombstone: Bool) {
+        guard !isReleasing else { return }
+        isReleasing = true
+        alertMessage = nil
+        releaseMessage = "准备释放本地原件：\(snapshot.archivedFile.originalFilename)"
+
+        Task {
+            do {
+                let store = try ManifestStore()
+                let result = try LocalReleaseService().quarantine(
+                    snapshot: snapshot,
+                    store: store,
+                    userConfirmed: true,
+                    skipRestoreTest: true,
+                    createTombstone: createTombstone
+                )
+                try refreshArchiveSnapshots(store: store)
+                if let placeholder = result.placeholderURL {
+                    releaseMessage = "原件已进入隔离区，微信原路径已写入 tombstone：\(placeholder.path)"
+                } else if createTombstone {
+                    releaseMessage = "原件已进入隔离区；当前文件类型未生成同类型 tombstone，微信原路径为空。"
+                } else {
+                    releaseMessage = "原件已进入隔离区；tombstone 已关闭，微信原路径为空。"
+                }
+            } catch {
+                alertMessage = error.localizedDescription
+                releaseMessage = "隔离失败：\(error.localizedDescription)"
+                if let store = try? ManifestStore() {
+                    try? refreshArchiveSnapshots(store: store)
+                }
+            }
+            isReleasing = false
+        }
+    }
+
+    func rollbackLocal(snapshot: ArchivedFileSnapshot) {
+        guard !isReleasing else { return }
+        isReleasing = true
+        alertMessage = nil
+        releaseMessage = "准备从隔离区回滚：\(snapshot.archivedFile.originalFilename)"
+
+        Task {
+            do {
+                let store = try ManifestStore()
+                let result = try LocalReleaseService().rollback(snapshot: snapshot, store: store)
+                try refreshArchiveSnapshots(store: store)
+                releaseMessage = "已回滚并通过 SHA-256 校验：\(result.originalURL.path)"
+                NSWorkspace.shared.activateFileViewerSelecting([result.originalURL])
+            } catch {
+                alertMessage = error.localizedDescription
+                releaseMessage = "回滚失败：\(error.localizedDescription)"
+                if let store = try? ManifestStore() {
+                    try? refreshArchiveSnapshots(store: store)
+                }
+            }
+            isReleasing = false
+        }
+    }
+
+    func finalizeLocalRelease(snapshot: ArchivedFileSnapshot) {
+        guard !isReleasing else { return }
+        isReleasing = true
+        alertMessage = nil
+        releaseMessage = "准备确认释放空间：\(snapshot.archivedFile.originalFilename)"
+
+        Task {
+            do {
+                let store = try ManifestStore()
+                _ = try LocalReleaseService().finalizeRelease(snapshot: snapshot, store: store)
+                try refreshArchiveSnapshots(store: store)
+                releaseMessage = "已删除隔离副本；云端对象和 manifest 仍保留，可从云端恢复。"
+            } catch {
+                alertMessage = error.localizedDescription
+                releaseMessage = "确认释放失败：\(error.localizedDescription)"
+                if let store = try? ManifestStore() {
+                    try? refreshArchiveSnapshots(store: store)
+                }
+            }
+            isReleasing = false
+        }
+    }
+
     func cloudStatus(for file: FileRecord) -> String {
         if let snapshot = cloudSnapshots[file.path] {
             return snapshot.object.verifyStatus.rawValue
@@ -460,8 +586,88 @@ final class ScanViewModel: ObservableObject {
     }
 
     private func uploadableFiles(from files: [FileRecord]) -> [FileRecord] {
-        files.filter { $0.sha256 != nil && $0.status != .notArchivable }
+        files.filter {
+            $0.sha256 != nil &&
+                $0.status != .notArchivable &&
+                $0.status != .tombstoned &&
+                $0.status != .localReleased &&
+                $0.status != .releaseEligible
+        }
     }
+
+    private func refreshArchiveSnapshots(store: ManifestStore) throws {
+        archivedSnapshots = try store.archivedFileSnapshots()
+        cloudSnapshots = try store.cloudArchiveSnapshots()
+        if let current = result, let selectedRoot {
+            result = Self.scanResultByAddingArchivedDisplayRecords(current, archived: archivedSnapshots, under: selectedRoot)
+        }
+    }
+
+    nonisolated private static func scanResultByAddingArchivedDisplayRecords(
+        _ scanResult: ScanResult,
+        archived: [String: ArchivedFileSnapshot],
+        under root: URL
+    ) -> ScanResult {
+        var merged = scanResult
+        var existingPaths = Set(merged.files.map(\.path))
+        let rootPath = root.standardizedFileURL.path
+        let archivedOnly = archived.values
+            .filter { snapshot in
+                let path = URL(fileURLWithPath: snapshot.archivedFile.filePath).standardizedFileURL.path
+                return !existingPaths.contains(snapshot.archivedFile.filePath) &&
+                    (path == rootPath || path.hasPrefix(rootPath + "/")) &&
+                    (snapshot.binding.localState == .quarantined ||
+                     snapshot.binding.localState == .tombstoned ||
+                     snapshot.binding.localState == .localReleased)
+            }
+            .sorted { $0.archivedFile.filePath < $1.archivedFile.filePath }
+
+        for snapshot in archivedOnly {
+            merged.files.append(displayRecord(for: snapshot))
+            existingPaths.insert(snapshot.archivedFile.filePath)
+        }
+        merged.files.sort { $0.relativePath < $1.relativePath }
+        return merged
+    }
+
+    nonisolated private static func displayRecord(for snapshot: ArchivedFileSnapshot) -> FileRecord {
+        let archived = snapshot.archivedFile
+        let status: ArchiveStatus
+        let reason: String
+        switch snapshot.binding.localState {
+        case .tombstoned:
+            status = .tombstoned
+            reason = "原件已归档，微信原路径为 tombstone 占位提示；可从详情恢复原件。"
+        case .quarantined:
+            status = .releaseEligible
+            reason = "原件已进入 WeVault quarantine，微信原路径为空；可从详情回滚或从云端恢复。"
+        case .localReleased:
+            status = .localReleased
+            reason = "本地隔离副本已确认释放；云端对象和 manifest 仍保留，可从详情恢复。"
+        default:
+            status = .verified
+            reason = "已归档普通文件。"
+        }
+        return FileRecord(
+            path: archived.filePath,
+            relativePath: archived.relativePath,
+            objectType: archived.objectType,
+            accountHash: archived.accountHash,
+            accountName: archived.accountName,
+            filename: archived.originalFilename,
+            fileExtension: URL(fileURLWithPath: archived.originalFilename).pathExtension.lowercased(),
+            month: archived.month,
+            sizeBytes: archived.sizeBytes,
+            allocatedBytes: snapshot.binding.placeholderSize ?? 0,
+            inode: 0,
+            nlink: 0,
+            mtime: archived.mtime,
+            sha256: archived.sha256,
+            status: status,
+            candidateReason: reason
+        )
+    }
+
 }
 
 enum RecordFilter: String, CaseIterable, Identifiable {
@@ -492,4 +698,13 @@ private extension ArchiveObjectType {
         case .videoRawLayer: "视频 Raw 层"
         }
     }
+}
+
+private extension FileRecord {
+    var sortTypeTitle: String { objectType.displayName }
+    var sortConversationTitle: String { conversationName ?? "未解析" }
+    var sortMonthTitle: String { month ?? "" }
+    var sortSHATitle: String { sha256 == nil ? "未计算" : "已计算" }
+    var sortDuplicateTitle: String { duplicateGroupID ?? "" }
+    var sortStatusTitle: String { status.rawValue }
 }

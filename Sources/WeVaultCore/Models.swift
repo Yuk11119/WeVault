@@ -15,8 +15,12 @@ public enum ArchiveStatus: String, Codable, CaseIterable, Sendable {
     case uploading = "UPLOADING"
     case uploaded = "UPLOADED"
     case verified = "VERIFIED"
+    case releaseEligible = "RELEASE_ELIGIBLE"
+    case localReleased = "LOCAL_RELEASED"
+    case tombstoned = "TOMBSTONED"
     case uploadFailed = "UPLOAD_FAILED"
     case verifyFailed = "VERIFY_FAILED"
+    case releaseFailed = "RELEASE_FAILED"
 }
 
 public enum CloudVerifyStatus: String, Codable, CaseIterable, Sendable {
@@ -29,16 +33,22 @@ public enum CloudVerifyStatus: String, Codable, CaseIterable, Sendable {
 public enum ArchiveBindingState: String, Codable, CaseIterable, Sendable {
     case uploaded = "UPLOADED"
     case verified = "VERIFIED"
+    case localReleased = "LOCAL_RELEASED"
     case verifyFailed = "VERIFY_FAILED"
     case restorePending = "RESTORE_PENDING"
     case restored = "RESTORED"
     case restoreFailed = "RESTORE_FAILED"
+    case releaseFailed = "RELEASE_FAILED"
 }
 
 public enum LocalArchiveState: String, Codable, CaseIterable, Sendable {
     case localPresent = "LOCAL_PRESENT"
+    case quarantined = "QUARANTINED"
+    case tombstoned = "TOMBSTONED"
+    case localReleased = "LOCAL_RELEASED"
     case restored = "RESTORED"
     case restoreFailed = "RESTORE_FAILED"
+    case releaseFailed = "RELEASE_FAILED"
 }
 
 public struct FileRecord: Identifiable, Codable, Hashable, Sendable {
@@ -243,6 +253,13 @@ public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
     public let localState: LocalArchiveState
     public let restoredAt: Date?
     public let lastRestoreCheckAt: Date?
+    public let releasedAt: Date?
+    public let quarantinePath: String?
+    public let placeholderPath: String?
+    public let placeholderCreatedAt: Date?
+    public let placeholderFormat: String?
+    public let placeholderSHA256: String?
+    public let placeholderSize: Int64?
 
     public init(
         bindingID: String,
@@ -251,7 +268,14 @@ public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
         archiveState: ArchiveBindingState,
         localState: LocalArchiveState,
         restoredAt: Date? = nil,
-        lastRestoreCheckAt: Date? = nil
+        lastRestoreCheckAt: Date? = nil,
+        releasedAt: Date? = nil,
+        quarantinePath: String? = nil,
+        placeholderPath: String? = nil,
+        placeholderCreatedAt: Date? = nil,
+        placeholderFormat: String? = nil,
+        placeholderSHA256: String? = nil,
+        placeholderSize: Int64? = nil
     ) {
         self.bindingID = bindingID
         self.filePath = filePath
@@ -260,6 +284,13 @@ public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
         self.localState = localState
         self.restoredAt = restoredAt
         self.lastRestoreCheckAt = lastRestoreCheckAt
+        self.releasedAt = releasedAt
+        self.quarantinePath = quarantinePath
+        self.placeholderPath = placeholderPath
+        self.placeholderCreatedAt = placeholderCreatedAt
+        self.placeholderFormat = placeholderFormat
+        self.placeholderSHA256 = placeholderSHA256
+        self.placeholderSize = placeholderSize
     }
 }
 

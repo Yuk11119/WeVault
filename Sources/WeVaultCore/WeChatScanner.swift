@@ -2,9 +2,11 @@ import Foundation
 
 public struct ScanOptions: Sendable {
     public var largeFileThresholdBytes: Int64
+    public var knownPlaceholderPaths: Set<String>
 
-    public init(largeFileThresholdBytes: Int64 = 50 * 1024 * 1024) {
+    public init(largeFileThresholdBytes: Int64 = 50 * 1024 * 1024, knownPlaceholderPaths: Set<String> = []) {
         self.largeFileThresholdBytes = largeFileThresholdBytes
+        self.knownPlaceholderPaths = knownPlaceholderPaths
     }
 }
 
@@ -32,7 +34,7 @@ public final class WeChatScanner: Sendable {
             let attachRoot = accountRoot.appendingPathComponent("msg/attach")
             let videoRoot = accountRoot.appendingPathComponent("msg/video")
 
-            files.append(contentsOf: try scanOrdinaryFiles(root: ordinaryRoot, baseRoot: baseRoot, accountName: accountName, accountHash: accountHash))
+            files.append(contentsOf: try scanOrdinaryFiles(root: ordinaryRoot, baseRoot: baseRoot, accountName: accountName, accountHash: accountHash, knownPlaceholderPaths: options.knownPlaceholderPaths))
             collectImageMembers(root: attachRoot, accountName: accountName, accountHash: accountHash, members: &imageMembers)
             collectVideoMembers(root: videoRoot, accountName: accountName, accountHash: accountHash, members: &videoMembers, playbackStats: &videoPlaybackStats)
         }
@@ -84,7 +86,7 @@ public final class WeChatScanner: Sendable {
         return accounts.sorted { $0.path < $1.path }
     }
 
-    private func scanOrdinaryFiles(root: URL, baseRoot: URL, accountName: String, accountHash: String) throws -> [FileRecord] {
+    private func scanOrdinaryFiles(root: URL, baseRoot: URL, accountName: String, accountHash: String, knownPlaceholderPaths: Set<String>) throws -> [FileRecord] {
         guard FileManager.default.fileExists(atPath: root.path) else { return [] }
         var result: [FileRecord] = []
         let months = try FileManager.default.contentsOfDirectory(
@@ -107,7 +109,30 @@ public final class WeChatScanner: Sendable {
             for case let url as URL in enumerator {
                 let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
                 guard values?.isRegularFile == true else { continue }
+                if knownPlaceholderPaths.contains(url.path) {
+                    continue
+                }
                 let stat = try fileStat(url.path)
+                if Tombstone.isTombstone(url) {
+                    result.append(FileRecord(
+                        path: url.path,
+                        relativePath: url.pathRelative(to: baseRoot),
+                        objectType: .ordinaryFile,
+                        accountHash: accountHash,
+                        accountName: accountName,
+                        filename: url.lastPathComponent,
+                        fileExtension: url.pathExtension.lowercased(),
+                        month: monthURL.lastPathComponent,
+                        sizeBytes: stat.size,
+                        allocatedBytes: stat.allocated,
+                        inode: stat.inode,
+                        nlink: stat.nlink,
+                        mtime: stat.mtime,
+                        status: .notArchivable,
+                        candidateReason: "疑似转发了 WeVault tombstone 占位文件；请恢复原件后重新发送"
+                    ))
+                    continue
+                }
                 result.append(FileRecord(
                     path: url.path,
                     relativePath: url.pathRelative(to: baseRoot),

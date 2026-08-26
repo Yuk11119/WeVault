@@ -2,14 +2,20 @@ import SwiftUI
 import WeVaultCore
 
 struct DetailView: View {
+    @State private var createTombstone = true
+
     let file: FileRecord?
     let families: [FamilyRecord]
     let cloudSnapshot: CloudArchiveSnapshot?
     let archivedSnapshot: ArchivedFileSnapshot?
     let isRestoring: Bool
+    let isReleasing: Bool
     let onRestoreDefault: () -> Void
     let onRestoreToDirectory: () -> Void
     let onRestoreOriginalPath: () -> Void
+    let onQuarantineLocal: (Bool) -> Void
+    let onRollbackLocal: () -> Void
+    let onFinalizeLocalRelease: () -> Void
 
     var family: FamilyRecord? {
         guard let file else { return nil }
@@ -19,8 +25,29 @@ struct DetailView: View {
     var canRestore: Bool {
         guard let archivedSnapshot else { return false }
         return archivedSnapshot.object.verifyStatus == .verified &&
-            (archivedSnapshot.binding.archiveState == .verified || archivedSnapshot.binding.archiveState == .restored) &&
+            (archivedSnapshot.binding.archiveState == .verified || archivedSnapshot.binding.archiveState == .restored || archivedSnapshot.binding.archiveState == .localReleased) &&
             !isRestoring
+    }
+
+    var canQuarantineLocal: Bool {
+        guard let archivedSnapshot else { return false }
+        return LocalReleaseService.isEligibleForPhase5Quarantine(archivedSnapshot) && !isReleasing
+    }
+
+    var canRollbackLocal: Bool {
+        guard let archivedSnapshot else { return false }
+        return archivedSnapshot.archivedFile.objectType == .ordinaryFile &&
+            (archivedSnapshot.binding.localState == .quarantined || archivedSnapshot.binding.localState == .tombstoned) &&
+            archivedSnapshot.binding.quarantinePath != nil &&
+            !isReleasing
+    }
+
+    var canFinalizeLocalRelease: Bool {
+        guard let archivedSnapshot else { return false }
+        return archivedSnapshot.archivedFile.objectType == .ordinaryFile &&
+            (archivedSnapshot.binding.localState == .quarantined || archivedSnapshot.binding.localState == .tombstoned) &&
+            archivedSnapshot.binding.quarantinePath != nil &&
+            !isReleasing
     }
 
     var body: some View {
@@ -64,6 +91,12 @@ struct DetailView: View {
                                 row("引用数量", "\(cloudSnapshot.object.refCount)")
                                 row("Binding", cloudSnapshot.binding.bindingID)
                                 row("本地状态", cloudSnapshot.binding.localState.rawValue)
+                                row("隔离路径", cloudSnapshot.binding.quarantinePath ?? "-")
+                                row("占位路径", cloudSnapshot.binding.placeholderPath ?? "-")
+                                row("占位格式", cloudSnapshot.binding.placeholderFormat ?? "-")
+                                row("占位 SHA", cloudSnapshot.binding.placeholderSHA256 ?? "-")
+                                row("占位大小", cloudSnapshot.binding.placeholderSize.map(humanBytes) ?? "-")
+                                row("释放时间", cloudSnapshot.binding.releasedAt?.formatted(date: .numeric, time: .standard) ?? "-")
                                 row("恢复时间", cloudSnapshot.binding.restoredAt?.formatted(date: .numeric, time: .standard) ?? "-")
                                 row("最后恢复校验", cloudSnapshot.binding.lastRestoreCheckAt?.formatted(date: .numeric, time: .standard) ?? "-")
                             }
@@ -96,6 +129,32 @@ struct DetailView: View {
                                     Button("受控恢复到原微信路径", action: onRestoreOriginalPath)
                                         .disabled(!canRestore)
                                     Text("不会覆盖已有的不同文件；不会生成占位文件。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+
+                        if archivedSnapshot != nil {
+                            detailSection("本地释放") {
+                                releaseCopy(for: file.objectType)
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                if file.objectType == .ordinaryFile {
+                                    HStack {
+                                        Button("释放本地原件") {
+                                            onQuarantineLocal(createTombstone)
+                                        }
+                                            .disabled(!canQuarantineLocal)
+                                        Button("从隔离区回滚", action: onRollbackLocal)
+                                            .disabled(!canRollbackLocal)
+                                    }
+                                    Toggle("在微信原路径生成 tombstone 占位提示", isOn: $createTombstone)
+                                        .disabled(!canQuarantineLocal)
+                                    Button("确认释放空间", action: onFinalizeLocalRelease)
+                                        .disabled(!canFinalizeLocalRelease)
+                                    Text("默认会把原件移动到工具 quarantine；支持同类型 tombstone 的文件会在微信原路径写入 WeVault 占位文件。微信中直接转发或导出该附件时，可能得到占位提示，不是原件。确认释放只删除隔离副本，不删除云端对象或 manifest。")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -145,6 +204,17 @@ struct DetailView: View {
             return "高清版本已归档；如需保存高清/原图，请先恢复高清版本。"
         case .videoRawLayer:
             return "视频可正常播放；高质量导出版本已归档，如需保存/导出高清版本，请先恢复 Raw 层。"
+        }
+    }
+
+    private func releaseCopy(for objectType: ArchiveObjectType) -> Text {
+        switch objectType {
+        case .ordinaryFile:
+            return Text("阶段 5 仅支持已校验普通文件的受控本地释放；支持同类型 tombstone 的文件默认在微信原路径生成强标识占位文件，占位不是原件。")
+        case .imageHighLayer:
+            return Text("图片高清层释放属于阶段 6，当前不开放。")
+        case .videoRawLayer:
+            return Text("视频 Raw 层释放属于阶段 7，当前不开放。")
         }
     }
 }

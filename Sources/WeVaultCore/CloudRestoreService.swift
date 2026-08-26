@@ -36,7 +36,8 @@ public final class CloudRestoreService: Sendable {
         config: S3CompatibleStorageConfig,
         store: ManifestStore
     ) async throws -> CloudRestoreResult {
-        guard snapshot.object.verifyStatus == .verified, snapshot.binding.archiveState == .verified || snapshot.binding.archiveState == .restored else {
+        guard snapshot.object.verifyStatus == .verified,
+              snapshot.binding.archiveState == .verified || snapshot.binding.archiveState == .restored || snapshot.binding.archiveState == .localReleased else {
             throw WeVaultError.cloud("Only verified cloud objects can be restored")
         }
         guard snapshot.binding.cloudObjectID == snapshot.object.cloudObjectID else {
@@ -44,6 +45,10 @@ public final class CloudRestoreService: Sendable {
         }
 
         let targetURL = try resolvedTargetURL(for: snapshot.archivedFile, destination: destination)
+        let restoreToOriginalPath = {
+            if case .originalPath = destination { return true }
+            return false
+        }()
         let now = Date()
         try store.updateRestoreState(
             bindingID: snapshot.binding.bindingID,
@@ -55,7 +60,7 @@ public final class CloudRestoreService: Sendable {
         try store.logOperation("RESTORE_STARTED", detail: targetURL.path)
 
         do {
-            let finalURL = try await downloadAndVerify(snapshot: snapshot, targetURL: targetURL, config: config)
+            let finalURL = try await downloadAndVerify(snapshot: snapshot, targetURL: targetURL, restoreToOriginalPath: restoreToOriginalPath, config: config)
             let digest = try sha256File(finalURL)
             let completedAt = Date()
             try store.updateRestoreState(
@@ -65,6 +70,9 @@ public final class CloudRestoreService: Sendable {
                 restoredAt: completedAt,
                 lastRestoreCheckAt: completedAt
             )
+            if restoreToOriginalPath {
+                try store.clearPlaceholderState(bindingID: snapshot.binding.bindingID)
+            }
             try store.logOperation("RESTORE_FINISHED", detail: finalURL.path)
             return CloudRestoreResult(destinationURL: finalURL, sha256: digest)
         } catch {
@@ -80,16 +88,21 @@ public final class CloudRestoreService: Sendable {
         }
     }
 
-    private func downloadAndVerify(snapshot: ArchivedFileSnapshot, targetURL: URL, config: S3CompatibleStorageConfig) async throws -> URL {
+    private func downloadAndVerify(snapshot: ArchivedFileSnapshot, targetURL: URL, restoreToOriginalPath: Bool, config: S3CompatibleStorageConfig) async throws -> URL {
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         if fileManager.fileExists(atPath: targetURL.path) {
             let existingHash = try sha256File(targetURL)
-            guard existingHash == snapshot.archivedFile.sha256 else {
+            if existingHash == snapshot.archivedFile.sha256 {
+                return targetURL
+            }
+            if restoreToOriginalPath {
+                try Tombstone.validatePlaceholder(at: targetURL, binding: snapshot.binding)
+                try fileManager.removeItem(at: targetURL)
+            } else {
                 throw WeVaultError.fileSystem("Refusing to overwrite existing file at \(targetURL.path)")
             }
-            return targetURL
         }
 
         let temporaryURL = targetURL.deletingLastPathComponent()

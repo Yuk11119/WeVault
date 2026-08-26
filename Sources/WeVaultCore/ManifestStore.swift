@@ -148,6 +148,13 @@ public final class ManifestStore: @unchecked Sendable {
             local_state TEXT NOT NULL,
             restored_at REAL,
             last_restore_check_at REAL,
+            released_at REAL,
+            quarantine_path TEXT,
+            placeholder_path TEXT,
+            placeholder_created_at REAL,
+            placeholder_format TEXT,
+            placeholder_sha256 TEXT,
+            placeholder_size INTEGER,
             updated_at REAL NOT NULL,
             UNIQUE(file_path, cloud_object_id),
             FOREIGN KEY(cloud_object_id) REFERENCES cloud_objects(cloud_object_id)
@@ -155,6 +162,13 @@ public final class ManifestStore: @unchecked Sendable {
         """)
         try addColumnIfNeeded(table: "archive_bindings", definition: "restored_at REAL")
         try addColumnIfNeeded(table: "archive_bindings", definition: "last_restore_check_at REAL")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "released_at REAL")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "quarantine_path TEXT")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "placeholder_path TEXT")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "placeholder_created_at REAL")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "placeholder_format TEXT")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "placeholder_sha256 TEXT")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "placeholder_size INTEGER")
         try execute("""
         CREATE TABLE IF NOT EXISTS archived_files (
             file_path TEXT PRIMARY KEY,
@@ -304,7 +318,9 @@ public final class ManifestStore: @unchecked Sendable {
         let sql = """
         SELECT co.cloud_object_id, co.sha256, co.size_bytes, co.storage_provider, co.bucket_or_container, co.object_key,
                co.uploaded_at, co.verified_at, co.verify_status, co.ref_count,
-               ab.binding_id, ab.file_path, ab.archive_state, ab.local_state, ab.restored_at, ab.last_restore_check_at
+               ab.binding_id, ab.file_path, ab.archive_state, ab.local_state, ab.restored_at, ab.last_restore_check_at,
+               ab.released_at, ab.quarantine_path, ab.placeholder_path, ab.placeholder_created_at,
+               ab.placeholder_format, ab.placeholder_sha256, ab.placeholder_size
         FROM archive_bindings ab
         JOIN cloud_objects co ON co.cloud_object_id = ab.cloud_object_id
         """
@@ -319,7 +335,14 @@ public final class ManifestStore: @unchecked Sendable {
                     archiveState: ArchiveBindingState(rawValue: columnText(stmt, 12)) ?? .uploaded,
                     localState: LocalArchiveState(rawValue: columnText(stmt, 13)) ?? .localPresent,
                     restoredAt: optionalDate(stmt, 14),
-                    lastRestoreCheckAt: optionalDate(stmt, 15)
+                    lastRestoreCheckAt: optionalDate(stmt, 15),
+                    releasedAt: optionalDate(stmt, 16),
+                    quarantinePath: optionalText(stmt, 17),
+                    placeholderPath: optionalText(stmt, 18),
+                    placeholderCreatedAt: optionalDate(stmt, 19),
+                    placeholderFormat: optionalText(stmt, 20),
+                    placeholderSHA256: optionalText(stmt, 21),
+                    placeholderSize: optionalInt64(stmt, 22)
                 )
                 snapshots[binding.filePath] = CloudArchiveSnapshot(object: object, binding: binding)
             }
@@ -333,6 +356,8 @@ public final class ManifestStore: @unchecked Sendable {
                af.month, af.size_bytes, af.sha256, af.mtime, af.family_id, af.display_or_playback_path,
                af.bubble_or_thumb_path, af.archived_at, af.updated_at,
                ab.binding_id, ab.archive_state, ab.local_state, ab.restored_at, ab.last_restore_check_at,
+               ab.released_at, ab.quarantine_path, ab.placeholder_path, ab.placeholder_created_at,
+               ab.placeholder_format, ab.placeholder_sha256, ab.placeholder_size,
                co.cloud_object_id, co.sha256, co.size_bytes, co.storage_provider, co.bucket_or_container, co.object_key,
                co.uploaded_at, co.verified_at, co.verify_status, co.ref_count
         FROM archived_files af
@@ -346,13 +371,20 @@ public final class ManifestStore: @unchecked Sendable {
                 let binding = ArchiveBinding(
                     bindingID: columnText(stmt, 15),
                     filePath: archivedFile.filePath,
-                    cloudObjectID: columnText(stmt, 20),
+                    cloudObjectID: columnText(stmt, 27),
                     archiveState: ArchiveBindingState(rawValue: columnText(stmt, 16)) ?? .uploaded,
                     localState: LocalArchiveState(rawValue: columnText(stmt, 17)) ?? .localPresent,
                     restoredAt: optionalDate(stmt, 18),
-                    lastRestoreCheckAt: optionalDate(stmt, 19)
+                    lastRestoreCheckAt: optionalDate(stmt, 19),
+                    releasedAt: optionalDate(stmt, 20),
+                    quarantinePath: optionalText(stmt, 21),
+                    placeholderPath: optionalText(stmt, 22),
+                    placeholderCreatedAt: optionalDate(stmt, 23),
+                    placeholderFormat: optionalText(stmt, 24),
+                    placeholderSHA256: optionalText(stmt, 25),
+                    placeholderSize: optionalInt64(stmt, 26)
                 )
-                let object = readCloudObject(stmt, offset: 20)
+                let object = readCloudObject(stmt, offset: 27)
                 snapshots[archivedFile.filePath] = ArchivedFileSnapshot(archivedFile: archivedFile, binding: binding, object: object)
             }
         }
@@ -371,6 +403,54 @@ public final class ManifestStore: @unchecked Sendable {
             bindOptionalDate(stmt, 4, lastRestoreCheckAt)
             sqlite3_bind_double(stmt, 5, Date().timeIntervalSince1970)
             bindText(stmt, 6, bindingID)
+            try stepDone(stmt)
+        }
+    }
+
+    public func updateLocalReleaseState(
+        bindingID: String,
+        archiveState: ArchiveBindingState,
+        localState: LocalArchiveState,
+        releasedAt: Date?,
+        quarantinePath: String?,
+        placeholderPath: String? = nil,
+        placeholderCreatedAt: Date? = nil,
+        placeholderFormat: String? = nil,
+        placeholderSHA256: String? = nil,
+        placeholderSize: Int64? = nil
+    ) throws {
+        try withStatement("""
+        UPDATE archive_bindings
+        SET archive_state = ?, local_state = ?, released_at = ?, quarantine_path = ?,
+            placeholder_path = ?, placeholder_created_at = ?, placeholder_format = ?,
+            placeholder_sha256 = ?, placeholder_size = ?, updated_at = ?
+        WHERE binding_id = ?
+        """) { stmt in
+            bindText(stmt, 1, archiveState.rawValue)
+            bindText(stmt, 2, localState.rawValue)
+            bindOptionalDate(stmt, 3, releasedAt)
+            bindOptionalText(stmt, 4, quarantinePath)
+            bindOptionalText(stmt, 5, placeholderPath)
+            bindOptionalDate(stmt, 6, placeholderCreatedAt)
+            bindOptionalText(stmt, 7, placeholderFormat)
+            bindOptionalText(stmt, 8, placeholderSHA256)
+            bindOptionalInt64(stmt, 9, placeholderSize)
+            sqlite3_bind_double(stmt, 10, Date().timeIntervalSince1970)
+            bindText(stmt, 11, bindingID)
+            try stepDone(stmt)
+        }
+    }
+
+    public func clearPlaceholderState(bindingID: String) throws {
+        try withStatement("""
+        UPDATE archive_bindings
+        SET placeholder_path = NULL, placeholder_created_at = NULL, placeholder_format = NULL,
+            placeholder_sha256 = NULL, placeholder_size = NULL, quarantine_path = NULL,
+            updated_at = ?
+        WHERE binding_id = ?
+        """) { stmt in
+            sqlite3_bind_double(stmt, 1, Date().timeIntervalSince1970)
+            bindText(stmt, 2, bindingID)
             try stepDone(stmt)
         }
     }
@@ -433,8 +513,11 @@ public final class ManifestStore: @unchecked Sendable {
     private func upsert(_ binding: ArchiveBinding) throws {
         let sql = """
         INSERT OR REPLACE INTO archive_bindings (
-            binding_id, file_path, cloud_object_id, archive_state, local_state, restored_at, last_restore_check_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            binding_id, file_path, cloud_object_id, archive_state, local_state,
+            restored_at, last_restore_check_at, released_at, quarantine_path,
+            placeholder_path, placeholder_created_at, placeholder_format, placeholder_sha256,
+            placeholder_size, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try withStatement(sql) { stmt in
             bindText(stmt, 1, binding.bindingID)
@@ -444,7 +527,14 @@ public final class ManifestStore: @unchecked Sendable {
             bindText(stmt, 5, binding.localState.rawValue)
             bindOptionalDate(stmt, 6, binding.restoredAt)
             bindOptionalDate(stmt, 7, binding.lastRestoreCheckAt)
-            sqlite3_bind_double(stmt, 8, Date().timeIntervalSince1970)
+            bindOptionalDate(stmt, 8, binding.releasedAt)
+            bindOptionalText(stmt, 9, binding.quarantinePath)
+            bindOptionalText(stmt, 10, binding.placeholderPath)
+            bindOptionalDate(stmt, 11, binding.placeholderCreatedAt)
+            bindOptionalText(stmt, 12, binding.placeholderFormat)
+            bindOptionalText(stmt, 13, binding.placeholderSHA256)
+            bindOptionalInt64(stmt, 14, binding.placeholderSize)
+            sqlite3_bind_double(stmt, 15, Date().timeIntervalSince1970)
             try stepDone(stmt)
         }
     }
@@ -600,11 +690,26 @@ private func bindOptionalDate(_ stmt: OpaquePointer?, _ index: Int32, _ value: D
     }
 }
 
+private func bindOptionalInt64(_ stmt: OpaquePointer?, _ index: Int32, _ value: Int64?) {
+    if let value {
+        sqlite3_bind_int64(stmt, index, value)
+    } else {
+        sqlite3_bind_null(stmt, index)
+    }
+}
+
 private func optionalDate(_ stmt: OpaquePointer?, _ index: Int32) -> Date? {
     if sqlite3_column_type(stmt, index) == SQLITE_NULL {
         return nil
     }
     return Date(timeIntervalSince1970: sqlite3_column_double(stmt, index))
+}
+
+private func optionalInt64(_ stmt: OpaquePointer?, _ index: Int32) -> Int64? {
+    if sqlite3_column_type(stmt, index) == SQLITE_NULL {
+        return nil
+    }
+    return sqlite3_column_int64(stmt, index)
 }
 
 private func columnText(_ stmt: OpaquePointer?, _ index: Int32) -> String {
