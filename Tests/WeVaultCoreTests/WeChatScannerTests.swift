@@ -481,23 +481,240 @@ struct WeChatScannerTests {
         #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_FAILED'") == 1)
     }
 
-    @Test("local release rejects image and video media layers in phase five")
-    func localReleaseRejectsMediaLayers() async throws {
+    @Test("phase six releases image high layer but keeps video raw layer closed")
+    func phaseSixReleasesImageHighLayerOnly() async throws {
         let fixture = try Fixture()
         let context = try await fixture.uploadedArchiveContext()
         let image = try #require(context.archived.values.first { $0.archivedFile.objectType == .imageHighLayer })
         let video = try #require(context.archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
         let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
 
-        #expect(throws: WeVaultError.self) {
-            _ = try service.quarantine(snapshot: image, store: context.store, userConfirmed: true, skipRestoreTest: true)
-        }
+        let releasedImage = try service.quarantineImageHighLayer(snapshot: image, store: context.store, userConfirmed: true)
+
+        #expect(!FileManager.default.fileExists(atPath: image.archivedFile.filePath))
+        #expect(FileManager.default.fileExists(atPath: try #require(image.archivedFile.displayOrPlaybackPath)))
+        #expect(FileManager.default.fileExists(atPath: try #require(image.archivedFile.bubbleOrThumbPath)))
+        #expect(FileManager.default.fileExists(atPath: try #require(releasedImage.quarantineURL).path))
+        #expect(try sha256File(try #require(releasedImage.quarantineURL)) == image.archivedFile.sha256)
+
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[image.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .quarantined)
+        #expect(refreshed.binding.archiveState == .verified)
+        #expect(refreshed.binding.placeholderPath == nil)
+        #expect(refreshed.binding.placeholderCreatedAt == nil)
+        #expect(refreshed.binding.placeholderFormat == nil)
+        #expect(refreshed.binding.placeholderSHA256 == nil)
+        #expect(refreshed.binding.placeholderSize == nil)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'IMAGE_HIGH_RELEASE_QUARANTINE_FINISHED'") == 1)
+
         #expect(throws: WeVaultError.self) {
             _ = try service.quarantine(snapshot: video, store: context.store, userConfirmed: true, skipRestoreTest: true)
         }
-        #expect(FileManager.default.fileExists(atPath: image.archivedFile.filePath))
         #expect(FileManager.default.fileExists(atPath: video.archivedFile.filePath))
-        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_FAILED'") == 2)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase six image release rejects missing display layer")
+    func phaseSixImageReleaseRejectsMissingDisplayLayer() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let image = try #require(context.archived.values.first { $0.archivedFile.objectType == .imageHighLayer })
+        let missingDisplay = snapshotByRemovingImageLayers(image, removeDisplay: true)
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineImageHighLayer(snapshot: missingDisplay, store: context.store, userConfirmed: true)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: image.archivedFile.filePath))
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'IMAGE_HIGH_RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase six image release rejects missing bubble or thumb layer")
+    func phaseSixImageReleaseRejectsMissingBubbleOrThumbLayer() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let image = try #require(context.archived.values.first { $0.archivedFile.objectType == .imageHighLayer })
+        let missingBubble = snapshotByRemovingImageLayers(image, removeBubbleOrThumb: true)
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineImageHighLayer(snapshot: missingBubble, store: context.store, userConfirmed: true)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: image.archivedFile.filePath))
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'IMAGE_HIGH_RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase six image release rejects changed local sha")
+    func phaseSixImageReleaseRejectsChangedSHA() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let image = try #require(context.archived.values.first { $0.archivedFile.objectType == .imageHighLayer })
+        try fixture.write("changed-high-layer", to: URL(fileURLWithPath: image.archivedFile.filePath))
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineImageHighLayer(snapshot: image, store: context.store, userConfirmed: true)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: image.archivedFile.filePath))
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[image.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .releaseFailed)
+        #expect(refreshed.binding.archiveState == .releaseFailed)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'IMAGE_HIGH_RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase six image release rejects unverified cloud object")
+    func phaseSixImageReleaseRejectsUnverifiedCloudObject() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+        _ = try await CloudUploadService { _ in MockObjectStorageClient(headSizeDelta: 1) }.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+        let image = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.objectType == .imageHighLayer })
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineImageHighLayer(snapshot: image, store: store, userConfirmed: true)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: image.archivedFile.filePath))
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'IMAGE_HIGH_RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase six image release requires user confirmation")
+    func phaseSixImageReleaseRequiresUserConfirmation() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let image = try #require(context.archived.values.first { $0.archivedFile.objectType == .imageHighLayer })
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineImageHighLayer(snapshot: image, store: context.store, userConfirmed: false)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: image.archivedFile.filePath))
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'IMAGE_HIGH_RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase six image release removes auto recovered copy when quarantine already has same sha")
+    func phaseSixImageReleaseRemovesAutoRecoveredCopy() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let image = try #require(context.archived.values.first { $0.archivedFile.objectType == .imageHighLayer })
+        let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
+        let firstRelease = try service.quarantineImageHighLayer(snapshot: image, store: context.store, userConfirmed: true)
+        let quarantineURL = try #require(firstRelease.quarantineURL)
+        try FileManager.default.copyItem(at: quarantineURL, to: URL(fileURLWithPath: image.archivedFile.filePath))
+        let autoRecovered = try #require(try context.store.archivedFileSnapshots()[image.archivedFile.filePath])
+
+        let secondRelease = try service.quarantineImageHighLayer(snapshot: autoRecovered, store: context.store, userConfirmed: true)
+
+        #expect(!FileManager.default.fileExists(atPath: image.archivedFile.filePath))
+        #expect(secondRelease.quarantineURL?.path == quarantineURL.path)
+        #expect(FileManager.default.fileExists(atPath: quarantineURL.path))
+        #expect(try sha256File(quarantineURL) == image.archivedFile.sha256)
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[image.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .quarantined)
+        #expect(refreshed.binding.quarantinePath == quarantineURL.path)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'IMAGE_HIGH_RELEASE_AUTO_RECOVERED_COPY_REMOVED'") == 1)
+    }
+
+    @Test("cloud upload does not clear quarantined image release state")
+    func cloudUploadDoesNotClearQuarantinedImageReleaseState() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let scan = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: scan)
+        let client = MockObjectStorageClient()
+        _ = try await CloudUploadService { _ in client }.upload(files: scan.files, families: scan.families, config: fixture.storageConfig, store: store)
+        let image = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.objectType == .imageHighLayer })
+        let released = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineImageHighLayer(snapshot: image, store: store, userConfirmed: true)
+        let quarantinePath = try #require(released.quarantineURL?.path)
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: quarantinePath), to: URL(fileURLWithPath: image.archivedFile.filePath))
+
+        let refreshedScan = try WeChatScanner().scan(root: fixture.root)
+        try store.save(scanResult: refreshedScan)
+        _ = try await CloudUploadService { _ in client }.upload(files: refreshedScan.files, families: refreshedScan.families, config: fixture.storageConfig, store: store)
+
+        let refreshed = try #require(try store.archivedFileSnapshots()[image.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .quarantined)
+        #expect(refreshed.binding.quarantinePath == quarantinePath)
+        #expect(refreshed.archivedFile.displayOrPlaybackPath?.hasSuffix("photo.dat") == true)
+        #expect(refreshed.archivedFile.bubbleOrThumbPath?.hasSuffix("photo_b.dat") == true)
+    }
+
+    @Test("restored image high layer scans and releases again without reupload")
+    func restoredImageHighLayerScansAndReleasesAgainWithoutReupload() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let scan = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: scan)
+        let client = MockObjectStorageClient()
+        _ = try await CloudUploadService { _ in client }.upload(files: scan.files, families: scan.families, config: fixture.storageConfig, store: store)
+        let initialPutCount = client.putKeys.count
+        let image = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.objectType == .imageHighLayer })
+        let releaseService = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
+        let firstRelease = try releaseService.quarantineImageHighLayer(snapshot: image, store: store, userConfirmed: true)
+        let quarantineURL = try #require(firstRelease.quarantineURL)
+        let released = try #require(try store.archivedFileSnapshots()[image.archivedFile.filePath])
+
+        let restored = try await CloudRestoreService { _ in client }.restore(
+            snapshot: released,
+            destination: .originalPath,
+            config: fixture.storageConfig,
+            store: store
+        )
+        #expect(restored.destinationURL.path == image.archivedFile.filePath)
+        #expect(try sha256File(restored.destinationURL) == image.archivedFile.sha256)
+        #expect(!FileManager.default.fileExists(atPath: quarantineURL.path))
+
+        let refreshedScan = try WeChatScanner().scan(root: fixture.root)
+        try store.save(scanResult: refreshedScan)
+        _ = try await CloudUploadService { _ in client }.upload(files: refreshedScan.files, families: refreshedScan.families, config: fixture.storageConfig, store: store)
+
+        #expect(client.putKeys.count == initialPutCount)
+        #expect(try fixture.countRows(table: "cloud_objects", whereClause: "sha256 = '\(image.archivedFile.sha256)' AND verify_status = 'VERIFIED'") == 1)
+
+        let afterUpload = try #require(try store.archivedFileSnapshots()[image.archivedFile.filePath])
+        let secondRelease = try releaseService.quarantineImageHighLayer(snapshot: afterUpload, store: store, userConfirmed: true)
+
+        #expect(!FileManager.default.fileExists(atPath: image.archivedFile.filePath))
+        #expect(secondRelease.quarantineURL?.path == quarantineURL.path)
+        #expect(FileManager.default.fileExists(atPath: quarantineURL.path))
+        #expect(try sha256File(quarantineURL) == image.archivedFile.sha256)
+    }
+
+    @Test("restore to original path removes matching quarantine when image was already auto recovered")
+    func restoreOriginalPathRemovesQuarantineForAutoRecoveredImage() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let scan = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: scan)
+        let client = MockObjectStorageClient()
+        _ = try await CloudUploadService { _ in client }.upload(files: scan.files, families: scan.families, config: fixture.storageConfig, store: store)
+        let image = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.objectType == .imageHighLayer })
+        let released = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineImageHighLayer(snapshot: image, store: store, userConfirmed: true)
+        let quarantineURL = try #require(released.quarantineURL)
+        try FileManager.default.copyItem(at: quarantineURL, to: URL(fileURLWithPath: image.archivedFile.filePath))
+        let autoRecovered = try #require(try store.archivedFileSnapshots()[image.archivedFile.filePath])
+        let downloadCountBeforeRestore = client.downloadedKeys.count
+
+        let restored = try await CloudRestoreService { _ in client }.restore(
+            snapshot: autoRecovered,
+            destination: .originalPath,
+            config: fixture.storageConfig,
+            store: store
+        )
+
+        #expect(restored.destinationURL.path == image.archivedFile.filePath)
+        #expect(try sha256File(restored.destinationURL) == image.archivedFile.sha256)
+        #expect(!FileManager.default.fileExists(atPath: quarantineURL.path))
+        #expect(client.downloadedKeys.count == downloadCountBeforeRestore)
+        let refreshed = try #require(try store.archivedFileSnapshots()[image.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .restored)
+        #expect(refreshed.binding.quarantinePath == nil)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RESTORE_REMOVED_MATCHING_QUARANTINE'") == 1)
     }
 
     @Test("local release rollback restores quarantined file to original path")
@@ -688,6 +905,32 @@ private func renamedSnapshot(_ snapshot: ArchivedFileSnapshot, filename: String)
     return ArchivedFileSnapshot(archivedFile: archivedFile, binding: snapshot.binding, object: snapshot.object)
 }
 
+private func snapshotByRemovingImageLayers(
+    _ snapshot: ArchivedFileSnapshot,
+    removeDisplay: Bool = false,
+    removeBubbleOrThumb: Bool = false
+) -> ArchivedFileSnapshot {
+    let archived = snapshot.archivedFile
+    let archivedFile = ArchivedFile(
+        filePath: archived.filePath,
+        objectType: archived.objectType,
+        originalFilename: archived.originalFilename,
+        relativePath: archived.relativePath,
+        accountHash: archived.accountHash,
+        accountName: archived.accountName,
+        month: archived.month,
+        sizeBytes: archived.sizeBytes,
+        sha256: archived.sha256,
+        mtime: archived.mtime,
+        familyID: archived.familyID,
+        displayOrPlaybackPath: removeDisplay ? nil : archived.displayOrPlaybackPath,
+        bubbleOrThumbPath: removeBubbleOrThumb ? nil : archived.bubbleOrThumbPath,
+        archivedAt: archived.archivedAt,
+        updatedAt: archived.updatedAt
+    )
+    return ArchivedFileSnapshot(archivedFile: archivedFile, binding: snapshot.binding, object: snapshot.object)
+}
+
 private func runPythonDeflatedTombstone(destination: URL) throws {
     let script = """
     import sys, zipfile
@@ -740,6 +983,7 @@ private struct Fixture {
 
         try write("normal", to: account.appendingPathComponent("msg/attach/res1/Img/2026-01/photo.dat"))
         try write("high-resolution", to: account.appendingPathComponent("msg/attach/res1/Img/2026-01/photo_h.dat"))
+        try write("bubble", to: account.appendingPathComponent("msg/attach/res1/Img/2026-01/photo_b.dat"))
         try write("high-only", to: account.appendingPathComponent("msg/attach/res2/Img/2026-01/lonely_h.dat"))
 
         try write("play", to: account.appendingPathComponent("msg/video/2026-01/clip.mp4"))

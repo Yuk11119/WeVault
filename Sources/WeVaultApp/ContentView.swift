@@ -490,15 +490,30 @@ final class ScanViewModel: ObservableObject {
         Task {
             do {
                 let store = try ManifestStore()
-                let result = try LocalReleaseService().quarantine(
-                    snapshot: snapshot,
-                    store: store,
-                    userConfirmed: true,
-                    skipRestoreTest: true,
-                    createTombstone: createTombstone
-                )
+                let releaseService = LocalReleaseService()
+                let result: LocalReleaseResult
+                switch snapshot.archivedFile.objectType {
+                case .ordinaryFile:
+                    result = try releaseService.quarantine(
+                        snapshot: snapshot,
+                        store: store,
+                        userConfirmed: true,
+                        skipRestoreTest: true,
+                        createTombstone: createTombstone
+                    )
+                case .imageHighLayer:
+                    result = try releaseService.quarantineImageHighLayer(
+                        snapshot: snapshot,
+                        store: store,
+                        userConfirmed: true
+                    )
+                case .videoRawLayer:
+                    throw WeVaultError.fileSystem("视频 Raw 层释放属于阶段 7，当前不开放")
+                }
                 try refreshArchiveSnapshots(store: store)
-                if let placeholder = result.placeholderURL {
+                if snapshot.archivedFile.objectType == .imageHighLayer {
+                    releaseMessage = "图片高清层已进入隔离区，原高清路径为空；普通查看层仍在本地，高清/原图需要时可从云端恢复。"
+                } else if let placeholder = result.placeholderURL {
                     releaseMessage = "原件已进入隔离区，微信原路径已写入 tombstone：\(placeholder.path)"
                 } else if createTombstone {
                     releaseMessage = "原件已进入隔离区；当前文件类型未生成同类型 tombstone，微信原路径为空。"

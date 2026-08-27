@@ -71,6 +71,7 @@ public final class CloudRestoreService: Sendable {
                 lastRestoreCheckAt: completedAt
             )
             if restoreToOriginalPath {
+                try removeMatchingQuarantineCopyIfNeeded(snapshot: snapshot, restoredURL: finalURL, store: store)
                 try store.clearPlaceholderState(bindingID: snapshot.binding.bindingID)
             }
             try store.logOperation("RESTORE_FINISHED", detail: finalURL.path)
@@ -128,6 +129,22 @@ public final class CloudRestoreService: Sendable {
             throw WeVaultError.cloud("Final restored SHA-256 mismatch for \(snapshot.archivedFile.originalFilename)")
         }
         return targetURL
+    }
+
+    private func removeMatchingQuarantineCopyIfNeeded(snapshot: ArchivedFileSnapshot, restoredURL: URL, store: ManifestStore) throws {
+        guard let quarantinePath = snapshot.binding.quarantinePath else { return }
+        let quarantineURL = URL(fileURLWithPath: quarantinePath)
+        guard FileManager.default.fileExists(atPath: quarantineURL.path) else { return }
+
+        let restoredDigest = try sha256File(restoredURL)
+        let quarantineDigest = try sha256File(quarantineURL)
+        guard restoredDigest == snapshot.archivedFile.sha256,
+              quarantineDigest == snapshot.archivedFile.sha256 else {
+            throw WeVaultError.fileSystem("Refusing to remove quarantine copy because SHA-256 does not match manifest")
+        }
+
+        try FileManager.default.removeItem(at: quarantineURL)
+        try store.logOperation("RESTORE_REMOVED_MATCHING_QUARANTINE", detail: quarantineURL.path)
     }
 
     private func resolvedTargetURL(for archivedFile: ArchivedFile, destination: RestoreDestination) throws -> URL {

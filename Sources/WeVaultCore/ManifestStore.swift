@@ -39,6 +39,7 @@ public final class ManifestStore: @unchecked Sendable {
             for group in scanResult.duplicateGroups {
                 try insert(group)
             }
+            try backfillArchivedFilesFromCurrentSnapshot()
             try logOperation("SCAN_FINISHED", detail: "files=\(scanResult.files.count), families=\(scanResult.families.count), duplicates=\(scanResult.duplicateGroups.count)")
             try execute("COMMIT")
         } catch {
@@ -199,7 +200,7 @@ public final class ManifestStore: @unchecked Sendable {
 
     private func backfillArchivedFilesFromCurrentSnapshot() throws {
         try execute("""
-        INSERT OR IGNORE INTO archived_files (
+        INSERT INTO archived_files (
             file_path, object_type, original_filename, relative_path, account_hash, account_name,
             month, size_bytes, sha256, mtime, family_id, display_or_playback_path,
             bubble_or_thumb_path, archived_at, updated_at
@@ -211,6 +212,20 @@ public final class ManifestStore: @unchecked Sendable {
         JOIN files f ON f.path = ab.file_path
         LEFT JOIN families fam ON fam.high_or_raw_path = f.path
         WHERE f.sha256 IS NOT NULL
+        ON CONFLICT(file_path) DO UPDATE SET
+            object_type = excluded.object_type,
+            original_filename = excluded.original_filename,
+            relative_path = excluded.relative_path,
+            account_hash = excluded.account_hash,
+            account_name = excluded.account_name,
+            month = excluded.month,
+            size_bytes = excluded.size_bytes,
+            sha256 = excluded.sha256,
+            mtime = excluded.mtime,
+            family_id = COALESCE(excluded.family_id, archived_files.family_id),
+            display_or_playback_path = COALESCE(excluded.display_or_playback_path, archived_files.display_or_playback_path),
+            bubble_or_thumb_path = COALESCE(excluded.bubble_or_thumb_path, archived_files.bubble_or_thumb_path),
+            updated_at = excluded.updated_at
         """)
     }
 
@@ -512,12 +527,36 @@ public final class ManifestStore: @unchecked Sendable {
 
     private func upsert(_ binding: ArchiveBinding) throws {
         let sql = """
-        INSERT OR REPLACE INTO archive_bindings (
+        INSERT INTO archive_bindings (
             binding_id, file_path, cloud_object_id, archive_state, local_state,
             restored_at, last_restore_check_at, released_at, quarantine_path,
             placeholder_path, placeholder_created_at, placeholder_format, placeholder_sha256,
             placeholder_size, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(binding_id) DO UPDATE SET
+            file_path = excluded.file_path,
+            cloud_object_id = excluded.cloud_object_id,
+            archive_state = CASE
+                WHEN excluded.archive_state = 'VERIFIED' AND archive_bindings.archive_state = 'LOCAL_RELEASED'
+                    THEN archive_bindings.archive_state
+                ELSE excluded.archive_state
+            END,
+            local_state = CASE
+                WHEN excluded.local_state = 'LOCAL_PRESENT'
+                     AND archive_bindings.local_state IN ('QUARANTINED', 'TOMBSTONED', 'LOCAL_RELEASED')
+                    THEN archive_bindings.local_state
+                ELSE excluded.local_state
+            END,
+            restored_at = COALESCE(archive_bindings.restored_at, excluded.restored_at),
+            last_restore_check_at = COALESCE(archive_bindings.last_restore_check_at, excluded.last_restore_check_at),
+            released_at = COALESCE(archive_bindings.released_at, excluded.released_at),
+            quarantine_path = COALESCE(archive_bindings.quarantine_path, excluded.quarantine_path),
+            placeholder_path = COALESCE(archive_bindings.placeholder_path, excluded.placeholder_path),
+            placeholder_created_at = COALESCE(archive_bindings.placeholder_created_at, excluded.placeholder_created_at),
+            placeholder_format = COALESCE(archive_bindings.placeholder_format, excluded.placeholder_format),
+            placeholder_sha256 = COALESCE(archive_bindings.placeholder_sha256, excluded.placeholder_sha256),
+            placeholder_size = COALESCE(archive_bindings.placeholder_size, excluded.placeholder_size),
+            updated_at = excluded.updated_at
         """
         try withStatement(sql) { stmt in
             bindText(stmt, 1, binding.bindingID)

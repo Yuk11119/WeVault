@@ -31,12 +31,22 @@ struct DetailView: View {
 
     var canQuarantineLocal: Bool {
         guard let archivedSnapshot else { return false }
-        return LocalReleaseService.isEligibleForPhase5Quarantine(archivedSnapshot) && !isReleasing
+        switch archivedSnapshot.archivedFile.objectType {
+        case .ordinaryFile:
+            return LocalReleaseService.isEligibleForPhase5Quarantine(archivedSnapshot) && !isReleasing
+        case .imageHighLayer:
+            return LocalReleaseService.isEligibleForPhase6ImageHighLayerRelease(archivedSnapshot) && !isReleasing
+        case .videoRawLayer:
+            return false
+        }
     }
 
     var canRollbackLocal: Bool {
         guard let archivedSnapshot else { return false }
-        return archivedSnapshot.archivedFile.objectType == .ordinaryFile &&
+        let originalExists = FileManager.default.fileExists(atPath: archivedSnapshot.archivedFile.filePath)
+        let imageHighLayerCanRollback = archivedSnapshot.archivedFile.objectType == .imageHighLayer && !originalExists
+        let ordinaryCanRollback = archivedSnapshot.archivedFile.objectType == .ordinaryFile
+        return (ordinaryCanRollback || imageHighLayerCanRollback) &&
             (archivedSnapshot.binding.localState == .quarantined || archivedSnapshot.binding.localState == .tombstoned) &&
             archivedSnapshot.binding.quarantinePath != nil &&
             !isReleasing
@@ -141,7 +151,8 @@ struct DetailView: View {
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
-                                if file.objectType == .ordinaryFile {
+                                switch file.objectType {
+                                case .ordinaryFile:
                                     HStack {
                                         Button("释放本地原件") {
                                             onQuarantineLocal(createTombstone)
@@ -157,6 +168,20 @@ struct DetailView: View {
                                     Text("默认会把原件移动到工具 quarantine；支持同类型 tombstone 的文件会在微信原路径写入 WeVault 占位文件。微信中直接转发或导出该附件时，可能得到占位提示，不是原件。确认释放只删除隔离副本，不删除云端对象或 manifest。")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
+                                case .imageHighLayer:
+                                    HStack {
+                                        Button("受控释放高清层") {
+                                            onQuarantineLocal(false)
+                                        }
+                                            .disabled(!canQuarantineLocal)
+                                        Button("从隔离区回滚", action: onRollbackLocal)
+                                            .disabled(!canRollbackLocal)
+                                    }
+                                    Text("阶段 6 只移动 _h.dat / _h_M.dat 高清层到工具 quarantine；原高清路径保持为空，不生成 tombstone。普通查看层和气泡/缩略层必须继续留在本地。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                case .videoRawLayer:
+                                    EmptyView()
                                 }
                             }
                         }
@@ -212,7 +237,7 @@ struct DetailView: View {
         case .ordinaryFile:
             return Text("阶段 5 仅支持已校验普通文件的受控本地释放；支持同类型 tombstone 的文件默认在微信原路径生成强标识占位文件，占位不是原件。")
         case .imageHighLayer:
-            return Text("图片高清层释放属于阶段 6，当前不开放。")
+            return Text("阶段 6 支持图片高清层受控释放：普通查看版本保留在本地，高清/原图需要时从云端恢复；不会生成 tombstone，也不会移动 .dat / _M.dat / _b.dat / _t.dat。")
         case .videoRawLayer:
             return Text("视频 Raw 层释放属于阶段 7，当前不开放。")
         }
