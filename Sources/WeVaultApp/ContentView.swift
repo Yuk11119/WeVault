@@ -508,11 +508,17 @@ final class ScanViewModel: ObservableObject {
                         userConfirmed: true
                     )
                 case .videoRawLayer:
-                    throw WeVaultError.fileSystem("视频 Raw 层释放属于阶段 7，当前不开放")
+                    result = try releaseService.quarantineVideoRawLayer(
+                        snapshot: snapshot,
+                        store: store,
+                        userConfirmed: true
+                    )
                 }
                 try refreshArchiveSnapshots(store: store)
                 if snapshot.archivedFile.objectType == .imageHighLayer {
                     releaseMessage = "图片高清层已进入隔离区，原高清路径为空；普通查看层仍在本地，高清/原图需要时可从云端恢复。"
+                } else if snapshot.archivedFile.objectType == .videoRawLayer {
+                    releaseMessage = "视频 Raw 层已进入隔离区，原 Raw 路径为空；普通播放版本仍在本地，保存/导出高质量版本前请从云端恢复 Raw 层。"
                 } else if let placeholder = result.placeholderURL {
                     releaseMessage = "原件已进入隔离区，微信原路径已写入 tombstone：\(placeholder.path)"
                 } else if createTombstone {

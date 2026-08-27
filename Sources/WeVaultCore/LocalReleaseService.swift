@@ -47,6 +47,18 @@ public final class LocalReleaseService: Sendable {
             snapshot.archivedFile.bubbleOrThumbPath.map { FileManager.default.fileExists(atPath: $0) } == true
     }
 
+    public static func isEligibleForPhase7VideoRawLayerRelease(_ snapshot: ArchivedFileSnapshot) -> Bool {
+        snapshot.archivedFile.objectType == .videoRawLayer &&
+            snapshot.object.verifyStatus == .verified &&
+            (snapshot.binding.archiveState == .verified || snapshot.binding.archiveState == .restored) &&
+            (snapshot.binding.localState == .localPresent ||
+             snapshot.binding.localState == .restored ||
+             snapshot.binding.localState == .quarantined) &&
+            FileManager.default.fileExists(atPath: snapshot.archivedFile.filePath) &&
+            snapshot.archivedFile.displayOrPlaybackPath.map { FileManager.default.fileExists(atPath: $0) } == true &&
+            snapshot.archivedFile.bubbleOrThumbPath.map { FileManager.default.fileExists(atPath: $0) } == true
+    }
+
     public func quarantine(
         snapshot: ArchivedFileSnapshot,
         store: ManifestStore,
@@ -177,6 +189,66 @@ public final class LocalReleaseService: Sendable {
             )
             try? store.updateFileStatus(path: snapshot.archivedFile.filePath, status: .releaseFailed)
             try? store.logOperation("IMAGE_HIGH_RELEASE_FAILED", detail: "\(snapshot.archivedFile.filePath): \(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    public func quarantineVideoRawLayer(
+        snapshot: ArchivedFileSnapshot,
+        store: ManifestStore,
+        userConfirmed: Bool
+    ) throws -> LocalReleaseResult {
+        do {
+            try preflightVideoRawLayerRelease(snapshot: snapshot, userConfirmed: userConfirmed)
+
+            let originalURL = URL(fileURLWithPath: snapshot.archivedFile.filePath)
+            let quarantineURL = quarantineURL(for: snapshot)
+            let digest = try sha256File(originalURL)
+            guard digest == snapshot.archivedFile.sha256 else {
+                throw WeVaultError.fileSystem("Local SHA-256 changed before video raw layer release for \(snapshot.archivedFile.originalFilename)")
+            }
+            if FileManager.default.fileExists(atPath: quarantineURL.path) {
+                let quarantineDigest = try sha256File(quarantineURL)
+                guard quarantineDigest == snapshot.archivedFile.sha256 else {
+                    throw WeVaultError.fileSystem("Quarantine target already exists with different SHA-256 at \(quarantineURL.path)")
+                }
+            } else {
+                try FileManager.default.createDirectory(at: quarantineURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            }
+
+            try store.logOperation("VIDEO_RAW_RELEASE_QUARANTINE_STARTED", detail: originalURL.path)
+            if FileManager.default.fileExists(atPath: quarantineURL.path) {
+                try FileManager.default.removeItem(at: originalURL)
+                try store.logOperation("VIDEO_RAW_RELEASE_AUTO_RECOVERED_COPY_REMOVED", detail: originalURL.path)
+            } else {
+                try FileManager.default.moveItem(at: originalURL, to: quarantineURL)
+            }
+
+            try store.updateLocalReleaseState(
+                bindingID: snapshot.binding.bindingID,
+                archiveState: .verified,
+                localState: .quarantined,
+                releasedAt: nil,
+                quarantinePath: quarantineURL.path,
+                placeholderPath: nil,
+                placeholderCreatedAt: nil,
+                placeholderFormat: nil,
+                placeholderSHA256: nil,
+                placeholderSize: nil
+            )
+            try store.updateFileStatus(path: snapshot.archivedFile.filePath, status: .releaseEligible)
+            try store.logOperation("VIDEO_RAW_RELEASE_QUARANTINE_FINISHED", detail: quarantineURL.path)
+            return LocalReleaseResult(originalURL: originalURL, quarantineURL: quarantineURL, sha256: digest)
+        } catch {
+            try? store.updateLocalReleaseState(
+                bindingID: snapshot.binding.bindingID,
+                archiveState: .releaseFailed,
+                localState: .releaseFailed,
+                releasedAt: snapshot.binding.releasedAt,
+                quarantinePath: snapshot.binding.quarantinePath
+            )
+            try? store.updateFileStatus(path: snapshot.archivedFile.filePath, status: .releaseFailed)
+            try? store.logOperation("VIDEO_RAW_RELEASE_FAILED", detail: "\(snapshot.archivedFile.filePath): \(error.localizedDescription)")
             throw error
         }
     }
@@ -315,6 +387,36 @@ public final class LocalReleaseService: Sendable {
         }
         guard let bubbleOrThumbPath = snapshot.archivedFile.bubbleOrThumbPath, FileManager.default.fileExists(atPath: bubbleOrThumbPath) else {
             throw WeVaultError.fileSystem("Image bubble or thumb layer must remain local before high layer release")
+        }
+    }
+
+    private func preflightVideoRawLayerRelease(snapshot: ArchivedFileSnapshot, userConfirmed: Bool) throws {
+        guard userConfirmed else {
+            throw WeVaultError.fileSystem("User confirmation is required before video raw layer release")
+        }
+        guard snapshot.archivedFile.objectType == .videoRawLayer else {
+            throw WeVaultError.fileSystem("Phase 7 only releases video raw layers")
+        }
+        guard snapshot.object.verifyStatus == .verified else {
+            throw WeVaultError.cloud("Cloud object must be verified before video raw layer release")
+        }
+        guard snapshot.binding.archiveState == .verified || snapshot.binding.archiveState == .restored else {
+            throw WeVaultError.cloud("Archive binding must be verified before video raw layer release")
+        }
+        guard snapshot.binding.localState == .localPresent ||
+              snapshot.binding.localState == .restored ||
+              snapshot.binding.localState == .quarantined else {
+            throw WeVaultError.fileSystem("Only local-present or auto-recovered video raw layers can be quarantined")
+        }
+        let originalURL = URL(fileURLWithPath: snapshot.archivedFile.filePath)
+        guard FileManager.default.fileExists(atPath: originalURL.path) else {
+            throw WeVaultError.fileSystem("Video raw layer is missing at \(originalURL.path)")
+        }
+        guard let playbackPath = snapshot.archivedFile.displayOrPlaybackPath, FileManager.default.fileExists(atPath: playbackPath) else {
+            throw WeVaultError.fileSystem("Video playback layer must remain local before raw layer release")
+        }
+        guard let coverOrThumbPath = snapshot.archivedFile.bubbleOrThumbPath, FileManager.default.fileExists(atPath: coverOrThumbPath) else {
+            throw WeVaultError.fileSystem("Video cover or thumb layer must remain local before raw layer release")
         }
     }
 

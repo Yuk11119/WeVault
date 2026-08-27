@@ -57,8 +57,7 @@ public final class CloudUploadService: Sendable {
                     try store.updateFileStatus(path: file.path, status: .uploaded)
                     try store.logOperation("UPLOAD_FINISHED", detail: objectKey)
 
-                    let head = try await client.headObject(objectKey: objectKey)
-                    guard head.sizeBytes == file.sizeBytes else {
+                    if let verifyFailure = try await Self.verifyRemoteObject(client: client, objectKey: objectKey, sha256: digest, sizeBytes: file.sizeBytes) {
                         let failed = Self.cloudObject(
                             sha256: digest,
                             sizeBytes: file.sizeBytes,
@@ -70,8 +69,8 @@ public final class CloudUploadService: Sendable {
                         let binding = Self.binding(filePath: file.path, cloudObjectID: failed.cloudObjectID, archiveState: .verifyFailed)
                         try store.saveCloudObject(failed, binding: binding, archivedFile: Self.archivedFile(file: file, family: familiesByArchivePath[file.path]))
                         try store.updateFileStatus(path: file.path, status: .verifyFailed)
-                        try store.logOperation("VERIFY_FAILED", detail: "\(objectKey): remote size \(head.sizeBytes), local size \(file.sizeBytes)")
-                        await progress?(CloudUploadProgress(filePath: file.path, status: .verifyFailed, message: "remote size \(head.sizeBytes), local size \(file.sizeBytes)"))
+                        try store.logOperation("VERIFY_FAILED", detail: "\(objectKey): \(verifyFailure)")
+                        await progress?(CloudUploadProgress(filePath: file.path, status: .verifyFailed, message: verifyFailure))
                         continue
                     }
 
@@ -108,6 +107,32 @@ public final class CloudUploadService: Sendable {
         let secondEnd = sha256.index(sha256.startIndex, offsetBy: min(4, sha256.count))
         let second = String(sha256[secondStart..<secondEnd])
         return "objects/sha256/\(first)/\(second)/\(sha256)"
+    }
+
+    private static func verifyRemoteObject(client: any ObjectStorageClient, objectKey: String, sha256: String, sizeBytes: Int64) async throws -> String? {
+        let head = try await client.headObject(objectKey: objectKey)
+        guard head.sizeBytes == sizeBytes else {
+            return "remote size \(head.sizeBytes), local size \(sizeBytes)"
+        }
+
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wevault-verify-\(UUID().uuidString)")
+        defer {
+            if FileManager.default.fileExists(atPath: temporaryURL.path) {
+                try? FileManager.default.removeItem(at: temporaryURL)
+            }
+        }
+
+        try await client.getObject(objectKey: objectKey, destinationURL: temporaryURL)
+        let downloadedStat = try fileStat(temporaryURL.path)
+        guard downloadedStat.size == sizeBytes else {
+            return "downloaded size \(downloadedStat.size), local size \(sizeBytes)"
+        }
+        let downloadedSHA = try sha256File(temporaryURL)
+        guard downloadedSHA == sha256 else {
+            return "downloaded SHA-256 \(downloadedSHA), local SHA-256 \(sha256)"
+        }
+        return nil
     }
 
     private static func cloudObject(

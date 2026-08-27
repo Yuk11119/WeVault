@@ -104,6 +104,26 @@ struct WeChatScannerTests {
         #expect(try fixture.countRows(table: "cloud_objects", whereClause: "verify_status = 'VERIFIED'") == 0)
     }
 
+    @Test("cloud upload records verify failure on downloaded sha mismatch")
+    func cloudUploadRecordsDownloadedHashFailure() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+
+        let client = MockObjectStorageClient(downloadOverride: Data("wrong-content".utf8))
+        let service = CloudUploadService { _ in client }
+        _ = try await service.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+
+        #expect(try fixture.countRows(table: "cloud_objects") == 3)
+        #expect(try fixture.countRows(table: "archive_bindings") == 4)
+        #expect(try fixture.countRows(table: "archived_files") == 4)
+        #expect(try fixture.countRows(table: "cloud_objects", whereClause: "verify_status = 'VERIFY_FAILED'") == 3)
+        #expect(try fixture.countRows(table: "cloud_objects", whereClause: "verify_status = 'VERIFIED'") == 0)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'VERIFY_FAILED'") == 4)
+    }
+
     @Test("cloud upload skips records without sha and not archivable media")
     func cloudUploadSkipsMissingSHAAndNotArchivable() async throws {
         let fixture = try Fixture()
@@ -232,9 +252,10 @@ struct WeChatScannerTests {
         let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
         try store.save(scanResult: result)
 
-        let client = MockObjectStorageClient(downloadOverride: Data("wrong-content".utf8))
+        let client = MockObjectStorageClient()
         let uploadService = CloudUploadService { _ in client }
         _ = try await uploadService.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+        client.downloadOverride = Data("wrong-content".utf8)
 
         let source = try #require(try store.archivedFileSnapshots().values.first)
         await #expect(throws: WeVaultError.self) {
@@ -293,6 +314,7 @@ struct WeChatScannerTests {
         #expect(duplicates.count == 2)
 
         let restoreService = CloudRestoreService { _ in client }
+        let downloadCountBeforeRestore = client.downloadedKeys.count
         let first = try await restoreService.restore(snapshot: duplicates[0], destination: .directory(fixture.restoreRoot), config: fixture.storageConfig, store: store)
         let second = try await restoreService.restore(snapshot: duplicates[1], destination: .directory(fixture.restoreRoot), config: fixture.storageConfig, store: store)
 
@@ -300,7 +322,7 @@ struct WeChatScannerTests {
         let firstSHA = try sha256File(first.destinationURL)
         let secondSHA = try sha256File(second.destinationURL)
         #expect(firstSHA == secondSHA)
-        #expect(client.downloadedKeys.count == 2)
+        #expect(client.downloadedKeys.count - downloadCountBeforeRestore == 2)
     }
 
     @Test("cloud restore media layers keep family targets")
@@ -481,12 +503,11 @@ struct WeChatScannerTests {
         #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_FAILED'") == 1)
     }
 
-    @Test("phase six releases image high layer but keeps video raw layer closed")
-    func phaseSixReleasesImageHighLayerOnly() async throws {
+    @Test("phase six releases image high layer")
+    func phaseSixReleasesImageHighLayer() async throws {
         let fixture = try Fixture()
         let context = try await fixture.uploadedArchiveContext()
         let image = try #require(context.archived.values.first { $0.archivedFile.objectType == .imageHighLayer })
-        let video = try #require(context.archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
         let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
 
         let releasedImage = try service.quarantineImageHighLayer(snapshot: image, store: context.store, userConfirmed: true)
@@ -506,12 +527,6 @@ struct WeChatScannerTests {
         #expect(refreshed.binding.placeholderSHA256 == nil)
         #expect(refreshed.binding.placeholderSize == nil)
         #expect(try fixture.countRows(table: "operations", whereClause: "event = 'IMAGE_HIGH_RELEASE_QUARANTINE_FINISHED'") == 1)
-
-        #expect(throws: WeVaultError.self) {
-            _ = try service.quarantine(snapshot: video, store: context.store, userConfirmed: true, skipRestoreTest: true)
-        }
-        #expect(FileManager.default.fileExists(atPath: video.archivedFile.filePath))
-        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_FAILED'") == 1)
     }
 
     @Test("phase six image release rejects missing display layer")
@@ -615,6 +630,191 @@ struct WeChatScannerTests {
         #expect(refreshed.binding.localState == .quarantined)
         #expect(refreshed.binding.quarantinePath == quarantineURL.path)
         #expect(try fixture.countRows(table: "operations", whereClause: "event = 'IMAGE_HIGH_RELEASE_AUTO_RECOVERED_COPY_REMOVED'") == 1)
+    }
+
+    @Test("phase seven releases video raw layer")
+    func phaseSevenReleasesVideoRawLayer() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let video = try #require(context.archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
+
+        let releasedVideo = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineVideoRawLayer(
+            snapshot: video,
+            store: context.store,
+            userConfirmed: true
+        )
+
+        #expect(!FileManager.default.fileExists(atPath: video.archivedFile.filePath))
+        #expect(FileManager.default.fileExists(atPath: try #require(video.archivedFile.displayOrPlaybackPath)))
+        #expect(FileManager.default.fileExists(atPath: try #require(video.archivedFile.bubbleOrThumbPath)))
+        #expect(FileManager.default.fileExists(atPath: try #require(releasedVideo.quarantineURL).path))
+        #expect(try sha256File(try #require(releasedVideo.quarantineURL)) == video.archivedFile.sha256)
+
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[video.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .quarantined)
+        #expect(refreshed.binding.archiveState == .verified)
+        #expect(refreshed.binding.placeholderPath == nil)
+        #expect(refreshed.binding.placeholderCreatedAt == nil)
+        #expect(refreshed.binding.placeholderFormat == nil)
+        #expect(refreshed.binding.placeholderSHA256 == nil)
+        #expect(refreshed.binding.placeholderSize == nil)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'VIDEO_RAW_RELEASE_QUARANTINE_FINISHED'") == 1)
+    }
+
+    @Test("phase seven video release rejects missing playback layer")
+    func phaseSevenVideoReleaseRejectsMissingPlaybackLayer() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let video = try #require(context.archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
+        let missingPlayback = snapshotByRemovingVideoLayers(video, removePlayback: true)
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineVideoRawLayer(snapshot: missingPlayback, store: context.store, userConfirmed: true)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: video.archivedFile.filePath))
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'VIDEO_RAW_RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase seven video release rejects missing cover or thumb layer")
+    func phaseSevenVideoReleaseRejectsMissingCoverOrThumbLayer() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let video = try #require(context.archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
+        let missingCoverOrThumb = snapshotByRemovingVideoLayers(video, removeCoverOrThumb: true)
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineVideoRawLayer(snapshot: missingCoverOrThumb, store: context.store, userConfirmed: true)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: video.archivedFile.filePath))
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'VIDEO_RAW_RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase seven video release rejects changed local sha")
+    func phaseSevenVideoReleaseRejectsChangedSHA() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let video = try #require(context.archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
+        try fixture.write("changed-raw-layer", to: URL(fileURLWithPath: video.archivedFile.filePath))
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineVideoRawLayer(snapshot: video, store: context.store, userConfirmed: true)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: video.archivedFile.filePath))
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[video.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .releaseFailed)
+        #expect(refreshed.binding.archiveState == .releaseFailed)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'VIDEO_RAW_RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase seven video release rejects unverified cloud object")
+    func phaseSevenVideoReleaseRejectsUnverifiedCloudObject() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let result = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: result)
+        _ = try await CloudUploadService { _ in MockObjectStorageClient(headSizeDelta: 1) }.upload(files: result.files, families: result.families, config: fixture.storageConfig, store: store)
+        let video = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.objectType == .videoRawLayer })
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineVideoRawLayer(snapshot: video, store: store, userConfirmed: true)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: video.archivedFile.filePath))
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'VIDEO_RAW_RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase seven video release requires user confirmation")
+    func phaseSevenVideoReleaseRequiresUserConfirmation() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let video = try #require(context.archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
+
+        #expect(throws: WeVaultError.self) {
+            _ = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineVideoRawLayer(snapshot: video, store: context.store, userConfirmed: false)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: video.archivedFile.filePath))
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'VIDEO_RAW_RELEASE_FAILED'") == 1)
+    }
+
+    @Test("phase seven video release removes auto recovered copy when quarantine already has same sha")
+    func phaseSevenVideoReleaseRemovesAutoRecoveredCopy() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let video = try #require(context.archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
+        let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
+        let firstRelease = try service.quarantineVideoRawLayer(snapshot: video, store: context.store, userConfirmed: true)
+        let quarantineURL = try #require(firstRelease.quarantineURL)
+        try FileManager.default.copyItem(at: quarantineURL, to: URL(fileURLWithPath: video.archivedFile.filePath))
+        let autoRecovered = try #require(try context.store.archivedFileSnapshots()[video.archivedFile.filePath])
+
+        let secondRelease = try service.quarantineVideoRawLayer(snapshot: autoRecovered, store: context.store, userConfirmed: true)
+
+        #expect(!FileManager.default.fileExists(atPath: video.archivedFile.filePath))
+        #expect(secondRelease.quarantineURL?.path == quarantineURL.path)
+        #expect(FileManager.default.fileExists(atPath: quarantineURL.path))
+        #expect(try sha256File(quarantineURL) == video.archivedFile.sha256)
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[video.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .quarantined)
+        #expect(refreshed.binding.quarantinePath == quarantineURL.path)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'VIDEO_RAW_RELEASE_AUTO_RECOVERED_COPY_REMOVED'") == 1)
+    }
+
+    @Test("video raw layer rollback restores quarantined file to original path")
+    func videoRawLayerRollbackRestoresQuarantinedFile() async throws {
+        let fixture = try Fixture()
+        let context = try await fixture.uploadedArchiveContext()
+        let video = try #require(context.archived.values.first { $0.archivedFile.objectType == .videoRawLayer })
+        let service = LocalReleaseService(quarantineRoot: fixture.quarantineRoot)
+        _ = try service.quarantineVideoRawLayer(snapshot: video, store: context.store, userConfirmed: true)
+        let quarantined = try #require(try context.store.archivedFileSnapshots()[video.archivedFile.filePath])
+
+        let rollback = try service.rollback(snapshot: quarantined, store: context.store)
+
+        #expect(FileManager.default.fileExists(atPath: video.archivedFile.filePath))
+        #expect(try sha256File(rollback.originalURL) == video.archivedFile.sha256)
+        let refreshed = try #require(try context.store.archivedFileSnapshots()[video.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .localPresent)
+        #expect(refreshed.binding.archiveState == .verified)
+        #expect(refreshed.binding.quarantinePath == nil)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RELEASE_ROLLBACK_FINISHED'") == 1)
+    }
+
+    @Test("restore to original path removes matching quarantine when video raw was already auto recovered")
+    func restoreOriginalPathRemovesQuarantineForAutoRecoveredVideoRaw() async throws {
+        let fixture = try Fixture()
+        try fixture.writeWeChatTree()
+        let scan = try WeChatScanner().scan(root: fixture.root)
+        let store = try ManifestStore(databaseURL: fixture.temp.appendingPathComponent("archive.sqlite"))
+        try store.save(scanResult: scan)
+        let client = MockObjectStorageClient()
+        _ = try await CloudUploadService { _ in client }.upload(files: scan.files, families: scan.families, config: fixture.storageConfig, store: store)
+        let video = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.objectType == .videoRawLayer })
+        let released = try LocalReleaseService(quarantineRoot: fixture.quarantineRoot).quarantineVideoRawLayer(snapshot: video, store: store, userConfirmed: true)
+        let quarantineURL = try #require(released.quarantineURL)
+        try FileManager.default.copyItem(at: quarantineURL, to: URL(fileURLWithPath: video.archivedFile.filePath))
+        let autoRecovered = try #require(try store.archivedFileSnapshots()[video.archivedFile.filePath])
+        let downloadCountBeforeRestore = client.downloadedKeys.count
+
+        let restored = try await CloudRestoreService { _ in client }.restore(
+            snapshot: autoRecovered,
+            destination: .originalPath,
+            config: fixture.storageConfig,
+            store: store
+        )
+
+        #expect(restored.destinationURL.path == video.archivedFile.filePath)
+        #expect(try sha256File(restored.destinationURL) == video.archivedFile.sha256)
+        #expect(!FileManager.default.fileExists(atPath: quarantineURL.path))
+        #expect(client.downloadedKeys.count == downloadCountBeforeRestore)
+        let refreshed = try #require(try store.archivedFileSnapshots()[video.archivedFile.filePath])
+        #expect(refreshed.binding.localState == .restored)
+        #expect(refreshed.binding.quarantinePath == nil)
+        #expect(try fixture.countRows(table: "operations", whereClause: "event = 'RESTORE_REMOVED_MATCHING_QUARANTINE'") == 1)
     }
 
     @Test("cloud upload does not clear quarantined image release state")
@@ -931,6 +1131,32 @@ private func snapshotByRemovingImageLayers(
     return ArchivedFileSnapshot(archivedFile: archivedFile, binding: snapshot.binding, object: snapshot.object)
 }
 
+private func snapshotByRemovingVideoLayers(
+    _ snapshot: ArchivedFileSnapshot,
+    removePlayback: Bool = false,
+    removeCoverOrThumb: Bool = false
+) -> ArchivedFileSnapshot {
+    let archived = snapshot.archivedFile
+    let archivedFile = ArchivedFile(
+        filePath: archived.filePath,
+        objectType: archived.objectType,
+        originalFilename: archived.originalFilename,
+        relativePath: archived.relativePath,
+        accountHash: archived.accountHash,
+        accountName: archived.accountName,
+        month: archived.month,
+        sizeBytes: archived.sizeBytes,
+        sha256: archived.sha256,
+        mtime: archived.mtime,
+        familyID: archived.familyID,
+        displayOrPlaybackPath: removePlayback ? nil : archived.displayOrPlaybackPath,
+        bubbleOrThumbPath: removeCoverOrThumb ? nil : archived.bubbleOrThumbPath,
+        archivedAt: archived.archivedAt,
+        updatedAt: archived.updatedAt
+    )
+    return ArchivedFileSnapshot(archivedFile: archivedFile, binding: snapshot.binding, object: snapshot.object)
+}
+
 private func runPythonDeflatedTombstone(destination: URL) throws {
     let script = """
     import sys, zipfile
@@ -1036,7 +1262,7 @@ private final class MockObjectStorageClient: ObjectStorageClient, @unchecked Sen
     var dataByKey: [String: Data] = [:]
     var downloadedKeys: [String] = []
     let headSizeDelta: Int64
-    let downloadOverride: Data?
+    var downloadOverride: Data?
 
     init(headSizeDelta: Int64 = 0, downloadOverride: Data? = nil) {
         self.headSizeDelta = headSizeDelta

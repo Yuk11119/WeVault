@@ -37,7 +37,7 @@ struct DetailView: View {
         case .imageHighLayer:
             return LocalReleaseService.isEligibleForPhase6ImageHighLayerRelease(archivedSnapshot) && !isReleasing
         case .videoRawLayer:
-            return false
+            return LocalReleaseService.isEligibleForPhase7VideoRawLayerRelease(archivedSnapshot) && !isReleasing
         }
     }
 
@@ -45,8 +45,9 @@ struct DetailView: View {
         guard let archivedSnapshot else { return false }
         let originalExists = FileManager.default.fileExists(atPath: archivedSnapshot.archivedFile.filePath)
         let imageHighLayerCanRollback = archivedSnapshot.archivedFile.objectType == .imageHighLayer && !originalExists
+        let videoRawLayerCanRollback = archivedSnapshot.archivedFile.objectType == .videoRawLayer && !originalExists
         let ordinaryCanRollback = archivedSnapshot.archivedFile.objectType == .ordinaryFile
-        return (ordinaryCanRollback || imageHighLayerCanRollback) &&
+        return (ordinaryCanRollback || imageHighLayerCanRollback || videoRawLayerCanRollback) &&
             (archivedSnapshot.binding.localState == .quarantined || archivedSnapshot.binding.localState == .tombstoned) &&
             archivedSnapshot.binding.quarantinePath != nil &&
             !isReleasing
@@ -181,7 +182,17 @@ struct DetailView: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 case .videoRawLayer:
-                                    EmptyView()
+                                    HStack {
+                                        Button("受控释放 Raw 层") {
+                                            onQuarantineLocal(false)
+                                        }
+                                            .disabled(!canQuarantineLocal)
+                                        Button("从隔离区回滚", action: onRollbackLocal)
+                                            .disabled(!canRollbackLocal)
+                                    }
+                                    Text("阶段 7 只移动 _raw.mp4 到工具 quarantine；Raw 原路径保持为空，不生成 tombstone。普通播放 .mp4 和封面/缩略图必须继续留在本地；保存/导出会降级为普通播放版，高质量导出前请先恢复 Raw 层。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
                             }
                         }
@@ -239,7 +250,7 @@ struct DetailView: View {
         case .imageHighLayer:
             return Text("阶段 6 支持图片高清层受控释放：普通查看版本保留在本地，高清/原图需要时从云端恢复；不会生成 tombstone，也不会移动 .dat / _M.dat / _b.dat / _t.dat。")
         case .videoRawLayer:
-            return Text("视频 Raw 层释放属于阶段 7，当前不开放。")
+            return Text("阶段 7 支持视频 Raw 层受控释放：普通播放版本、封面或缩略图保留在本地；保存/导出高质量版本前需要从云端恢复 _raw.mp4。")
         }
     }
 }
