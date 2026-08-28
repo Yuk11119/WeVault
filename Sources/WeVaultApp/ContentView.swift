@@ -3,7 +3,10 @@ import SwiftUI
 import WeVaultCore
 
 struct ContentView: View {
-    @StateObject private var viewModel = ScanViewModel()
+    @ObservedObject var viewModel: ScanViewModel
+    let settings: ProductSettings
+    let openSettings: () -> Void
+    let saveSettings: (ProductSettings) -> Void
     @State private var selection: FileRecord.ID?
 
     var selectedFile: FileRecord? {
@@ -79,9 +82,11 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("WeVault")
                         .font(.largeTitle.bold())
-                    Text("微信云端归档候选扫描")
+                    Text("状态中心 · 手动任务")
                         .foregroundStyle(.secondary)
                 }
+
+                Button("打开设置", action: openSettings)
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("扫描目录")
@@ -104,6 +109,11 @@ struct ContentView: View {
                         .font(.headline)
                     HStack {
                         Slider(value: $viewModel.largeFileThresholdMB, in: 1...500, step: 1)
+                            .onChange(of: viewModel.largeFileThresholdMB) { _, threshold in
+                                var updated = settings
+                                updated.largeFileThresholdMB = Int(threshold)
+                                saveSettings(updated)
+                            }
                         Text("\(Int(viewModel.largeFileThresholdMB)) MB")
                             .monospacedDigit()
                             .frame(width: 64, alignment: .trailing)
@@ -114,24 +124,15 @@ struct ContentView: View {
                     ProgressView("只读扫描中...")
                 }
 
+                activitySection
+
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("云端上传")
+                    Text("云端连接")
                         .font(.headline)
-                    Text(viewModel.uploadScopeSummary)
+                    Text("已选择\(settings.cloudMode == .weVault ? "WeVault 云端" : "自配 OSS/COS")。P2 将在登录后提供短期凭证；P1 不保存长期密钥，因此上传与自动释放尚未启用。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Button("上传本次扫描的可归档对象", action: viewModel.uploadHashedCandidates)
-                        .disabled(!viewModel.canUpload)
-                    if viewModel.isUploading {
-                        ProgressView("上传并校验中...")
-                    }
-                    if !viewModel.uploadMessage.isEmpty {
-                        Text(viewModel.uploadMessage)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
                 }
 
                 if !viewModel.restoreMessage.isEmpty || viewModel.isRestoring {
@@ -270,6 +271,35 @@ struct ContentView: View {
         }
     }
 
+    private var activitySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("最近任务")
+                .font(.headline)
+            if viewModel.recentOperations.isEmpty {
+                Text("暂无任务记录。完成一次扫描后会在这里显示最近结果和异常。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(viewModel.recentOperations.prefix(5)) { operation in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(operation.eventTitle)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(operation.isFailure ? .red : .primary)
+                        Text(operation.detail ?? "-")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(operation.createdAt.formatted(date: .abbreviated, time: .shortened))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 3)
+                }
+            }
+        }
+    }
+
     private func chooseDirectory() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -281,6 +311,9 @@ struct ContentView: View {
         }
         if panel.runModal() == .OK {
             viewModel.selectedRoot = panel.url
+            var updated = settings
+            updated.scanRootPath = panel.url?.path
+            saveSettings(updated)
         }
     }
 
@@ -327,12 +360,32 @@ final class ScanViewModel: ObservableObject {
     @Published var restoreMessage = ""
     @Published var isReleasing = false
     @Published var releaseMessage = ""
+    @Published var recentOperations: [OperationRecord] = []
     @Published var sortOrder = [KeyPathComparator(\FileRecord.filename, comparator: .localizedStandard)]
 
     let manifestURL = ManifestStore.defaultDatabaseURL()
 
     init() {
         selectedRoot = nil
+    }
+
+    func apply(_ settings: ProductSettings) {
+        largeFileThresholdMB = Double(settings.largeFileThresholdMB)
+        if let path = settings.scanRootPath {
+            selectedRoot = URL(fileURLWithPath: path)
+        }
+    }
+
+    var activitySummary: String {
+        if isScanning { return "正在执行手动扫描" }
+        if let latest = recentOperations.first {
+            return latest.isFailure ? "最近任务出现异常：\(latest.event)" : "最近任务：\(latest.event)"
+        }
+        return "尚无任务记录"
+    }
+
+    func reloadActivity() {
+        recentOperations = (try? ManifestStore().recentOperations()) ?? []
     }
 
     var filteredFiles: [FileRecord] {
@@ -404,6 +457,7 @@ final class ScanViewModel: ObservableObject {
                 result = scanResult.0
                 cloudSnapshots = scanResult.1
                 archivedSnapshots = scanResult.2
+                reloadActivity()
             } catch {
                 alertMessage = error.localizedDescription
             }
@@ -446,6 +500,7 @@ final class ScanViewModel: ObservableObject {
                 }
                 cloudSnapshots = snapshots
                 archivedSnapshots = try store.archivedFileSnapshots()
+                reloadActivity()
                 uploadMessage = "上传完成：已校验 \(snapshots.values.filter { $0.object.verifyStatus == .verified }.count) 项绑定"
             } catch {
                 alertMessage = error.localizedDescription
@@ -467,6 +522,7 @@ final class ScanViewModel: ObservableObject {
                 let result = try await CloudRestoreService().restore(snapshot: snapshot, destination: destination, config: config, store: store)
                 archivedSnapshots = try store.archivedFileSnapshots()
                 cloudSnapshots = try store.cloudArchiveSnapshots()
+                reloadActivity()
                 restoreMessage = "恢复完成并通过 SHA-256 校验：\(result.destinationURL.path)"
                 NSWorkspace.shared.activateFileViewerSelecting([result.destinationURL])
             } catch {
@@ -515,6 +571,7 @@ final class ScanViewModel: ObservableObject {
                     )
                 }
                 try refreshArchiveSnapshots(store: store)
+                reloadActivity()
                 if snapshot.archivedFile.objectType == .imageHighLayer {
                     releaseMessage = "图片高清层已进入隔离区，原高清路径为空；普通查看层仍在本地，高清/原图需要时可从云端恢复。"
                 } else if snapshot.archivedFile.objectType == .videoRawLayer {
@@ -548,6 +605,7 @@ final class ScanViewModel: ObservableObject {
                 let store = try ManifestStore()
                 let result = try LocalReleaseService().rollback(snapshot: snapshot, store: store)
                 try refreshArchiveSnapshots(store: store)
+                reloadActivity()
                 releaseMessage = "已回滚并通过 SHA-256 校验：\(result.originalURL.path)"
                 NSWorkspace.shared.activateFileViewerSelecting([result.originalURL])
             } catch {
@@ -572,6 +630,7 @@ final class ScanViewModel: ObservableObject {
                 let store = try ManifestStore()
                 _ = try LocalReleaseService().finalizeRelease(snapshot: snapshot, store: store)
                 try refreshArchiveSnapshots(store: store)
+                reloadActivity()
                 releaseMessage = "已删除隔离副本；云端对象和 manifest 仍保留，可从云端恢复。"
             } catch {
                 alertMessage = error.localizedDescription
@@ -622,6 +681,7 @@ final class ScanViewModel: ObservableObject {
         if let current = result, let selectedRoot {
             result = Self.scanResultByAddingArchivedDisplayRecords(current, archived: archivedSnapshots, under: selectedRoot)
         }
+        recentOperations = try store.recentOperations()
     }
 
     nonisolated private static func scanResultByAddingArchivedDisplayRecords(
@@ -689,6 +749,21 @@ final class ScanViewModel: ObservableObject {
         )
     }
 
+}
+
+private extension OperationRecord {
+    var eventTitle: String {
+        switch event {
+        case "SCAN_STARTED": "扫描开始"
+        case "SCAN_FINISHED": "扫描完成"
+        case "UPLOAD_FINISHED": "上传完成"
+        case "VERIFY_FINISHED": "云端校验完成"
+        case "RESTORE_FINISHED": "恢复完成"
+        case "RELEASE_QUARANTINE_FINISHED", "IMAGE_HIGH_RELEASE_QUARANTINE_FINISHED", "VIDEO_RAW_RELEASE_QUARANTINE_FINISHED": "已进入 quarantine"
+        case "RELEASE_DELETE_QUARANTINE_FINISHED": "已确认释放空间"
+        default: event
+        }
+    }
 }
 
 enum RecordFilter: String, CaseIterable, Identifiable {

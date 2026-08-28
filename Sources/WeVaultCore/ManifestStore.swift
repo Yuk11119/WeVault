@@ -502,6 +502,23 @@ public final class ManifestStore: @unchecked Sendable {
         }
     }
 
+    public func recentOperations(limit: Int = 20) throws -> [OperationRecord] {
+        let safeLimit = min(max(limit, 1), 200)
+        var records: [OperationRecord] = []
+        try withStatement("SELECT id, event, detail, created_at FROM operations ORDER BY id DESC LIMIT ?") { stmt in
+            sqlite3_bind_int(stmt, 1, Int32(safeLimit))
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                records.append(OperationRecord(
+                    id: sqlite3_column_int64(stmt, 0),
+                    event: columnText(stmt, 1),
+                    detail: optionalText(stmt, 2),
+                    createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3))
+                ))
+            }
+        }
+        return records
+    }
+
     private func upsert(_ object: CloudObject) throws {
         let sql = """
         INSERT OR REPLACE INTO cloud_objects (

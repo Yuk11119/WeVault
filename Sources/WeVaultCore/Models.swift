@@ -204,6 +204,24 @@ public struct ScanResult: Codable, Sendable {
     public let summary: ScanSummary
 }
 
+public struct OperationRecord: Identifiable, Codable, Hashable, Sendable {
+    public let id: Int64
+    public let event: String
+    public let detail: String?
+    public let createdAt: Date
+
+    public init(id: Int64, event: String, detail: String?, createdAt: Date) {
+        self.id = id
+        self.event = event
+        self.detail = detail
+        self.createdAt = createdAt
+    }
+
+    public var isFailure: Bool {
+        event.contains("FAILED") || event.contains("ERROR")
+    }
+}
+
 public struct CloudObject: Identifiable, Codable, Hashable, Sendable {
     public var id: String { cloudObjectID }
 
