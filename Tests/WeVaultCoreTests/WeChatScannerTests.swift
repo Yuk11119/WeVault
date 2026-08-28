@@ -155,7 +155,7 @@ struct WeChatScannerTests {
 
         let uploadedPaths = Set(client.uploadedLocalURLs.map(\.lastPathComponent))
         #expect(uploadedPaths.contains("c.zip"))
-        #expect(try fixture.countRows(table: "archived_files", whereClause: "original_filename = 'c.zip'") == 1)
+        #expect(try store.archivedFileSnapshots().values.filter { $0.archivedFile.originalFilename == "c.zip" }.count == 1)
 
         let archive = try #require(try store.archivedFileSnapshots().values.first { $0.archivedFile.originalFilename == "c.zip" })
         let restored = try await CloudRestoreService { _ in client }.restore(

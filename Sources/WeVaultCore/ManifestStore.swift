@@ -4,16 +4,68 @@ import SQLite3
 public final class ManifestStore: @unchecked Sendable {
     public let databaseURL: URL
     private var db: OpaquePointer?
+    private let keyProvider: any ManifestKeyProvider
+    private var cipher: ManifestCipher!
+    public private(set) var recoveryState: ManifestRecoveryState = .ready
 
-    public init(databaseURL: URL = ManifestStore.defaultDatabaseURL()) throws {
+    public init(databaseURL: URL = ManifestStore.defaultDatabaseURL(), keyProvider: any ManifestKeyProvider = KeychainManifestKeyProvider.shared) throws {
         self.databaseURL = databaseURL
+        self.keyProvider = keyProvider
+        let existed = FileManager.default.fileExists(atPath: databaseURL.path)
+        // A missing production manifest after a key was provisioned is not a first launch.
+        if !existed, databaseURL == Self.defaultDatabaseURL(), try keyProvider.existingKey() != nil {
+            recoveryState = .needsCloudIndexFallback
+            throw WeVaultError.manifest(.missingNeedsCloudIndexFallback)
+        }
         try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         if sqlite3_open(databaseURL.path, &db) != SQLITE_OK {
-            throw WeVaultError.sqlite(lastError)
+            throw WeVaultError.manifest(.sqliteCorrupt)
         }
         try execute("PRAGMA journal_mode=WAL")
-        try execute("PRAGMA foreign_keys=ON")
+        // Encrypted identifiers use authenticated ciphertext with independent nonces; SQLite's
+        // plaintext foreign-key comparison is therefore replaced by keyed token joins.
+        try execute("PRAGMA foreign_keys=OFF")
+        try prepareSecurity()
         try migrate()
+        try encryptLegacyManifestIfNeeded()
+        try verifyIntegrity()
+    }
+
+    private func prepareSecurity() throws {
+        try execute("CREATE TABLE IF NOT EXISTS manifest_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        let state = try metadata("encryption_state")
+        let databaseID: String
+        if let existing = try metadata("database_id") { databaseID = existing }
+        else { databaseID = UUID().uuidString; try setMetadata("database_id", databaseID) }
+        let master: Data
+        if state == "encrypted" {
+            guard let key = try keyProvider.existingKey() else { throw WeVaultError.manifest(.keyMissing) }
+            master = key
+        } else {
+            master = try keyProvider.existingKey() ?? keyProvider.createKey()
+        }
+        do { cipher = try ManifestCipher(masterKey: master, databaseID: databaseID) }
+        catch let failure as ManifestFailure { throw WeVaultError.manifest(failure) }
+        if state == "encrypted", try metadata("key_verifier") != cipher.verifier(databaseID: databaseID) {
+            throw WeVaultError.manifest(.keyMismatch)
+        }
+        if state == nil {
+            try setMetadata("key_verifier", cipher.verifier(databaseID: databaseID))
+        }
+    }
+
+    private func metadata(_ key: String) throws -> String? {
+        var value: String?
+        try withStatement("SELECT value FROM manifest_metadata WHERE key = ?") { stmt in
+            bindText(stmt, 1, key); if sqlite3_step(stmt) == SQLITE_ROW { value = columnText(stmt, 0) }
+        }
+        return value
+    }
+
+    private func setMetadata(_ key: String, _ value: String) throws {
+        try withStatement("INSERT OR REPLACE INTO manifest_metadata (key, value) VALUES (?, ?)") { stmt in
+            bindText(stmt, 1, key); bindText(stmt, 2, value); try stepDone(stmt)
+        }
     }
 
     deinit {
@@ -75,6 +127,7 @@ public final class ManifestStore: @unchecked Sendable {
         """)
         try addColumnIfNeeded(table: "files", definition: "conversation_name TEXT")
         try addColumnIfNeeded(table: "files", definition: "conversation_resolution TEXT NOT NULL DEFAULT ''")
+        try addColumnIfNeeded(table: "files", definition: "path_token TEXT")
         try execute("""
         CREATE TABLE IF NOT EXISTS families (
             id TEXT PRIMARY KEY,
@@ -92,6 +145,7 @@ public final class ManifestStore: @unchecked Sendable {
             updated_at REAL NOT NULL
         )
         """)
+        try addColumnIfNeeded(table: "families", definition: "id_token TEXT")
         try execute("""
         CREATE TABLE IF NOT EXISTS duplicate_groups (
             id TEXT PRIMARY KEY,
@@ -103,6 +157,7 @@ public final class ManifestStore: @unchecked Sendable {
             updated_at REAL NOT NULL
         )
         """)
+        try addColumnIfNeeded(table: "duplicate_groups", definition: "id_token TEXT")
         try execute("""
         CREATE TABLE IF NOT EXISTS operations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +195,7 @@ public final class ManifestStore: @unchecked Sendable {
             UNIQUE(storage_provider, bucket_or_container, object_key)
         )
         """)
+        try addColumnIfNeeded(table: "cloud_objects", definition: "cloud_object_token TEXT")
         try execute("""
         CREATE TABLE IF NOT EXISTS archive_bindings (
             binding_id TEXT PRIMARY KEY,
@@ -172,6 +228,9 @@ public final class ManifestStore: @unchecked Sendable {
         try addColumnIfNeeded(table: "archive_bindings", definition: "placeholder_format TEXT")
         try addColumnIfNeeded(table: "archive_bindings", definition: "placeholder_sha256 TEXT")
         try addColumnIfNeeded(table: "archive_bindings", definition: "placeholder_size INTEGER")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "binding_token TEXT")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "file_path_token TEXT")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "cloud_object_token TEXT")
         try execute("""
         CREATE TABLE IF NOT EXISTS archived_files (
             file_path TEXT PRIMARY KEY,
@@ -191,6 +250,7 @@ public final class ManifestStore: @unchecked Sendable {
             updated_at REAL NOT NULL
         )
         """)
+        try addColumnIfNeeded(table: "archived_files", definition: "file_path_token TEXT")
         try execute("""
         CREATE TABLE IF NOT EXISTS automation_tasks (
             id TEXT PRIMARY KEY,
@@ -228,6 +288,70 @@ public final class ManifestStore: @unchecked Sendable {
         )
         """)
         try backfillArchivedFilesFromCurrentSnapshot()
+    }
+
+    // SQLite has no field encryption primitive. P3 stores ciphertext in the original text
+    // columns and uses keyed tokens only for equality joins/indexes. This method is deliberately
+    // transactional so an interrupted legacy upgrade leaves the plaintext database untouched.
+    private func encryptLegacyManifestIfNeeded() throws {
+        guard try metadata("encryption_state") != "encrypted" else { return }
+        try execute("BEGIN IMMEDIATE TRANSACTION")
+        do {
+            try migrateTable("files", tokenColumn: "path_token", sourceColumn: "path", columns: ["path", "account_hash", "account_name", "conversation_name", "conversation_resolution", "original_filename", "relative_path", "duplicate_group_id", "candidate_reason"])
+            try migrateTable("families", tokenColumn: "id_token", sourceColumn: "id", columns: ["id", "account_hash", "account_name", "prefix", "high_or_raw_path", "display_or_playback_path", "bubble_or_thumb_path", "reason", "member_paths_json"])
+            try migrateTable("duplicate_groups", tokenColumn: "id_token", sourceColumn: "id", columns: ["id", "paths_json"])
+            try migrateTable("cloud_objects", tokenColumn: "cloud_object_token", sourceColumn: "cloud_object_id", columns: ["cloud_object_id", "storage_provider", "bucket_or_container", "object_key"])
+            try migrateTable("archive_bindings", tokenColumn: "binding_token", sourceColumn: "binding_id", columns: ["binding_id", "file_path", "cloud_object_id", "quarantine_path", "placeholder_path", "placeholder_format", "placeholder_sha256"])
+            try migrateTable("archived_files", tokenColumn: "file_path_token", sourceColumn: "file_path", columns: ["file_path", "original_filename", "relative_path", "account_hash", "account_name", "sha256", "family_id", "display_or_playback_path", "bubble_or_thumb_path"])
+            try migrateTable("storage_configs", tokenColumn: "id", sourceColumn: "id", columns: ["endpoint", "bucket", "region", "access_key_reference", "secret_key_reference"])
+            try migrateTable("operations", tokenColumn: "id", sourceColumn: "id", columns: ["detail"])
+            try migrateTable("automation_task_runs", tokenColumn: "id", sourceColumn: "id", columns: ["failure_reason", "retry_of_run_id"])
+            try migrateTable("automation_task_logs", tokenColumn: "id", sourceColumn: "id", columns: ["detail"])
+            try execute("UPDATE archive_bindings SET file_path_token = NULL, cloud_object_token = NULL")
+            try fillBindingTokens()
+            try execute("CREATE UNIQUE INDEX IF NOT EXISTS files_path_token_idx ON files(path_token)")
+            try execute("CREATE UNIQUE INDEX IF NOT EXISTS cloud_objects_token_idx ON cloud_objects(cloud_object_token)")
+            try execute("CREATE UNIQUE INDEX IF NOT EXISTS bindings_binding_token_idx ON archive_bindings(binding_token)")
+            try execute("CREATE UNIQUE INDEX IF NOT EXISTS archived_files_path_token_idx ON archived_files(file_path_token)")
+            try setMetadata("encryption_state", "encrypted")
+            try execute("COMMIT")
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    private func migrateTable(_ table: String, tokenColumn: String, sourceColumn: String, columns: [String]) throws {
+        try withStatement("SELECT rowid, \(sourceColumn) FROM \(table)") { stmt in
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let rowID = sqlite3_column_int64(stmt, 0); let source = columnText(stmt, 1)
+                let token = cipher.token(source, domain: "\(table).\(sourceColumn)")
+                try withStatement("UPDATE \(table) SET \(tokenColumn) = ? WHERE rowid = ?") { update in bindText(update, 1, token); sqlite3_bind_int64(update, 2, rowID); try stepDone(update) }
+                for column in columns {
+                    try withStatement("SELECT \(column) FROM \(table) WHERE rowid = ?") { read in
+                        sqlite3_bind_int64(read, 1, rowID)
+                        guard sqlite3_step(read) == SQLITE_ROW, sqlite3_column_type(read, 0) != SQLITE_NULL else { return }
+                        let sealed = try cipher.seal(columnText(read, 0), context: "\(table).\(column).\(token)")
+                        try withStatement("UPDATE \(table) SET \(column) = ? WHERE rowid = ?") { update in bindData(update, 1, sealed); sqlite3_bind_int64(update, 2, rowID); try stepDone(update) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func fillBindingTokens() throws {
+        try withStatement("SELECT rowid, binding_id, file_path, cloud_object_id, binding_token FROM archive_bindings") { stmt in
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let rowID = sqlite3_column_int64(stmt, 0)
+                let binding = try decryptColumn(stmt, 1, table: "archive_bindings", column: "binding_id", token: columnText(stmt, 4))
+                let file = try decryptColumn(stmt, 2, table: "archive_bindings", column: "file_path", token: columnText(stmt, 4))
+                let object = try decryptColumn(stmt, 3, table: "archive_bindings", column: "cloud_object_id", token: columnText(stmt, 4))
+                try withStatement("UPDATE archive_bindings SET file_path_token = ?, cloud_object_token = ? WHERE rowid = ?") { update in
+                    bindText(update, 1, cipher.token(file, domain: "files.path")); bindText(update, 2, cipher.token(object, domain: "cloud_objects.cloud_object_id")); sqlite3_bind_int64(update, 3, rowID); try stepDone(update)
+                }
+                _ = binding
+            }
+        }
     }
 
     private func clearCurrentSnapshot() throws {
@@ -276,13 +400,14 @@ public final class ManifestStore: @unchecked Sendable {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try withStatement(sql) { stmt in
-            bindText(stmt, 1, file.path)
+            let token = cipher.token(file.path, domain: "files.path")
+            bindData(stmt, 1, try encrypted(file.path, table: "files", column: "path", token: token))
             bindText(stmt, 2, file.objectType.rawValue)
-            bindText(stmt, 3, file.accountHash)
-            bindText(stmt, 4, file.accountName)
-            bindOptionalText(stmt, 5, file.conversationName)
-            bindText(stmt, 6, file.conversationResolution)
-            bindText(stmt, 7, file.filename)
+            bindData(stmt, 3, try encrypted(file.accountHash, table: "files", column: "account_hash", token: token))
+            bindData(stmt, 4, try encrypted(file.accountName, table: "files", column: "account_name", token: token))
+            try bindOptionalEncrypted(stmt, 5, file.conversationName, table: "files", column: "conversation_name", token: token)
+            bindData(stmt, 6, try encrypted(file.conversationResolution, table: "files", column: "conversation_resolution", token: token))
+            bindData(stmt, 7, try encrypted(file.filename, table: "files", column: "original_filename", token: token))
             bindText(stmt, 8, file.fileExtension)
             bindOptionalText(stmt, 9, file.month)
             sqlite3_bind_int64(stmt, 10, file.sizeBytes)
@@ -292,12 +417,13 @@ public final class ManifestStore: @unchecked Sendable {
             sqlite3_bind_double(stmt, 14, file.mtime.timeIntervalSince1970)
             bindOptionalText(stmt, 15, file.sha256)
             bindText(stmt, 16, file.status.rawValue)
-            bindOptionalText(stmt, 17, file.duplicateGroupID)
-            bindOptionalText(stmt, 18, file.candidateReason)
-            bindText(stmt, 19, file.relativePath)
+            try bindOptionalEncrypted(stmt, 17, file.duplicateGroupID, table: "files", column: "duplicate_group_id", token: token)
+            try bindOptionalEncrypted(stmt, 18, file.candidateReason, table: "files", column: "candidate_reason", token: token)
+            bindData(stmt, 19, try encrypted(file.relativePath, table: "files", column: "relative_path", token: token))
             sqlite3_bind_double(stmt, 20, Date().timeIntervalSince1970)
             try stepDone(stmt)
         }
+        try withStatement("UPDATE files SET path_token = ? WHERE rowid = last_insert_rowid()") { stmt in bindText(stmt, 1, cipher.token(file.path, domain: "files.path")); try stepDone(stmt) }
     }
 
     private func insert(_ family: FamilyRecord) throws {
@@ -309,21 +435,23 @@ public final class ManifestStore: @unchecked Sendable {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try withStatement(sql) { stmt in
-            bindText(stmt, 1, family.id)
+            let token = cipher.token(family.id, domain: "families.id")
+            bindData(stmt, 1, try encrypted(family.id, table: "families", column: "id", token: token))
             bindText(stmt, 2, family.familyType.rawValue)
-            bindText(stmt, 3, family.accountHash)
-            bindText(stmt, 4, family.accountName)
+            bindData(stmt, 3, try encrypted(family.accountHash, table: "families", column: "account_hash", token: token))
+            bindData(stmt, 4, try encrypted(family.accountName, table: "families", column: "account_name", token: token))
             bindOptionalText(stmt, 5, family.month)
-            bindText(stmt, 6, family.prefix)
-            bindText(stmt, 7, family.highOrRawPath)
-            bindOptionalText(stmt, 8, family.displayOrPlaybackPath)
-            bindOptionalText(stmt, 9, family.bubbleOrThumbPath)
+            bindData(stmt, 6, try encrypted(family.prefix, table: "families", column: "prefix", token: token))
+            bindData(stmt, 7, try encrypted(family.highOrRawPath, table: "families", column: "high_or_raw_path", token: token))
+            try bindOptionalEncrypted(stmt, 8, family.displayOrPlaybackPath, table: "families", column: "display_or_playback_path", token: token)
+            try bindOptionalEncrypted(stmt, 9, family.bubbleOrThumbPath, table: "families", column: "bubble_or_thumb_path", token: token)
             sqlite3_bind_int(stmt, 10, family.isCandidate ? 1 : 0)
-            bindText(stmt, 11, family.reason)
-            bindText(stmt, 12, pathsJSON)
+            bindData(stmt, 11, try encrypted(family.reason, table: "families", column: "reason", token: token))
+            bindData(stmt, 12, try encrypted(pathsJSON, table: "families", column: "member_paths_json", token: token))
             sqlite3_bind_double(stmt, 13, Date().timeIntervalSince1970)
             try stepDone(stmt)
         }
+        try withStatement("UPDATE families SET id_token = ? WHERE rowid = last_insert_rowid()") { stmt in bindText(stmt, 1, cipher.token(family.id, domain: "families.id")); try stepDone(stmt) }
     }
 
     private func insert(_ group: DuplicateGroup) throws {
@@ -334,34 +462,33 @@ public final class ManifestStore: @unchecked Sendable {
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """
         try withStatement(sql) { stmt in
-            bindText(stmt, 1, group.id)
+            let token = cipher.token(group.id, domain: "duplicate_groups.id")
+            bindData(stmt, 1, try encrypted(group.id, table: "duplicate_groups", column: "id", token: token))
             bindText(stmt, 2, group.sha256)
             sqlite3_bind_int64(stmt, 3, group.sizeBytes)
             sqlite3_bind_int(stmt, 4, Int32(group.duplicateCount))
             sqlite3_bind_int64(stmt, 5, group.reclaimableBytes)
-            bindText(stmt, 6, pathsJSON)
+            bindData(stmt, 6, try encrypted(pathsJSON, table: "duplicate_groups", column: "paths_json", token: token))
             sqlite3_bind_double(stmt, 7, Date().timeIntervalSince1970)
             try stepDone(stmt)
         }
+        try withStatement("UPDATE duplicate_groups SET id_token = ? WHERE rowid = last_insert_rowid()") { stmt in bindText(stmt, 1, cipher.token(group.id, domain: "duplicate_groups.id")); try stepDone(stmt) }
     }
 
     public func verifiedCloudObject(sha256: String, provider: String, bucket: String, objectKey: String) throws -> CloudObject? {
         let sql = """
         SELECT cloud_object_id, sha256, size_bytes, storage_provider, bucket_or_container, object_key,
-               uploaded_at, verified_at, verify_status, ref_count
+               uploaded_at, verified_at, verify_status, ref_count, cloud_object_token
         FROM cloud_objects
-        WHERE sha256 = ? AND storage_provider = ? AND bucket_or_container = ? AND object_key = ? AND verify_status = ?
-        LIMIT 1
+        WHERE sha256 = ? AND verify_status = ?
         """
         var result: CloudObject?
         try withStatement(sql) { stmt in
             bindText(stmt, 1, sha256)
-            bindText(stmt, 2, provider)
-            bindText(stmt, 3, bucket)
-            bindText(stmt, 4, objectKey)
-            bindText(stmt, 5, CloudVerifyStatus.verified.rawValue)
-            if sqlite3_step(stmt) == SQLITE_ROW {
-                result = readCloudObject(stmt)
+            bindText(stmt, 2, CloudVerifyStatus.verified.rawValue)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let object = try readCloudObject(stmt, token: columnText(stmt, 10))
+                if object.storageProvider == provider && object.bucketOrContainer == bucket && object.objectKey == objectKey { result = object; break }
             }
         }
         return result
@@ -373,17 +500,18 @@ public final class ManifestStore: @unchecked Sendable {
                co.uploaded_at, co.verified_at, co.verify_status, co.ref_count,
                ab.binding_id, ab.file_path, ab.archive_state, ab.local_state, ab.restored_at, ab.last_restore_check_at,
                ab.released_at, ab.quarantined_at, ab.quarantine_path, ab.placeholder_path, ab.placeholder_created_at,
-               ab.placeholder_format, ab.placeholder_sha256, ab.placeholder_size
+               ab.placeholder_format, ab.placeholder_sha256, ab.placeholder_size, ab.binding_token, co.cloud_object_token
         FROM archive_bindings ab
-        JOIN cloud_objects co ON co.cloud_object_id = ab.cloud_object_id
+        JOIN cloud_objects co ON co.cloud_object_token = ab.cloud_object_token
         """
         var snapshots: [String: CloudArchiveSnapshot] = [:]
         try withStatement(sql) { stmt in
             while sqlite3_step(stmt) == SQLITE_ROW {
-                let object = readCloudObject(stmt)
+                let bindingToken = columnText(stmt, 24)
+                let object = try readCloudObject(stmt, token: columnText(stmt, 25))
                 let binding = ArchiveBinding(
-                    bindingID: columnText(stmt, 10),
-                    filePath: columnText(stmt, 11),
+                    bindingID: try decryptColumn(stmt, 10, table: "archive_bindings", column: "binding_id", token: bindingToken),
+                    filePath: try decryptColumn(stmt, 11, table: "archive_bindings", column: "file_path", token: bindingToken),
                     cloudObjectID: object.cloudObjectID,
                     archiveState: ArchiveBindingState(rawValue: columnText(stmt, 12)) ?? .uploaded,
                     localState: LocalArchiveState(rawValue: columnText(stmt, 13)) ?? .localPresent,
@@ -391,11 +519,11 @@ public final class ManifestStore: @unchecked Sendable {
                     lastRestoreCheckAt: optionalDate(stmt, 15),
                     releasedAt: optionalDate(stmt, 16),
                     quarantinedAt: optionalDate(stmt, 17),
-                    quarantinePath: optionalText(stmt, 18),
-                    placeholderPath: optionalText(stmt, 19),
+                    quarantinePath: try decryptOptionalColumn(stmt, 18, table: "archive_bindings", column: "quarantine_path", token: bindingToken),
+                    placeholderPath: try decryptOptionalColumn(stmt, 19, table: "archive_bindings", column: "placeholder_path", token: bindingToken),
                     placeholderCreatedAt: optionalDate(stmt, 20),
-                    placeholderFormat: optionalText(stmt, 21),
-                    placeholderSHA256: optionalText(stmt, 22),
+                    placeholderFormat: try decryptOptionalColumn(stmt, 21, table: "archive_bindings", column: "placeholder_format", token: bindingToken),
+                    placeholderSHA256: try decryptOptionalColumn(stmt, 22, table: "archive_bindings", column: "placeholder_sha256", token: bindingToken),
                     placeholderSize: optionalInt64(stmt, 23)
                 )
                 snapshots[binding.filePath] = CloudArchiveSnapshot(object: object, binding: binding)
@@ -413,33 +541,35 @@ public final class ManifestStore: @unchecked Sendable {
                ab.released_at, ab.quarantined_at, ab.quarantine_path, ab.placeholder_path, ab.placeholder_created_at,
                ab.placeholder_format, ab.placeholder_sha256, ab.placeholder_size,
                co.cloud_object_id, co.sha256, co.size_bytes, co.storage_provider, co.bucket_or_container, co.object_key,
-               co.uploaded_at, co.verified_at, co.verify_status, co.ref_count
+               co.uploaded_at, co.verified_at, co.verify_status, co.ref_count,
+               af.file_path_token, ab.binding_token, co.cloud_object_token
         FROM archived_files af
-        JOIN archive_bindings ab ON ab.file_path = af.file_path
-        JOIN cloud_objects co ON co.cloud_object_id = ab.cloud_object_id
+        JOIN archive_bindings ab ON ab.file_path_token = af.file_path_token
+        JOIN cloud_objects co ON co.cloud_object_token = ab.cloud_object_token
         """
         var snapshots: [String: ArchivedFileSnapshot] = [:]
         try withStatement(sql) { stmt in
             while sqlite3_step(stmt) == SQLITE_ROW {
-                let archivedFile = readArchivedFile(stmt)
+                let fileToken = columnText(stmt, 38), bindingToken = columnText(stmt, 39)
+                let archivedFile = try readArchivedFile(stmt, token: fileToken)
                 let binding = ArchiveBinding(
-                    bindingID: columnText(stmt, 15),
+                    bindingID: try decryptColumn(stmt, 15, table: "archive_bindings", column: "binding_id", token: bindingToken),
                     filePath: archivedFile.filePath,
-                    cloudObjectID: columnText(stmt, 28),
+                    cloudObjectID: try decryptColumn(stmt, 28, table: "cloud_objects", column: "cloud_object_id", token: columnText(stmt, 40)),
                     archiveState: ArchiveBindingState(rawValue: columnText(stmt, 16)) ?? .uploaded,
                     localState: LocalArchiveState(rawValue: columnText(stmt, 17)) ?? .localPresent,
                     restoredAt: optionalDate(stmt, 18),
                     lastRestoreCheckAt: optionalDate(stmt, 19),
                     releasedAt: optionalDate(stmt, 20),
                     quarantinedAt: optionalDate(stmt, 21),
-                    quarantinePath: optionalText(stmt, 22),
-                    placeholderPath: optionalText(stmt, 23),
+                    quarantinePath: try decryptOptionalColumn(stmt, 22, table: "archive_bindings", column: "quarantine_path", token: bindingToken),
+                    placeholderPath: try decryptOptionalColumn(stmt, 23, table: "archive_bindings", column: "placeholder_path", token: bindingToken),
                     placeholderCreatedAt: optionalDate(stmt, 24),
-                    placeholderFormat: optionalText(stmt, 25),
-                    placeholderSHA256: optionalText(stmt, 26),
+                    placeholderFormat: try decryptOptionalColumn(stmt, 25, table: "archive_bindings", column: "placeholder_format", token: bindingToken),
+                    placeholderSHA256: try decryptOptionalColumn(stmt, 26, table: "archive_bindings", column: "placeholder_sha256", token: bindingToken),
                     placeholderSize: optionalInt64(stmt, 27)
                 )
-                let object = readCloudObject(stmt, offset: 28)
+                let object = try readCloudObject(stmt, offset: 28, token: columnText(stmt, 40))
                 snapshots[archivedFile.filePath] = ArchivedFileSnapshot(archivedFile: archivedFile, binding: binding, object: object)
             }
         }
@@ -450,14 +580,14 @@ public final class ManifestStore: @unchecked Sendable {
         try withStatement("""
         UPDATE archive_bindings
         SET archive_state = ?, local_state = ?, restored_at = ?, last_restore_check_at = ?, updated_at = ?
-        WHERE binding_id = ?
+        WHERE binding_token = ?
         """) { stmt in
             bindText(stmt, 1, archiveState.rawValue)
             bindText(stmt, 2, localState.rawValue)
             bindOptionalDate(stmt, 3, restoredAt)
             bindOptionalDate(stmt, 4, lastRestoreCheckAt)
             sqlite3_bind_double(stmt, 5, Date().timeIntervalSince1970)
-            bindText(stmt, 6, bindingID)
+            bindText(stmt, 6, cipher.token(bindingID, domain: "archive_bindings.binding_id"))
             try stepDone(stmt)
         }
     }
@@ -480,20 +610,21 @@ public final class ManifestStore: @unchecked Sendable {
         SET archive_state = ?, local_state = ?, released_at = ?, quarantined_at = ?, quarantine_path = ?,
             placeholder_path = ?, placeholder_created_at = ?, placeholder_format = ?,
             placeholder_sha256 = ?, placeholder_size = ?, updated_at = ?
-        WHERE binding_id = ?
+        WHERE binding_token = ?
         """) { stmt in
             bindText(stmt, 1, archiveState.rawValue)
             bindText(stmt, 2, localState.rawValue)
             bindOptionalDate(stmt, 3, releasedAt)
             bindOptionalDate(stmt, 4, quarantinedAt)
-            bindOptionalText(stmt, 5, quarantinePath)
-            bindOptionalText(stmt, 6, placeholderPath)
+            let token = cipher.token(bindingID, domain: "archive_bindings.binding_id")
+            try bindOptionalEncrypted(stmt, 5, quarantinePath, table: "archive_bindings", column: "quarantine_path", token: token)
+            try bindOptionalEncrypted(stmt, 6, placeholderPath, table: "archive_bindings", column: "placeholder_path", token: token)
             bindOptionalDate(stmt, 7, placeholderCreatedAt)
-            bindOptionalText(stmt, 8, placeholderFormat)
-            bindOptionalText(stmt, 9, placeholderSHA256)
+            try bindOptionalEncrypted(stmt, 8, placeholderFormat, table: "archive_bindings", column: "placeholder_format", token: token)
+            try bindOptionalEncrypted(stmt, 9, placeholderSHA256, table: "archive_bindings", column: "placeholder_sha256", token: token)
             bindOptionalInt64(stmt, 10, placeholderSize)
             sqlite3_bind_double(stmt, 11, Date().timeIntervalSince1970)
-            bindText(stmt, 12, bindingID)
+            bindText(stmt, 12, token)
             try stepDone(stmt)
         }
     }
@@ -504,10 +635,10 @@ public final class ManifestStore: @unchecked Sendable {
         SET placeholder_path = NULL, placeholder_created_at = NULL, placeholder_format = NULL,
             placeholder_sha256 = NULL, placeholder_size = NULL, quarantine_path = NULL,
             updated_at = ?
-        WHERE binding_id = ?
+        WHERE binding_token = ?
         """) { stmt in
             sqlite3_bind_double(stmt, 1, Date().timeIntervalSince1970)
-            bindText(stmt, 2, bindingID)
+            bindText(stmt, 2, cipher.token(bindingID, domain: "archive_bindings.binding_id"))
             try stepDone(stmt)
         }
     }
@@ -527,10 +658,10 @@ public final class ManifestStore: @unchecked Sendable {
     }
 
     public func updateFileStatus(path: String, status: ArchiveStatus) throws {
-        try withStatement("UPDATE files SET status = ?, updated_at = ? WHERE path = ?") { stmt in
+        try withStatement("UPDATE files SET status = ?, updated_at = ? WHERE path_token = ?") { stmt in
             bindText(stmt, 1, status.rawValue)
             sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
-            bindText(stmt, 3, path)
+            bindText(stmt, 3, cipher.token(path, domain: "files.path"))
             try stepDone(stmt)
         }
     }
@@ -538,7 +669,10 @@ public final class ManifestStore: @unchecked Sendable {
     public func logOperation(_ event: String, detail: String?) throws {
         try withStatement("INSERT INTO operations (event, detail, created_at) VALUES (?, ?, ?)") { stmt in
             bindText(stmt, 1, event)
-            bindOptionalText(stmt, 2, detail)
+            // Event names are sufficient for the activity feed. Raw diagnostics can contain
+            // paths, filenames, object keys, or provider responses, so P3 never persists them
+            // in plaintext logs.
+            bindOptionalText(stmt, 2, detail == nil ? nil : "[redacted]")
             sqlite3_bind_double(stmt, 3, Date().timeIntervalSince1970)
             try stepDone(stmt)
         }
@@ -623,21 +757,22 @@ public final class ManifestStore: @unchecked Sendable {
         let sql = """
         INSERT OR REPLACE INTO cloud_objects (
             cloud_object_id, sha256, size_bytes, storage_provider, bucket_or_container, object_key,
-            uploaded_at, verified_at, verify_status, ref_count, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            uploaded_at, verified_at, verify_status, ref_count, updated_at, cloud_object_token
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try withStatement(sql) { stmt in
-            bindText(stmt, 1, object.cloudObjectID)
+            let token = cipher.token(object.cloudObjectID, domain: "cloud_objects.cloud_object_id")
+            bindData(stmt, 1, try encrypted(object.cloudObjectID, table: "cloud_objects", column: "cloud_object_id", token: token))
             bindText(stmt, 2, object.sha256)
             sqlite3_bind_int64(stmt, 3, object.sizeBytes)
-            bindText(stmt, 4, object.storageProvider)
-            bindText(stmt, 5, object.bucketOrContainer)
-            bindText(stmt, 6, object.objectKey)
+            bindData(stmt, 4, try encrypted(object.storageProvider, table: "cloud_objects", column: "storage_provider", token: token))
+            bindData(stmt, 5, try encrypted(object.bucketOrContainer, table: "cloud_objects", column: "bucket_or_container", token: token))
+            bindData(stmt, 6, try encrypted(object.objectKey, table: "cloud_objects", column: "object_key", token: token))
             sqlite3_bind_double(stmt, 7, object.uploadedAt.timeIntervalSince1970)
             bindOptionalDate(stmt, 8, object.verifiedAt)
             bindText(stmt, 9, object.verifyStatus.rawValue)
             sqlite3_bind_int(stmt, 10, Int32(object.refCount))
-            sqlite3_bind_double(stmt, 11, Date().timeIntervalSince1970)
+            sqlite3_bind_double(stmt, 11, Date().timeIntervalSince1970); bindText(stmt, 12, token)
             try stepDone(stmt)
         }
     }
@@ -648,9 +783,9 @@ public final class ManifestStore: @unchecked Sendable {
             binding_id, file_path, cloud_object_id, archive_state, local_state,
             restored_at, last_restore_check_at, released_at, quarantined_at, quarantine_path,
             placeholder_path, placeholder_created_at, placeholder_format, placeholder_sha256,
-            placeholder_size, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(binding_id) DO UPDATE SET
+            placeholder_size, updated_at, binding_token, file_path_token, cloud_object_token
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(binding_token) DO UPDATE SET
             file_path = excluded.file_path,
             cloud_object_id = excluded.cloud_object_id,
             archive_state = CASE
@@ -677,22 +812,24 @@ public final class ManifestStore: @unchecked Sendable {
             updated_at = excluded.updated_at
         """
         try withStatement(sql) { stmt in
-            bindText(stmt, 1, binding.bindingID)
-            bindText(stmt, 2, binding.filePath)
-            bindText(stmt, 3, binding.cloudObjectID)
+            let token = cipher.token(binding.bindingID, domain: "archive_bindings.binding_id")
+            bindData(stmt, 1, try encrypted(binding.bindingID, table: "archive_bindings", column: "binding_id", token: token))
+            bindData(stmt, 2, try encrypted(binding.filePath, table: "archive_bindings", column: "file_path", token: token))
+            bindData(stmt, 3, try encrypted(binding.cloudObjectID, table: "archive_bindings", column: "cloud_object_id", token: token))
             bindText(stmt, 4, binding.archiveState.rawValue)
             bindText(stmt, 5, binding.localState.rawValue)
             bindOptionalDate(stmt, 6, binding.restoredAt)
             bindOptionalDate(stmt, 7, binding.lastRestoreCheckAt)
             bindOptionalDate(stmt, 8, binding.releasedAt)
             bindOptionalDate(stmt, 9, binding.quarantinedAt)
-            bindOptionalText(stmt, 10, binding.quarantinePath)
-            bindOptionalText(stmt, 11, binding.placeholderPath)
+            try bindOptionalEncrypted(stmt, 10, binding.quarantinePath, table: "archive_bindings", column: "quarantine_path", token: token)
+            try bindOptionalEncrypted(stmt, 11, binding.placeholderPath, table: "archive_bindings", column: "placeholder_path", token: token)
             bindOptionalDate(stmt, 12, binding.placeholderCreatedAt)
-            bindOptionalText(stmt, 13, binding.placeholderFormat)
-            bindOptionalText(stmt, 14, binding.placeholderSHA256)
+            try bindOptionalEncrypted(stmt, 13, binding.placeholderFormat, table: "archive_bindings", column: "placeholder_format", token: token)
+            try bindOptionalEncrypted(stmt, 14, binding.placeholderSHA256, table: "archive_bindings", column: "placeholder_sha256", token: token)
             bindOptionalInt64(stmt, 15, binding.placeholderSize)
             sqlite3_bind_double(stmt, 16, Date().timeIntervalSince1970)
+            bindText(stmt, 17, token); bindText(stmt, 18, cipher.token(binding.filePath, domain: "files.path")); bindText(stmt, 19, cipher.token(binding.cloudObjectID, domain: "cloud_objects.cloud_object_id"))
             try stepDone(stmt)
         }
     }
@@ -702,9 +839,9 @@ public final class ManifestStore: @unchecked Sendable {
         INSERT INTO archived_files (
             file_path, object_type, original_filename, relative_path, account_hash, account_name,
             month, size_bytes, sha256, mtime, family_id, display_or_playback_path,
-            bubble_or_thumb_path, archived_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(file_path) DO UPDATE SET
+            bubble_or_thumb_path, archived_at, updated_at, file_path_token
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(file_path_token) DO UPDATE SET
             object_type = excluded.object_type,
             original_filename = excluded.original_filename,
             relative_path = excluded.relative_path,
@@ -720,21 +857,22 @@ public final class ManifestStore: @unchecked Sendable {
             updated_at = excluded.updated_at
         """
         try withStatement(sql) { stmt in
-            bindText(stmt, 1, archivedFile.filePath)
+            let token = cipher.token(archivedFile.filePath, domain: "files.path")
+            bindData(stmt, 1, try encrypted(archivedFile.filePath, table: "archived_files", column: "file_path", token: token))
             bindText(stmt, 2, archivedFile.objectType.rawValue)
-            bindText(stmt, 3, archivedFile.originalFilename)
-            bindText(stmt, 4, archivedFile.relativePath)
-            bindText(stmt, 5, archivedFile.accountHash)
-            bindText(stmt, 6, archivedFile.accountName)
+            bindData(stmt, 3, try encrypted(archivedFile.originalFilename, table: "archived_files", column: "original_filename", token: token))
+            bindData(stmt, 4, try encrypted(archivedFile.relativePath, table: "archived_files", column: "relative_path", token: token))
+            bindData(stmt, 5, try encrypted(archivedFile.accountHash, table: "archived_files", column: "account_hash", token: token))
+            bindData(stmt, 6, try encrypted(archivedFile.accountName, table: "archived_files", column: "account_name", token: token))
             bindOptionalText(stmt, 7, archivedFile.month)
             sqlite3_bind_int64(stmt, 8, archivedFile.sizeBytes)
-            bindText(stmt, 9, archivedFile.sha256)
+            bindData(stmt, 9, try encrypted(archivedFile.sha256, table: "archived_files", column: "sha256", token: token))
             sqlite3_bind_double(stmt, 10, archivedFile.mtime.timeIntervalSince1970)
-            bindOptionalText(stmt, 11, archivedFile.familyID)
-            bindOptionalText(stmt, 12, archivedFile.displayOrPlaybackPath)
-            bindOptionalText(stmt, 13, archivedFile.bubbleOrThumbPath)
+            try bindOptionalEncrypted(stmt, 11, archivedFile.familyID, table: "archived_files", column: "family_id", token: token)
+            try bindOptionalEncrypted(stmt, 12, archivedFile.displayOrPlaybackPath, table: "archived_files", column: "display_or_playback_path", token: token)
+            try bindOptionalEncrypted(stmt, 13, archivedFile.bubbleOrThumbPath, table: "archived_files", column: "bubble_or_thumb_path", token: token)
             sqlite3_bind_double(stmt, 14, archivedFile.archivedAt.timeIntervalSince1970)
-            sqlite3_bind_double(stmt, 15, archivedFile.updatedAt.timeIntervalSince1970)
+            sqlite3_bind_double(stmt, 15, archivedFile.updatedAt.timeIntervalSince1970); bindText(stmt, 16, token)
             try stepDone(stmt)
         }
     }
@@ -742,45 +880,45 @@ public final class ManifestStore: @unchecked Sendable {
     private func refreshRefCount(cloudObjectID: String) throws {
         let sql = """
         UPDATE cloud_objects
-        SET ref_count = (SELECT COUNT(*) FROM archive_bindings WHERE cloud_object_id = ?), updated_at = ?
-        WHERE cloud_object_id = ?
+        SET ref_count = (SELECT COUNT(*) FROM archive_bindings WHERE cloud_object_token = ?), updated_at = ?
+        WHERE cloud_object_token = ?
         """
         try withStatement(sql) { stmt in
-            bindText(stmt, 1, cloudObjectID)
+            bindText(stmt, 1, cipher.token(cloudObjectID, domain: "cloud_objects.cloud_object_id"))
             sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
-            bindText(stmt, 3, cloudObjectID)
+            bindText(stmt, 3, cipher.token(cloudObjectID, domain: "cloud_objects.cloud_object_id"))
             try stepDone(stmt)
         }
     }
 
-    private func readArchivedFile(_ stmt: OpaquePointer?) -> ArchivedFile {
+    private func readArchivedFile(_ stmt: OpaquePointer?, token: String) throws -> ArchivedFile {
         ArchivedFile(
-            filePath: columnText(stmt, 0),
+            filePath: try decryptColumn(stmt, 0, table: "archived_files", column: "file_path", token: token),
             objectType: ArchiveObjectType(rawValue: columnText(stmt, 1)) ?? .ordinaryFile,
-            originalFilename: columnText(stmt, 2),
-            relativePath: columnText(stmt, 3),
-            accountHash: columnText(stmt, 4),
-            accountName: columnText(stmt, 5),
+            originalFilename: try decryptColumn(stmt, 2, table: "archived_files", column: "original_filename", token: token),
+            relativePath: try decryptColumn(stmt, 3, table: "archived_files", column: "relative_path", token: token),
+            accountHash: try decryptColumn(stmt, 4, table: "archived_files", column: "account_hash", token: token),
+            accountName: try decryptColumn(stmt, 5, table: "archived_files", column: "account_name", token: token),
             month: optionalText(stmt, 6),
             sizeBytes: sqlite3_column_int64(stmt, 7),
-            sha256: columnText(stmt, 8),
+            sha256: try decryptColumn(stmt, 8, table: "archived_files", column: "sha256", token: token),
             mtime: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 9)),
-            familyID: optionalText(stmt, 10),
-            displayOrPlaybackPath: optionalText(stmt, 11),
-            bubbleOrThumbPath: optionalText(stmt, 12),
+            familyID: try decryptOptionalColumn(stmt, 10, table: "archived_files", column: "family_id", token: token),
+            displayOrPlaybackPath: try decryptOptionalColumn(stmt, 11, table: "archived_files", column: "display_or_playback_path", token: token),
+            bubbleOrThumbPath: try decryptOptionalColumn(stmt, 12, table: "archived_files", column: "bubble_or_thumb_path", token: token),
             archivedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 13)),
             updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 14))
         )
     }
 
-    private func readCloudObject(_ stmt: OpaquePointer?, offset: Int32 = 0) -> CloudObject {
+    private func readCloudObject(_ stmt: OpaquePointer?, offset: Int32 = 0, token: String) throws -> CloudObject {
         CloudObject(
-            cloudObjectID: columnText(stmt, offset),
+            cloudObjectID: try decryptColumn(stmt, offset, table: "cloud_objects", column: "cloud_object_id", token: token),
             sha256: columnText(stmt, offset + 1),
             sizeBytes: sqlite3_column_int64(stmt, offset + 2),
-            storageProvider: columnText(stmt, offset + 3),
-            bucketOrContainer: columnText(stmt, offset + 4),
-            objectKey: columnText(stmt, offset + 5),
+            storageProvider: try decryptColumn(stmt, offset + 3, table: "cloud_objects", column: "storage_provider", token: token),
+            bucketOrContainer: try decryptColumn(stmt, offset + 4, table: "cloud_objects", column: "bucket_or_container", token: token),
+            objectKey: try decryptColumn(stmt, offset + 5, table: "cloud_objects", column: "object_key", token: token),
             uploadedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, offset + 6)),
             verifiedAt: optionalDate(stmt, offset + 7),
             verifyStatus: CloudVerifyStatus(rawValue: columnText(stmt, offset + 8)) ?? .uploaded,
@@ -792,6 +930,56 @@ public final class ManifestStore: @unchecked Sendable {
         if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
             throw WeVaultError.sqlite(lastError)
         }
+    }
+
+    private func verifyIntegrity() throws {
+        var healthy = false
+        try withStatement("PRAGMA quick_check") { stmt in
+            healthy = sqlite3_step(stmt) == SQLITE_ROW && columnText(stmt, 0).lowercased() == "ok"
+        }
+        guard healthy else { throw WeVaultError.manifest(.sqliteCorrupt) }
+        // Validate every encrypted row at open. This is intentionally streaming and fail-closed;
+        // P7 can optimize scheduling but must not weaken this security gate.
+        for (table, tokenColumn, columns) in [
+            ("files", "path_token", ["path", "original_filename", "relative_path"]),
+            ("families", "id_token", ["high_or_raw_path", "member_paths_json"]),
+            ("cloud_objects", "cloud_object_token", ["cloud_object_id", "bucket_or_container", "object_key"]),
+            ("archive_bindings", "binding_token", ["binding_id", "file_path", "cloud_object_id"]),
+            ("archived_files", "file_path_token", ["file_path", "original_filename"])
+        ] {
+            try withStatement("SELECT \(tokenColumn), \(columns.joined(separator: ", ")) FROM \(table)") { stmt in
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    let token = columnText(stmt, 0)
+                    guard !token.isEmpty else { throw WeVaultError.manifest(.malformedEncryptedField) }
+                    for (offset, column) in columns.enumerated() {
+                        _ = try decryptColumn(stmt, Int32(offset + 1), table: table, column: column, token: token)
+                    }
+                }
+            }
+        }
+    }
+
+    private func encrypted(_ value: String, table: String, column: String, token: String) throws -> Data {
+        do { return try cipher.seal(value, context: "\(table).\(column).\(token)") }
+        catch let failure as ManifestFailure { throw WeVaultError.manifest(failure) }
+    }
+
+    private func bindOptionalEncrypted(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?, table: String, column: String, token: String) throws {
+        if let value { bindData(stmt, index, try encrypted(value, table: table, column: column, token: token)) }
+        else { sqlite3_bind_null(stmt, index) }
+    }
+
+    private func decryptColumn(_ stmt: OpaquePointer?, _ index: Int32, table: String, column: String, token: String) throws -> String {
+        guard sqlite3_column_type(stmt, index) != SQLITE_NULL else { return "" }
+        guard let bytes = sqlite3_column_blob(stmt, index) else { throw WeVaultError.manifest(.malformedEncryptedField) }
+        let length = Int(sqlite3_column_bytes(stmt, index))
+        do { return try cipher.open(Data(bytes: bytes, count: length), context: "\(table).\(column).\(token)") }
+        catch let failure as ManifestFailure { throw WeVaultError.manifest(failure) }
+    }
+
+    private func decryptOptionalColumn(_ stmt: OpaquePointer?, _ index: Int32, table: String, column: String, token: String) throws -> String? {
+        if sqlite3_column_type(stmt, index) == SQLITE_NULL { return nil }
+        return try decryptColumn(stmt, index, table: table, column: column, token: token)
     }
 
     private func addColumnIfNeeded(table: String, definition: String) throws {
@@ -830,6 +1018,10 @@ public final class ManifestStore: @unchecked Sendable {
 
 private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
     sqlite3_bind_text(stmt, index, value, -1, SQLITE_TRANSIENT)
+}
+
+private func bindData(_ stmt: OpaquePointer?, _ index: Int32, _ value: Data) {
+    _ = value.withUnsafeBytes { sqlite3_bind_blob(stmt, index, $0.baseAddress, Int32(value.count), SQLITE_TRANSIENT) }
 }
 
 private func bindOptionalText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?) {
