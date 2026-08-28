@@ -150,6 +150,7 @@ public final class ManifestStore: @unchecked Sendable {
             restored_at REAL,
             last_restore_check_at REAL,
             released_at REAL,
+            quarantined_at REAL,
             quarantine_path TEXT,
             placeholder_path TEXT,
             placeholder_created_at REAL,
@@ -164,6 +165,7 @@ public final class ManifestStore: @unchecked Sendable {
         try addColumnIfNeeded(table: "archive_bindings", definition: "restored_at REAL")
         try addColumnIfNeeded(table: "archive_bindings", definition: "last_restore_check_at REAL")
         try addColumnIfNeeded(table: "archive_bindings", definition: "released_at REAL")
+        try addColumnIfNeeded(table: "archive_bindings", definition: "quarantined_at REAL")
         try addColumnIfNeeded(table: "archive_bindings", definition: "quarantine_path TEXT")
         try addColumnIfNeeded(table: "archive_bindings", definition: "placeholder_path TEXT")
         try addColumnIfNeeded(table: "archive_bindings", definition: "placeholder_created_at REAL")
@@ -187,6 +189,42 @@ public final class ManifestStore: @unchecked Sendable {
             bubble_or_thumb_path TEXT,
             archived_at REAL NOT NULL,
             updated_at REAL NOT NULL
+        )
+        """)
+        try execute("""
+        CREATE TABLE IF NOT EXISTS automation_tasks (
+            id TEXT PRIMARY KEY,
+            is_paused INTEGER NOT NULL,
+            interval_hours INTEGER NOT NULL,
+            next_run_at REAL NOT NULL,
+            last_run_at REAL,
+            updated_at REAL NOT NULL
+        )
+        """)
+        try execute("""
+        CREATE TABLE IF NOT EXISTS automation_task_runs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            completed_units INTEGER NOT NULL,
+            total_units INTEGER NOT NULL,
+            failure_reason TEXT,
+            retry_of_run_id TEXT,
+            started_at REAL,
+            finished_at REAL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES automation_tasks(id)
+        )
+        """)
+        try execute("""
+        CREATE TABLE IF NOT EXISTS automation_task_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT,
+            event TEXT NOT NULL,
+            detail TEXT,
+            created_at REAL NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES automation_task_runs(id)
         )
         """)
         try backfillArchivedFilesFromCurrentSnapshot()
@@ -334,7 +372,7 @@ public final class ManifestStore: @unchecked Sendable {
         SELECT co.cloud_object_id, co.sha256, co.size_bytes, co.storage_provider, co.bucket_or_container, co.object_key,
                co.uploaded_at, co.verified_at, co.verify_status, co.ref_count,
                ab.binding_id, ab.file_path, ab.archive_state, ab.local_state, ab.restored_at, ab.last_restore_check_at,
-               ab.released_at, ab.quarantine_path, ab.placeholder_path, ab.placeholder_created_at,
+               ab.released_at, ab.quarantined_at, ab.quarantine_path, ab.placeholder_path, ab.placeholder_created_at,
                ab.placeholder_format, ab.placeholder_sha256, ab.placeholder_size
         FROM archive_bindings ab
         JOIN cloud_objects co ON co.cloud_object_id = ab.cloud_object_id
@@ -352,12 +390,13 @@ public final class ManifestStore: @unchecked Sendable {
                     restoredAt: optionalDate(stmt, 14),
                     lastRestoreCheckAt: optionalDate(stmt, 15),
                     releasedAt: optionalDate(stmt, 16),
-                    quarantinePath: optionalText(stmt, 17),
-                    placeholderPath: optionalText(stmt, 18),
-                    placeholderCreatedAt: optionalDate(stmt, 19),
-                    placeholderFormat: optionalText(stmt, 20),
-                    placeholderSHA256: optionalText(stmt, 21),
-                    placeholderSize: optionalInt64(stmt, 22)
+                    quarantinedAt: optionalDate(stmt, 17),
+                    quarantinePath: optionalText(stmt, 18),
+                    placeholderPath: optionalText(stmt, 19),
+                    placeholderCreatedAt: optionalDate(stmt, 20),
+                    placeholderFormat: optionalText(stmt, 21),
+                    placeholderSHA256: optionalText(stmt, 22),
+                    placeholderSize: optionalInt64(stmt, 23)
                 )
                 snapshots[binding.filePath] = CloudArchiveSnapshot(object: object, binding: binding)
             }
@@ -371,7 +410,7 @@ public final class ManifestStore: @unchecked Sendable {
                af.month, af.size_bytes, af.sha256, af.mtime, af.family_id, af.display_or_playback_path,
                af.bubble_or_thumb_path, af.archived_at, af.updated_at,
                ab.binding_id, ab.archive_state, ab.local_state, ab.restored_at, ab.last_restore_check_at,
-               ab.released_at, ab.quarantine_path, ab.placeholder_path, ab.placeholder_created_at,
+               ab.released_at, ab.quarantined_at, ab.quarantine_path, ab.placeholder_path, ab.placeholder_created_at,
                ab.placeholder_format, ab.placeholder_sha256, ab.placeholder_size,
                co.cloud_object_id, co.sha256, co.size_bytes, co.storage_provider, co.bucket_or_container, co.object_key,
                co.uploaded_at, co.verified_at, co.verify_status, co.ref_count
@@ -386,20 +425,21 @@ public final class ManifestStore: @unchecked Sendable {
                 let binding = ArchiveBinding(
                     bindingID: columnText(stmt, 15),
                     filePath: archivedFile.filePath,
-                    cloudObjectID: columnText(stmt, 27),
+                    cloudObjectID: columnText(stmt, 28),
                     archiveState: ArchiveBindingState(rawValue: columnText(stmt, 16)) ?? .uploaded,
                     localState: LocalArchiveState(rawValue: columnText(stmt, 17)) ?? .localPresent,
                     restoredAt: optionalDate(stmt, 18),
                     lastRestoreCheckAt: optionalDate(stmt, 19),
                     releasedAt: optionalDate(stmt, 20),
-                    quarantinePath: optionalText(stmt, 21),
-                    placeholderPath: optionalText(stmt, 22),
-                    placeholderCreatedAt: optionalDate(stmt, 23),
-                    placeholderFormat: optionalText(stmt, 24),
-                    placeholderSHA256: optionalText(stmt, 25),
-                    placeholderSize: optionalInt64(stmt, 26)
+                    quarantinedAt: optionalDate(stmt, 21),
+                    quarantinePath: optionalText(stmt, 22),
+                    placeholderPath: optionalText(stmt, 23),
+                    placeholderCreatedAt: optionalDate(stmt, 24),
+                    placeholderFormat: optionalText(stmt, 25),
+                    placeholderSHA256: optionalText(stmt, 26),
+                    placeholderSize: optionalInt64(stmt, 27)
                 )
-                let object = readCloudObject(stmt, offset: 27)
+                let object = readCloudObject(stmt, offset: 28)
                 snapshots[archivedFile.filePath] = ArchivedFileSnapshot(archivedFile: archivedFile, binding: binding, object: object)
             }
         }
@@ -427,6 +467,7 @@ public final class ManifestStore: @unchecked Sendable {
         archiveState: ArchiveBindingState,
         localState: LocalArchiveState,
         releasedAt: Date?,
+        quarantinedAt: Date? = nil,
         quarantinePath: String?,
         placeholderPath: String? = nil,
         placeholderCreatedAt: Date? = nil,
@@ -436,7 +477,7 @@ public final class ManifestStore: @unchecked Sendable {
     ) throws {
         try withStatement("""
         UPDATE archive_bindings
-        SET archive_state = ?, local_state = ?, released_at = ?, quarantine_path = ?,
+        SET archive_state = ?, local_state = ?, released_at = ?, quarantined_at = ?, quarantine_path = ?,
             placeholder_path = ?, placeholder_created_at = ?, placeholder_format = ?,
             placeholder_sha256 = ?, placeholder_size = ?, updated_at = ?
         WHERE binding_id = ?
@@ -444,14 +485,15 @@ public final class ManifestStore: @unchecked Sendable {
             bindText(stmt, 1, archiveState.rawValue)
             bindText(stmt, 2, localState.rawValue)
             bindOptionalDate(stmt, 3, releasedAt)
-            bindOptionalText(stmt, 4, quarantinePath)
-            bindOptionalText(stmt, 5, placeholderPath)
-            bindOptionalDate(stmt, 6, placeholderCreatedAt)
-            bindOptionalText(stmt, 7, placeholderFormat)
-            bindOptionalText(stmt, 8, placeholderSHA256)
-            bindOptionalInt64(stmt, 9, placeholderSize)
-            sqlite3_bind_double(stmt, 10, Date().timeIntervalSince1970)
-            bindText(stmt, 11, bindingID)
+            bindOptionalDate(stmt, 4, quarantinedAt)
+            bindOptionalText(stmt, 5, quarantinePath)
+            bindOptionalText(stmt, 6, placeholderPath)
+            bindOptionalDate(stmt, 7, placeholderCreatedAt)
+            bindOptionalText(stmt, 8, placeholderFormat)
+            bindOptionalText(stmt, 9, placeholderSHA256)
+            bindOptionalInt64(stmt, 10, placeholderSize)
+            sqlite3_bind_double(stmt, 11, Date().timeIntervalSince1970)
+            bindText(stmt, 12, bindingID)
             try stepDone(stmt)
         }
     }
@@ -519,6 +561,64 @@ public final class ManifestStore: @unchecked Sendable {
         return records
     }
 
+    public func saveAutomationTask(_ task: AutomationTask) throws {
+        try withStatement("""
+        INSERT INTO automation_tasks (id, is_paused, interval_hours, next_run_at, last_run_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET is_paused = excluded.is_paused, interval_hours = excluded.interval_hours,
+            next_run_at = excluded.next_run_at, last_run_at = excluded.last_run_at, updated_at = excluded.updated_at
+        """) { stmt in
+            bindText(stmt, 1, task.id); sqlite3_bind_int(stmt, 2, task.isPaused ? 1 : 0); sqlite3_bind_int(stmt, 3, Int32(task.intervalHours))
+            sqlite3_bind_double(stmt, 4, task.nextRunAt.timeIntervalSince1970); bindOptionalDate(stmt, 5, task.lastRunAt); sqlite3_bind_double(stmt, 6, Date().timeIntervalSince1970); try stepDone(stmt)
+        }
+    }
+
+    public func automationTask(id: String) throws -> AutomationTask? {
+        var task: AutomationTask?
+        try withStatement("SELECT id, is_paused, interval_hours, next_run_at, last_run_at FROM automation_tasks WHERE id = ?") { stmt in
+            bindText(stmt, 1, id)
+            if sqlite3_step(stmt) == SQLITE_ROW { task = AutomationTask(id: columnText(stmt, 0), isPaused: sqlite3_column_int(stmt, 1) != 0, intervalHours: Int(sqlite3_column_int(stmt, 2)), nextRunAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3)), lastRunAt: optionalDate(stmt, 4)) }
+        }
+        return task
+    }
+
+    public func dueAutomationTasks(at date: Date) throws -> [AutomationTask] {
+        var tasks: [AutomationTask] = []
+        try withStatement("SELECT id, is_paused, interval_hours, next_run_at, last_run_at FROM automation_tasks WHERE is_paused = 0 AND next_run_at <= ?") { stmt in
+            sqlite3_bind_double(stmt, 1, date.timeIntervalSince1970)
+            while sqlite3_step(stmt) == SQLITE_ROW { tasks.append(AutomationTask(id: columnText(stmt, 0), isPaused: false, intervalHours: Int(sqlite3_column_int(stmt, 2)), nextRunAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3)), lastRunAt: optionalDate(stmt, 4))) }
+        }
+        return tasks
+    }
+
+    public func saveAutomationRun(_ run: AutomationTaskRun) throws {
+        try withStatement("INSERT OR REPLACE INTO automation_task_runs (id, task_id, status, stage, completed_units, total_units, failure_reason, retry_of_run_id, started_at, finished_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") { stmt in
+            bindText(stmt, 1, run.id); bindText(stmt, 2, run.taskID); bindText(stmt, 3, run.status.rawValue); bindText(stmt, 4, run.stage.rawValue); sqlite3_bind_int(stmt, 5, Int32(run.completedUnits)); sqlite3_bind_int(stmt, 6, Int32(run.totalUnits)); bindOptionalText(stmt, 7, run.failureReason); bindOptionalText(stmt, 8, run.retryOfRunID); bindOptionalDate(stmt, 9, run.startedAt); bindOptionalDate(stmt, 10, run.finishedAt); sqlite3_bind_double(stmt, 11, Date().timeIntervalSince1970); try stepDone(stmt)
+        }
+    }
+
+    public func latestAutomationRun(taskID: String) throws -> AutomationTaskRun? {
+        var run: AutomationTaskRun?
+        try withStatement("SELECT id, task_id, status, stage, completed_units, total_units, failure_reason, retry_of_run_id, started_at, finished_at FROM automation_task_runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1") { stmt in
+            bindText(stmt, 1, taskID)
+            if sqlite3_step(stmt) == SQLITE_ROW { run = AutomationTaskRun(id: columnText(stmt, 0), taskID: columnText(stmt, 1), status: AutomationRunStatus(rawValue: columnText(stmt, 2)) ?? .failed, stage: AutomationStage(rawValue: columnText(stmt, 3)) ?? .finished, completedUnits: Int(sqlite3_column_int(stmt, 4)), totalUnits: Int(sqlite3_column_int(stmt, 5)), failureReason: optionalText(stmt, 6), retryOfRunID: optionalText(stmt, 7), startedAt: optionalDate(stmt, 8), finishedAt: optionalDate(stmt, 9)) }
+        }
+        return run
+    }
+
+    public func logAutomation(runID: String?, event: String, detail: String?) throws {
+        try withStatement("INSERT INTO automation_task_logs (run_id, event, detail, created_at) VALUES (?, ?, ?, ?)") { stmt in bindOptionalText(stmt, 1, runID); bindText(stmt, 2, event); bindOptionalText(stmt, 3, detail); sqlite3_bind_double(stmt, 4, Date().timeIntervalSince1970); try stepDone(stmt) }
+    }
+
+    public func recentAutomationLogs(taskID: String, limit: Int = 20) throws -> [AutomationTaskLog] {
+        var logs: [AutomationTaskLog] = []; let safeLimit = min(max(limit, 1), 200)
+        try withStatement("SELECT l.id, l.run_id, l.event, l.detail, l.created_at FROM automation_task_logs l JOIN automation_task_runs r ON r.id = l.run_id WHERE r.task_id = ? ORDER BY l.id DESC LIMIT ?") { stmt in
+            bindText(stmt, 1, taskID); sqlite3_bind_int(stmt, 2, Int32(safeLimit))
+            while sqlite3_step(stmt) == SQLITE_ROW { logs.append(AutomationTaskLog(id: sqlite3_column_int64(stmt, 0), runID: optionalText(stmt, 1), event: columnText(stmt, 2), detail: optionalText(stmt, 3), createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4)))) }
+        }
+        return logs
+    }
+
     private func upsert(_ object: CloudObject) throws {
         let sql = """
         INSERT OR REPLACE INTO cloud_objects (
@@ -546,10 +646,10 @@ public final class ManifestStore: @unchecked Sendable {
         let sql = """
         INSERT INTO archive_bindings (
             binding_id, file_path, cloud_object_id, archive_state, local_state,
-            restored_at, last_restore_check_at, released_at, quarantine_path,
+            restored_at, last_restore_check_at, released_at, quarantined_at, quarantine_path,
             placeholder_path, placeholder_created_at, placeholder_format, placeholder_sha256,
             placeholder_size, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(binding_id) DO UPDATE SET
             file_path = excluded.file_path,
             cloud_object_id = excluded.cloud_object_id,
@@ -567,6 +667,7 @@ public final class ManifestStore: @unchecked Sendable {
             restored_at = COALESCE(archive_bindings.restored_at, excluded.restored_at),
             last_restore_check_at = COALESCE(archive_bindings.last_restore_check_at, excluded.last_restore_check_at),
             released_at = COALESCE(archive_bindings.released_at, excluded.released_at),
+            quarantined_at = COALESCE(archive_bindings.quarantined_at, excluded.quarantined_at),
             quarantine_path = COALESCE(archive_bindings.quarantine_path, excluded.quarantine_path),
             placeholder_path = COALESCE(archive_bindings.placeholder_path, excluded.placeholder_path),
             placeholder_created_at = COALESCE(archive_bindings.placeholder_created_at, excluded.placeholder_created_at),
@@ -584,13 +685,14 @@ public final class ManifestStore: @unchecked Sendable {
             bindOptionalDate(stmt, 6, binding.restoredAt)
             bindOptionalDate(stmt, 7, binding.lastRestoreCheckAt)
             bindOptionalDate(stmt, 8, binding.releasedAt)
-            bindOptionalText(stmt, 9, binding.quarantinePath)
-            bindOptionalText(stmt, 10, binding.placeholderPath)
-            bindOptionalDate(stmt, 11, binding.placeholderCreatedAt)
-            bindOptionalText(stmt, 12, binding.placeholderFormat)
-            bindOptionalText(stmt, 13, binding.placeholderSHA256)
-            bindOptionalInt64(stmt, 14, binding.placeholderSize)
-            sqlite3_bind_double(stmt, 15, Date().timeIntervalSince1970)
+            bindOptionalDate(stmt, 9, binding.quarantinedAt)
+            bindOptionalText(stmt, 10, binding.quarantinePath)
+            bindOptionalText(stmt, 11, binding.placeholderPath)
+            bindOptionalDate(stmt, 12, binding.placeholderCreatedAt)
+            bindOptionalText(stmt, 13, binding.placeholderFormat)
+            bindOptionalText(stmt, 14, binding.placeholderSHA256)
+            bindOptionalInt64(stmt, 15, binding.placeholderSize)
+            sqlite3_bind_double(stmt, 16, Date().timeIntervalSince1970)
             try stepDone(stmt)
         }
     }

@@ -272,6 +272,7 @@ public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
     public let restoredAt: Date?
     public let lastRestoreCheckAt: Date?
     public let releasedAt: Date?
+    public let quarantinedAt: Date?
     public let quarantinePath: String?
     public let placeholderPath: String?
     public let placeholderCreatedAt: Date?
@@ -288,6 +289,7 @@ public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
         restoredAt: Date? = nil,
         lastRestoreCheckAt: Date? = nil,
         releasedAt: Date? = nil,
+        quarantinedAt: Date? = nil,
         quarantinePath: String? = nil,
         placeholderPath: String? = nil,
         placeholderCreatedAt: Date? = nil,
@@ -303,6 +305,7 @@ public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
         self.restoredAt = restoredAt
         self.lastRestoreCheckAt = lastRestoreCheckAt
         self.releasedAt = releasedAt
+        self.quarantinedAt = quarantinedAt
         self.quarantinePath = quarantinePath
         self.placeholderPath = placeholderPath
         self.placeholderCreatedAt = placeholderCreatedAt

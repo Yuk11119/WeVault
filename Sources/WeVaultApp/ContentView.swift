@@ -5,6 +5,7 @@ import WeVaultCore
 struct ContentView: View {
     @ObservedObject var viewModel: ScanViewModel
     let settings: ProductSettings
+    let automationSnapshot: AutomationTaskSnapshot?
     let openSettings: () -> Void
     @State private var selection: FileRecord.ID?
 
@@ -120,6 +121,8 @@ struct ContentView: View {
                 }
 
                 activitySection
+
+                automationSection
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("云端连接")
@@ -291,6 +294,22 @@ struct ContentView: View {
                     }
                     .padding(.vertical, 3)
                 }
+            }
+        }
+    }
+
+    private var automationSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("自动任务").font(.headline)
+            if let snapshot = automationSnapshot {
+                Text(snapshot.task.isPaused ? "已暂停" : "下次运行：\(snapshot.task.nextRunAt.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let run = snapshot.latestRun {
+                    Text(run.status == .waitingForCloud ? "等待 P2 云端临时凭证；不会扫描、上传或释放本地副本。" : run.failureReason ?? run.status.rawValue)
+                        .font(.caption).foregroundStyle(run.status == .failed ? .red : .secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                Text("正在恢复任务状态…").font(.caption).foregroundStyle(.secondary)
             }
         }
     }
