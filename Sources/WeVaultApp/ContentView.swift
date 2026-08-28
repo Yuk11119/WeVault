@@ -6,7 +6,6 @@ struct ContentView: View {
     @ObservedObject var viewModel: ScanViewModel
     let settings: ProductSettings
     let openSettings: () -> Void
-    let saveSettings: (ProductSettings) -> Void
     @State private var selection: FileRecord.ID?
 
     var selectedFile: FileRecord? {
@@ -89,7 +88,7 @@ struct ContentView: View {
                 Button("打开设置", action: openSettings)
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("扫描目录")
+                    Text("当前扫描范围")
                         .font(.headline)
                     Text(viewModel.selectedRoot?.path ?? "请选择 xwechat_files 或 wxid_* 账号目录")
                         .font(.caption)
@@ -98,26 +97,22 @@ struct ContentView: View {
                         .truncationMode(.middle)
                         .textSelection(.enabled)
                     HStack {
-                        Button("选择目录", action: chooseDirectory)
                         Button("开始扫描", action: viewModel.scan)
                             .disabled(viewModel.selectedRoot == nil || viewModel.isScanning)
+                        Button("修改设置", action: openSettings)
                     }
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("大文件阈值")
+                    Text("当前策略")
                         .font(.headline)
-                    HStack {
-                        Slider(value: $viewModel.largeFileThresholdMB, in: 1...500, step: 1)
-                            .onChange(of: viewModel.largeFileThresholdMB) { _, threshold in
-                                var updated = settings
-                                updated.largeFileThresholdMB = Int(threshold)
-                                saveSettings(updated)
-                            }
-                        Text("\(Int(viewModel.largeFileThresholdMB)) MB")
-                            .monospacedDigit()
-                            .frame(width: 64, alignment: .trailing)
-                    }
+                    Text("大文件 ≥ \(settings.largeFileThresholdMB) MB · 每 \(settings.runIntervalHours) 小时 · 冷却 \(settings.coolingPeriodDays) 天 · quarantine \(settings.quarantineRetentionDays) 天")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("对象：\(settings.archiveOrdinaryFiles ? "普通文件" : "")\(settings.archiveImageHighLayers ? " 图片高清层" : "")\(settings.archiveVideoRawLayers ? " 视频 Raw 层" : "")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 if viewModel.isScanning {
@@ -297,23 +292,6 @@ struct ContentView: View {
                     .padding(.vertical, 3)
                 }
             }
-        }
-    }
-
-    private func chooseDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "选择"
-        if let defaultURL = WeChatDirectory.defaultXWeChatFilesURL(), FileManager.default.fileExists(atPath: defaultURL.path) {
-            panel.directoryURL = defaultURL
-        }
-        if panel.runModal() == .OK {
-            viewModel.selectedRoot = panel.url
-            var updated = settings
-            updated.scanRootPath = panel.url?.path
-            saveSettings(updated)
         }
     }
 

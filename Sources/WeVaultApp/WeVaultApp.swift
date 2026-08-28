@@ -25,8 +25,7 @@ private struct StatusCenter: View {
                 ContentView(
                     viewModel: appState.scanViewModel,
                     settings: appState.settings,
-                    openSettings: { appState.isSettingsPresented = true },
-                    saveSettings: appState.save
+                    openSettings: { appState.isSettingsPresented = true }
                 )
             } else {
                 SetupWizard { appState.completeOnboarding($0) }
