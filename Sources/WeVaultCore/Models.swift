@@ -398,8 +398,8 @@ public struct S3CompatibleStorageConfig: Codable, Equatable, Sendable {
     public var region: String
     public var accessKeyID: String
     public var secretAccessKey: String
-    /// Present only for short-lived STS credentials.  User-managed S3 settings
-    /// continue to use long-lived keys and leave this value nil.
+    /// Managed and self-configured P2 flows supply a short-lived STS token.
+    /// This transport struct never decides credential persistence policy.
     public var sessionToken: String?
     public var pathStyle: Bool
 

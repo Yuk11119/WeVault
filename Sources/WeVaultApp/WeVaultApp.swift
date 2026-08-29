@@ -24,6 +24,8 @@ private struct StatusCenter: View {
             if appState.settings.onboardingCompleted {
                 ContentView(
                     viewModel: appState.scanViewModel,
+                    managedAccount: appState.managedAccount,
+                    selfManagedCloud: appState.selfManagedCloud,
                     settings: appState.settings,
                     automationSnapshot: appState.automationSnapshot,
                     openSettings: { appState.isSettingsPresented = true }
@@ -43,7 +45,7 @@ private struct StatusCenter: View {
             appState.scanViewModel.scan()
         }
         .sheet(isPresented: $appState.isSettingsPresented) {
-            SettingsSheet(settings: appState.settings, onSave: appState.save)
+            SettingsSheet(settings: appState.settings, managedAccount: appState.managedAccount, selfManagedCloud: appState.selfManagedCloud, onSave: appState.save)
         }
     }
 }

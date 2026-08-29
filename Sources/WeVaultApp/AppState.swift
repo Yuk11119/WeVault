@@ -9,6 +9,8 @@ final class AppState: ObservableObject {
     @Published var manualScanRequestID: UUID?
     @Published private(set) var automationSnapshot: AutomationTaskSnapshot?
     let scanViewModel = ScanViewModel()
+    let managedAccount = ManagedAccount()
+    let selfManagedCloud = SelfManagedCloud()
 
     private let defaults: UserDefaults
     private let settingsKey = "product-settings-v1"

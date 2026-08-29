@@ -88,9 +88,9 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
         // this signed header.  It is intentionally supplied only by the
         // in-memory managed-cloud factory, never persisted in app settings.
         if let sessionToken = config.sessionToken, !sessionToken.isEmpty {
-            headers["x-oss-security-token"] = sessionToken
+            headers[config.provider.localizedCaseInsensitiveContains("tencent") ? "x-cos-security-token" : "x-oss-security-token"] = sessionToken
         }
-        let metadataPrefix = config.provider.localizedCaseInsensitiveContains("aliyun") ? "x-oss-meta-" : "x-amz-meta-"
+        let metadataPrefix = config.provider.localizedCaseInsensitiveContains("aliyun") ? "x-oss-meta-" : (config.provider.localizedCaseInsensitiveContains("tencent") ? "x-cos-meta-" : "x-amz-meta-")
         for (key, value) in metadata {
             headers["\(metadataPrefix)\(key.lowercased())"] = value
         }

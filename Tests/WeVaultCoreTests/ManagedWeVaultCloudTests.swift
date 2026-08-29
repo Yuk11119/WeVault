@@ -94,7 +94,7 @@ private func jsonString(_ value: some Encodable) throws -> String {
         let transport = SequenceTransport([
             (200, #"{"objects":[]}"#),
             (200, try jsonString(UploadAuthorizationEnvelope(authorizationId: authID, credentials: credentials))),
-            (200, #"{"status":"VERIFIED"}"#)
+            (200, #"{"status":"VERIFIED","objectId":"00000000-0000-4000-8000-000000000010","sha256":"\#(sha)","sizeBytes":14,"verifiedAt":"2026-08-29T00:00:00Z"}"#)
         ])
         let storage = RecordingStorage()
         let result = try await ManagedCloudContractPipeline.upload(
@@ -102,8 +102,9 @@ private func jsonString(_ value: some Encodable) throws -> String {
             accessToken: "access", deviceId: deviceID, fileURL: file,
             storageFactory: RecordingStorageFactory(storage: storage)
         )
-        guard case let .verified(authorization) = result else { Issue.record("expected verified outcome"); return }
+        guard case let .verified(authorization, verification) = result else { Issue.record("expected verified outcome"); return }
         #expect(authorization.authorizationId == authID)
+        #expect(verification.status == "VERIFIED")
         #expect(await storage.uploadCount() == 1)
         #expect(await transport.requestedPaths() == ["/v1/objects", "/v1/objects/upload-authorizations", "/v1/objects/\(authID)/complete"])
         #expect(FileManager.default.fileExists(atPath: file.path))

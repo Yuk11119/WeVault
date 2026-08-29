@@ -4,6 +4,8 @@ import WeVaultCore
 
 struct ContentView: View {
     @ObservedObject var viewModel: ScanViewModel
+    @ObservedObject var managedAccount: ManagedAccount
+    @ObservedObject var selfManagedCloud: SelfManagedCloud
     let settings: ProductSettings
     let automationSnapshot: AutomationTaskSnapshot?
     let openSettings: () -> Void
@@ -36,7 +38,7 @@ struct ContentView: View {
                 isReleasing: viewModel.isReleasing,
                 onRestoreDefault: {
                     if let selectedArchiveSnapshot {
-                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .defaultDownloads)
+                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .defaultDownloads, managedAccount: managedAccount, selfManagedCloud: selfManagedCloud)
                     }
                 },
                 onRestoreToDirectory: {
@@ -44,7 +46,7 @@ struct ContentView: View {
                 },
                 onRestoreOriginalPath: {
                     if let selectedArchiveSnapshot {
-                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .originalPath)
+                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .originalPath, managedAccount: managedAccount, selfManagedCloud: selfManagedCloud)
                     }
                 },
                 onQuarantineLocal: {
@@ -127,10 +129,12 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("云端连接")
                         .font(.headline)
-                    Text("已选择\(settings.cloudMode == .weVault ? "WeVault 云端" : "自配 OSS/COS")。P2 将在登录后提供短期凭证；P1 不保存长期密钥，因此上传与自动释放尚未启用。")
+                    Text(settings.cloudMode == .weVault ? managedAccount.status : "自配 OSS/COS 高级配置使用短期 STS 凭证，不保存长期密钥。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    Button("上传已哈希对象") { viewModel.uploadHashedCandidates(managedAccount: managedAccount, selfManagedCloud: selfManagedCloud, mode: settings.cloudMode) }
+                        .disabled(viewModel.result == nil || viewModel.isUploading || (settings.cloudMode == .weVault && !managedAccount.isReady))
                 }
 
                 if !viewModel.restoreMessage.isEmpty || viewModel.isRestoring {
@@ -323,7 +327,7 @@ struct ContentView: View {
         panel.prompt = "恢复到此处"
         panel.directoryURL = CloudRestoreService.defaultRestoreDirectory()
         if panel.runModal() == .OK, let url = panel.url {
-            viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .directory(url))
+            viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .directory(url), managedAccount: managedAccount, selfManagedCloud: selfManagedCloud)
         }
     }
 }
@@ -348,7 +352,6 @@ final class ScanViewModel: ObservableObject {
     @Published var alertMessage: String?
     @Published var largeFileThresholdMB: Double = 50
     @Published var filter: RecordFilter = .all
-    @Published var storageConfig = LocalStorageConfig.load()
     @Published var cloudSnapshots: [String: CloudArchiveSnapshot] = [:]
     @Published var archivedSnapshots: [String: ArchivedFileSnapshot] = [:]
     @Published var isUploading = false
@@ -406,16 +409,6 @@ final class ScanViewModel: ObservableObject {
         result?.files ?? []
     }
 
-    var canUpload: Bool {
-        result != nil &&
-            !isScanning &&
-            !isUploading &&
-            !storageConfig.endpoint.isEmpty &&
-            !storageConfig.bucket.isEmpty &&
-            !storageConfig.accessKeyID.isEmpty &&
-            !storageConfig.secretAccessKey.isEmpty
-    }
-
     var uploadScopeSummary: String {
         guard let files = result?.files else {
             return "扫描后可上传已有 SHA 的可归档对象；上传前会按当前阈值刷新扫描，普通大文件和重复文件会计算 SHA，重复对象云端只保存一份。"
@@ -462,13 +455,12 @@ final class ScanViewModel: ObservableObject {
         }
     }
 
-    func uploadHashedCandidates() {
+    func uploadHashedCandidates(managedAccount: ManagedAccount, selfManagedCloud: SelfManagedCloud, mode: ProductSettings.CloudMode) {
         guard let selectedRoot else { return }
         isUploading = true
         alertMessage = nil
         uploadMessage = "按当前阈值刷新扫描..."
         let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
-        let config = storageConfig
 
         Task {
             do {
@@ -488,11 +480,16 @@ final class ScanViewModel: ObservableObject {
                 archivedSnapshots = refreshed.2
                 uploadMessage = "准备上传：\(uploadableFiles(from: refreshed.0.files).count) 项绑定"
 
-                let service = CloudUploadService()
                 let store = try ManifestStore()
-                let snapshots = try await service.upload(files: refreshed.0.files, families: refreshed.0.families, config: config, store: store) { [weak self] progress in
-                    await MainActor.run {
-                        self?.apply(progress)
+                let snapshots: [String: CloudArchiveSnapshot]
+                if mode == .weVault {
+                    let authorization = try await managedAccount.withAuthorizedDevice()
+                    snapshots = try await ManagedCloudArchiveService().upload(files: refreshed.0.files, families: refreshed.0.families, api: authorization.api, accessToken: authorization.accessToken, deviceId: authorization.deviceID, store: store) { [weak self] progress in
+                        await MainActor.run { self?.apply(progress) }
+                    }
+                } else {
+                    snapshots = try await CloudUploadService().upload(files: refreshed.0.files, families: refreshed.0.families, config: try selfManagedCloud.storageConfig(), store: store) { [weak self] progress in
+                        await MainActor.run { self?.apply(progress) }
                     }
                 }
                 cloudSnapshots = snapshots
@@ -506,17 +503,22 @@ final class ScanViewModel: ObservableObject {
         }
     }
 
-    func restore(snapshot: ArchivedFileSnapshot, destination: RestoreDestination) {
+    func restore(snapshot: ArchivedFileSnapshot, destination: RestoreDestination, managedAccount: ManagedAccount, selfManagedCloud: SelfManagedCloud) {
         guard !isRestoring else { return }
         isRestoring = true
         alertMessage = nil
         restoreMessage = "准备恢复：\(snapshot.archivedFile.originalFilename)"
-        let config = storageConfig
 
         Task {
             do {
                 let store = try ManifestStore()
-                let result = try await CloudRestoreService().restore(snapshot: snapshot, destination: destination, config: config, store: store)
+                let result: CloudRestoreResult
+                if snapshot.object.storageProvider == "WeVault Managed Cloud" {
+                    let authorization = try await managedAccount.withAuthorizedDevice()
+                    result = try await ManagedCloudArchiveService().restore(snapshot: snapshot, destination: destination, api: authorization.api, accessToken: authorization.accessToken, deviceId: authorization.deviceID, store: store)
+                } else {
+                    result = try await CloudRestoreService().restore(snapshot: snapshot, destination: destination, config: try selfManagedCloud.storageConfig(), store: store)
+                }
                 archivedSnapshots = try store.archivedFileSnapshots()
                 cloudSnapshots = try store.cloudArchiveSnapshots()
                 reloadActivity()

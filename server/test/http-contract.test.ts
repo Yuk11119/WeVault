@@ -51,3 +51,21 @@ test("verification endpoint is limited with a stable error code", async () => {
     assert.equal(limited.statusCode, 429); assert.equal(limited.json().error.code, "RATE_LIMITED");
   } finally { await app.close(); }
 });
+
+test("forwarded client addresses are accepted only from the local Nginx proxy", async () => {
+  const app = await appForTest();
+  app.get("/_test/request-ip", async request => ({ ip: request.ip }));
+  try {
+    const direct = await app.inject({
+      method: "GET", url: "/_test/request-ip", remoteAddress: "203.0.113.5",
+      headers: { "x-forwarded-for": "198.51.100.8" }
+    });
+    assert.equal(direct.json().ip, "203.0.113.5");
+
+    const proxied = await app.inject({
+      method: "GET", url: "/_test/request-ip", remoteAddress: "127.0.0.1",
+      headers: { "x-forwarded-for": "198.51.100.8" }
+    });
+    assert.equal(proxied.json().ip, "198.51.100.8");
+  } finally { await app.close(); }
+});

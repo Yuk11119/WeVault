@@ -18,7 +18,11 @@ const schema = z.object({
   MAIL_HOST: z.string().min(1), MAIL_PORT: z.coerce.number().int().positive().default(465),
   MAIL_USER: z.string().min(1), MAIL_PASSWORD: z.string().min(1), MAIL_FROM: z.string().min(3),
   OSS_BUCKET: z.string().min(3), OSS_REGION: z.string().min(1), OSS_ENDPOINT: z.url(),
-  ECS_RAM_ROLE_NAME: z.string().min(1), OSS_UPLOAD_ROLE_ARN: z.string().min(1), OSS_DOWNLOAD_ROLE_ARN: z.string().min(1)
+  ECS_RAM_ROLE_NAME: z.string().min(1), OSS_UPLOAD_ROLE_ARN: z.string().min(1), OSS_DOWNLOAD_ROLE_ARN: z.string().min(1),
+  MANAGED_CLOUD_PROVIDER: z.enum(["aliyun-oss", "tencent-cos"]).default("aliyun-oss"),
+  COS_SECRET_ID: z.string().min(1).optional(), COS_SECRET_KEY: z.string().min(1).optional(),
+  COS_ROLE_ARN: z.string().min(1).optional(), COS_BUCKET: z.string().min(3).optional(),
+  COS_REGION: z.string().min(1).optional(), COS_ENDPOINT: z.url().optional(), COS_RESOURCE_PREFIX: z.string().min(1).optional()
 });
 
 export type Config = z.infer<typeof schema>;
