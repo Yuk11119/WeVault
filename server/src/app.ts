@@ -66,8 +66,16 @@ export const createApp = async (deps: { config: Config; db: Database; mailer: Ma
     await transaction(db, async client => {
       const invite = await client.query("UPDATE invitations SET used_count=used_count+1 WHERE code_hash=$1 AND revoked_at IS NULL AND used_count < max_uses AND (expires_at IS NULL OR expires_at > now()) RETURNING id", [invitationHash]);
       if (!invite.rowCount) throw errors.invitation();
+      // A uniqueness violation aborts the current PostgreSQL transaction. Keep
+      // the invitation decrement inside a savepoint so duplicate registrations
+      // return the stable conflict envelope rather than a 500.
+      await client.query("SAVEPOINT register_user");
       try { await client.query("INSERT INTO users (id,email,password_hash) VALUES ($1,$2,$3)", [userID, body.email, await hashPassword(body.password)]); }
-      catch (error: unknown) { await client.query("UPDATE invitations SET used_count=used_count-1 WHERE id=$1", [invite.rows[0]!.id]); throw errors.conflict("Email is already registered"); }
+      catch (error: unknown) {
+        await client.query("ROLLBACK TO SAVEPOINT register_user");
+        await client.query("UPDATE invitations SET used_count=used_count-1 WHERE id=$1", [invite.rows[0]!.id]);
+        throw errors.conflict("Email is already registered");
+      }
       await client.query("INSERT INTO email_verifications (id,user_id,code_hash,expires_at) VALUES ($1,$2,$3,now() + interval '15 minutes')", [randomUUID(), userID, digest(code, config.REFRESH_TOKEN_PEPPER)]);
     });
     await mailer.sendVerification(body.email, code); await audit(db, "REGISTERED", { email: body.email }, userID);
