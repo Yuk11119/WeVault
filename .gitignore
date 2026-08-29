@@ -17,3 +17,9 @@ Tools/
 tmp/
 temp/
 .build/
+
+# WeVault backend local state
+server/node_modules/
+server/dist/
+server/.env
+server/coverage/

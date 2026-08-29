@@ -1,0 +1,13 @@
+[Unit]
+Description=WeVault PostgreSQL backup to private OSS
+After=network-online.target wevault-postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+EnvironmentFile=/etc/wevault-api/wevault-backup.env
+ExecStart=/opt/wevault-node/bin/node /opt/wevault-api/current/dist/cli/backup-postgres.js
+ExecStartPost=/usr/bin/find /var/backups/wevault-postgresql -type f -name wevault_staging-*.dump -mtime +14 -delete

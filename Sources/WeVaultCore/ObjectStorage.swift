@@ -46,8 +46,13 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
         }
         var metadata: [String: String] = [:]
         for (key, value) in http.allHeaderFields {
-            guard let header = key as? String, header.lowercased().hasPrefix("x-amz-meta-") else { continue }
-            metadata[String(header.dropFirst("x-amz-meta-".count))] = String(describing: value)
+            guard let header = key as? String else { continue }
+            let normalized = header.lowercased()
+            if normalized.hasPrefix("x-oss-meta-") {
+                metadata[String(header.dropFirst("x-oss-meta-".count))] = String(describing: value)
+            } else if normalized.hasPrefix("x-amz-meta-") {
+                metadata[String(header.dropFirst("x-amz-meta-".count))] = String(describing: value)
+            }
         }
         return StoredObjectHead(sizeBytes: contentLength, metadata: metadata)
     }
@@ -79,8 +84,15 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
             "x-amz-content-sha256": payloadHash,
             "x-amz-date": amzDate
         ]
+        // Alibaba Cloud's S3-compatible endpoint accepts the STS token through
+        // this signed header.  It is intentionally supplied only by the
+        // in-memory managed-cloud factory, never persisted in app settings.
+        if let sessionToken = config.sessionToken, !sessionToken.isEmpty {
+            headers["x-oss-security-token"] = sessionToken
+        }
+        let metadataPrefix = config.provider.localizedCaseInsensitiveContains("aliyun") ? "x-oss-meta-" : "x-amz-meta-"
         for (key, value) in metadata {
-            headers["x-amz-meta-\(key.lowercased())"] = value
+            headers["\(metadataPrefix)\(key.lowercased())"] = value
         }
 
         let canonicalHeaders = headers.keys.sorted().map { "\($0):\(headers[$0]!.trimmingCharacters(in: .whitespacesAndNewlines))\n" }.joined()

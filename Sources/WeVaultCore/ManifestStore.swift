@@ -163,9 +163,11 @@ public final class ManifestStore: @unchecked Sendable {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event TEXT NOT NULL,
             detail TEXT,
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            id_token TEXT
         )
         """)
+        try addColumnIfNeeded(table: "operations", definition: "id_token TEXT")
         try execute("""
         CREATE TABLE IF NOT EXISTS storage_configs (
             id TEXT PRIMARY KEY,
@@ -284,9 +286,11 @@ public final class ManifestStore: @unchecked Sendable {
             event TEXT NOT NULL,
             detail TEXT,
             created_at REAL NOT NULL,
+            id_token TEXT,
             FOREIGN KEY(run_id) REFERENCES automation_task_runs(id)
         )
         """)
+        try addColumnIfNeeded(table: "automation_task_logs", definition: "id_token TEXT")
         try backfillArchivedFilesFromCurrentSnapshot()
     }
 
@@ -304,9 +308,11 @@ public final class ManifestStore: @unchecked Sendable {
             try migrateTable("archive_bindings", tokenColumn: "binding_token", sourceColumn: "binding_id", columns: ["binding_id", "file_path", "cloud_object_id", "quarantine_path", "placeholder_path", "placeholder_format", "placeholder_sha256"])
             try migrateTable("archived_files", tokenColumn: "file_path_token", sourceColumn: "file_path", columns: ["file_path", "original_filename", "relative_path", "account_hash", "account_name", "sha256", "family_id", "display_or_playback_path", "bubble_or_thumb_path"])
             try migrateTable("storage_configs", tokenColumn: "id", sourceColumn: "id", columns: ["endpoint", "bucket", "region", "access_key_reference", "secret_key_reference"])
-            try migrateTable("operations", tokenColumn: "id", sourceColumn: "id", columns: ["detail"])
+            // `id` is an INTEGER PRIMARY KEY. Keep it numeric and store the encryption token
+            // separately; replacing it with a text token makes SQLite reject the migration.
+            try migrateTable("operations", tokenColumn: "id_token", sourceColumn: "id", columns: ["detail"])
             try migrateTable("automation_task_runs", tokenColumn: "id", sourceColumn: "id", columns: ["failure_reason", "retry_of_run_id"])
-            try migrateTable("automation_task_logs", tokenColumn: "id", sourceColumn: "id", columns: ["detail"])
+            try migrateTable("automation_task_logs", tokenColumn: "id_token", sourceColumn: "id", columns: ["detail"])
             try execute("UPDATE archive_bindings SET file_path_token = NULL, cloud_object_token = NULL")
             try fillBindingTokens()
             try execute("CREATE UNIQUE INDEX IF NOT EXISTS files_path_token_idx ON files(path_token)")
@@ -322,18 +328,23 @@ public final class ManifestStore: @unchecked Sendable {
     }
 
     private func migrateTable(_ table: String, tokenColumn: String, sourceColumn: String, columns: [String]) throws {
+        // Do not mutate a table while walking a cursor over it. SQLite can then revisit rows
+        // whose payload changed, which produces duplicate keyed tokens during legacy upgrades.
+        var rows: [(rowID: Int64, source: String)] = []
         try withStatement("SELECT rowid, \(sourceColumn) FROM \(table)") { stmt in
             while sqlite3_step(stmt) == SQLITE_ROW {
-                let rowID = sqlite3_column_int64(stmt, 0); let source = columnText(stmt, 1)
-                let token = cipher.token(source, domain: "\(table).\(sourceColumn)")
-                try withStatement("UPDATE \(table) SET \(tokenColumn) = ? WHERE rowid = ?") { update in bindText(update, 1, token); sqlite3_bind_int64(update, 2, rowID); try stepDone(update) }
-                for column in columns {
-                    try withStatement("SELECT \(column) FROM \(table) WHERE rowid = ?") { read in
-                        sqlite3_bind_int64(read, 1, rowID)
-                        guard sqlite3_step(read) == SQLITE_ROW, sqlite3_column_type(read, 0) != SQLITE_NULL else { return }
-                        let sealed = try cipher.seal(columnText(read, 0), context: "\(table).\(column).\(token)")
-                        try withStatement("UPDATE \(table) SET \(column) = ? WHERE rowid = ?") { update in bindData(update, 1, sealed); sqlite3_bind_int64(update, 2, rowID); try stepDone(update) }
-                    }
+                rows.append((sqlite3_column_int64(stmt, 0), columnText(stmt, 1)))
+            }
+        }
+        for row in rows {
+            let token = cipher.token(row.source, domain: "\(table).\(sourceColumn)")
+            try withStatement("UPDATE \(table) SET \(tokenColumn) = ? WHERE rowid = ?") { update in bindText(update, 1, token); sqlite3_bind_int64(update, 2, row.rowID); try stepDone(update) }
+            for column in columns {
+                try withStatement("SELECT \(column) FROM \(table) WHERE rowid = ?") { read in
+                    sqlite3_bind_int64(read, 1, row.rowID)
+                    guard sqlite3_step(read) == SQLITE_ROW, sqlite3_column_type(read, 0) != SQLITE_NULL else { return }
+                    let sealed = try cipher.seal(columnText(read, 0), context: "\(table).\(column).\(token)")
+                    try withStatement("UPDATE \(table) SET \(column) = ? WHERE rowid = ?") { update in bindData(update, 1, sealed); sqlite3_bind_int64(update, 2, row.rowID); try stepDone(update) }
                 }
             }
         }
@@ -681,13 +692,14 @@ public final class ManifestStore: @unchecked Sendable {
     public func recentOperations(limit: Int = 20) throws -> [OperationRecord] {
         let safeLimit = min(max(limit, 1), 200)
         var records: [OperationRecord] = []
-        try withStatement("SELECT id, event, detail, created_at FROM operations ORDER BY id DESC LIMIT ?") { stmt in
+        try withStatement("SELECT id, event, detail, created_at, id_token FROM operations ORDER BY id DESC LIMIT ?") { stmt in
             sqlite3_bind_int(stmt, 1, Int32(safeLimit))
             while sqlite3_step(stmt) == SQLITE_ROW {
+                let token = columnText(stmt, 4)
                 records.append(OperationRecord(
                     id: sqlite3_column_int64(stmt, 0),
                     event: columnText(stmt, 1),
-                    detail: optionalText(stmt, 2),
+                    detail: token.isEmpty ? optionalText(stmt, 2) : try decryptOptionalColumn(stmt, 2, table: "operations", column: "detail", token: token),
                     createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3))
                 ))
             }

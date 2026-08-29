@@ -1,0 +1,21 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["oss:GetObject"],
+      "Resource": [
+        "acs:oss:*:*:wevault-beta-a7k3m9xq/users/*/devices/*/objects/sha256/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["sts:AssumeRole"],
+      "Resource": [
+        "acs:ram::1833534089420641:role/wevault-oss-upload-staging",
+        "acs:ram::1833534089420641:role/wevault-oss-download-staging",
+        "acs:ram::1833534089420641:role/wevault-backup-upload-staging"
+      ]
+    }
+  ]
+}

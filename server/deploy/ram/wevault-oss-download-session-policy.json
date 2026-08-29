@@ -1,0 +1,8 @@
+{
+  "Version": "1",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["oss:GetObject"],
+    "Resource": ["acs:oss:*:*:WEVAULT_BUCKET/users/*/devices/*/objects/sha256/*"]
+  }]
+}

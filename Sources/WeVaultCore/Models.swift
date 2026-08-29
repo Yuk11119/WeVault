@@ -398,15 +398,19 @@ public struct S3CompatibleStorageConfig: Codable, Equatable, Sendable {
     public var region: String
     public var accessKeyID: String
     public var secretAccessKey: String
+    /// Present only for short-lived STS credentials.  User-managed S3 settings
+    /// continue to use long-lived keys and leave this value nil.
+    public var sessionToken: String?
     public var pathStyle: Bool
 
-    public init(provider: String = "Aliyun OSS", endpoint: String = "https://s3.oss-cn-hangzhou.aliyuncs.com", bucket: String = "wevault-demo-yuk177", region: String = "cn-hangzhou", accessKeyID: String = "", secretAccessKey: String = "", pathStyle: Bool = false) {
+    public init(provider: String = "Aliyun OSS", endpoint: String = "https://s3.oss-cn-hangzhou.aliyuncs.com", bucket: String = "wevault-demo-yuk177", region: String = "cn-hangzhou", accessKeyID: String = "", secretAccessKey: String = "", sessionToken: String? = nil, pathStyle: Bool = false) {
         self.provider = provider
         self.endpoint = endpoint
         self.bucket = bucket
         self.region = region
         self.accessKeyID = accessKeyID
         self.secretAccessKey = secretAccessKey
+        self.sessionToken = sessionToken
         self.pathStyle = pathStyle
     }
 }
