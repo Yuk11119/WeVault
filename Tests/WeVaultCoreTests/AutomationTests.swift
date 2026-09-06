@@ -59,6 +59,25 @@ struct AutomationTests {
         #expect(AutomationPipelineLimits.uploadConcurrencyLimit == 2)
     }
 
+    @Test("authorized pipeline records completion and never exposes credentials")
+    func authorizedPipelineCompletes() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wevault-automation-authorized-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = try ManifestStore(databaseURL: directory.appendingPathComponent("archive.sqlite"))
+        let scheduler = AutomationScheduler(store: store, now: { now })
+        _ = try await scheduler.configure(settings: ProductSettings())
+        let runs = try await scheduler.runDueTasks(cloudGate: .available) {
+            AutomationPipelineResult(completedUnits: 2, totalUnits: 3)
+        }
+        let run = try #require(runs.first)
+        #expect(run.status == .completed)
+        #expect(run.stage == .finished)
+        #expect(run.completedUnits == 2)
+        #expect(run.totalUnits == 3)
+        #expect((try await scheduler.snapshot())?.logs.first?.event == "AUTOMATION_UPLOAD_FINISHED")
+    }
+
     @Test("release engine requires verification, cooling period, local hash and rules")
     func releaseEligibility() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wevault-automation-rules-\(UUID().uuidString)", isDirectory: true)

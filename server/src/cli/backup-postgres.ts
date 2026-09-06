@@ -33,7 +33,9 @@ const main = async () => {
   const filename = `wevault_staging-${timestamp()}.dump`;
   const localPath = join(backupDirectory, filename);
   try {
-    await execFileAsync("/usr/pgsql-16/bin/pg_dump", ["--dbname", databaseURL, "--format=custom", "--file", localPath], { timeout: 10 * 60_000 });
+    // Debian/Ubuntu packages place pg_dump in /usr/bin; relying on PATH also
+    // works for versioned installations without baking a host-specific path.
+    await execFileAsync("pg_dump", ["--dbname", databaseURL, "--format=custom", "--file", localPath], { timeout: 10 * 60_000 });
   } catch (error) {
     // pg_dump can leave a zero-byte partial target after authentication or
     // connection errors. It is not a recoverable backup and must not survive

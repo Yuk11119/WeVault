@@ -80,8 +80,34 @@ final class AppState: ObservableObject {
         let settings = settings
         do {
             _ = try await scheduler.configure(settings: settings)
-            _ = try await scheduler.runDueTasks()
+            let gate: AutomationCloudGate
+            let pipeline: AutomationPipeline?
+            if settings.cloudMode == .weVault, managedAccount.isReady,
+               let root = scanViewModel.selectedRoot,
+               let authorization = try? await managedAccount.withAuthorizedDevice() {
+                gate = .available
+                let threshold = Int64(settings.largeFileThresholdMB * 1024 * 1024)
+                pipeline = { [root, threshold, authorization] in
+                    let scanned = try await Task.detached(priority: .utility) {
+                        let store = try ManifestStore()
+                        let placeholders = try store.archivedFileSnapshots().values.compactMap(\.binding.placeholderPath)
+                        let result = try WeChatScanner().scan(root: root, options: ScanOptions(largeFileThresholdBytes: threshold, knownPlaceholderPaths: Set(placeholders)))
+                        try store.save(scanResult: result)
+                        return result
+                    }.value
+                    let store = try ManifestStore()
+                    let snapshots = try await ManagedCloudArchiveService().upload(files: scanned.files, families: scanned.families, api: authorization.api, accessToken: authorization.accessToken, deviceId: authorization.deviceID, store: store)
+                    let total = scanned.files.filter { $0.sha256 != nil && $0.status != .notArchivable }.count
+                    let verified = snapshots.values.filter { $0.object.verifyStatus == .verified }.count
+                    return AutomationPipelineResult(completedUnits: verified, totalUnits: total)
+                }
+            } else {
+                gate = .unavailable
+                pipeline = nil
+            }
+            _ = try await scheduler.runDueTasks(cloudGate: gate, pipeline: pipeline)
             automationSnapshot = try await scheduler.snapshot()
+            scanViewModel.reloadActivity()
         } catch {
             // The manifest operation log remains the durable diagnostic source.
         }

@@ -2,8 +2,8 @@ module.exports = {
   apps: [{
     name: "wevault-api-staging",
     script: "dist/index.js",
-    interpreter: "/opt/wevault-node/bin/node",
-    cwd: "/opt/wevault-api/current",
+    interpreter: "/usr/bin/node",
+    cwd: "/opt/wevault-api/current/server",
     instances: 1,
     exec_mode: "fork",
     autorestart: true,

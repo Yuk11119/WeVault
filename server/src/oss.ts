@@ -24,6 +24,19 @@ const metadataCredential = async (roleName: string): Promise<EcsCredential> => {
 export const objectKeyFor = (userID: string, deviceID: string, sha256: string) => `users/${userID}/devices/${deviceID}/objects/sha256/${sha256.slice(0, 2)}/${sha256.slice(2, 4)}/${sha256}`;
 export const policyFor = (bucket: string, objectKey: string, operation: "upload" | "download") => JSON.stringify({ Version: "1", Statement: [{ Effect: "Allow", Action: operation === "upload" ? ["oss:PutObject", "oss:AbortMultipartUpload", "oss:ListParts"] : ["oss:GetObject"], Resource: [`acs:oss:*:*:${bucket}/${objectKey}`] }] });
 
+const assumeAliyunObjectRole = async (config: Config, operation: "upload" | "download", objectKey: string): Promise<EcsCredential> => {
+  const source = await metadataCredential(config.ECS_RAM_ROLE_NAME);
+  const client = new RPCClient({ accessKeyId: source.AccessKeyId, accessKeySecret: source.AccessKeySecret, securityToken: source.SecurityToken, endpoint: "https://sts.aliyuncs.com", apiVersion: "2015-04-01" });
+  const data = await client.request("AssumeRole", {
+    RoleArn: operation === "upload" ? config.OSS_UPLOAD_ROLE_ARN : config.OSS_DOWNLOAD_ROLE_ARN,
+    RoleSessionName: `wevault-${operation}-${randomUUID()}`,
+    DurationSeconds: 900,
+    Policy: policyFor(config.OSS_BUCKET, objectKey, operation)
+  }, { method: "POST" });
+  const embedded = data.Credentials as unknown;
+  return (typeof embedded === "string" ? JSON.parse(embedded) : embedded ?? data) as EcsCredential;
+};
+
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 const hmacHex = (key: string | Buffer, value: string) => createHmac("sha256", key).update(value).digest("hex");
 const hmacBuffer = (key: string | Buffer, value: string) => createHmac("sha256", key).update(value).digest();
@@ -71,18 +84,15 @@ const cosAuthorization = (secretID: string, secretKey: string, method: string, h
 
 export const createAliyunObjectStore = (config: Config): ObjectStore => ({
   async issue(operation, objectKey) {
-    const source = await metadataCredential(config.ECS_RAM_ROLE_NAME);
-    const client = new RPCClient({ accessKeyId: source.AccessKeyId, accessKeySecret: source.AccessKeySecret, securityToken: source.SecurityToken, endpoint: "https://sts.aliyuncs.com", apiVersion: "2015-04-01" });
-    const data = await client.request("AssumeRole", { RoleArn: operation === "upload" ? config.OSS_UPLOAD_ROLE_ARN : config.OSS_DOWNLOAD_ROLE_ARN, RoleSessionName: `wevault-${operation}-${randomUUID()}`, DurationSeconds: 900, Policy: policyFor(config.OSS_BUCKET, objectKey, operation) }, { method: "POST" });
-    const embedded = data.Credentials as unknown;
-    const credentials = typeof embedded === "string" ? JSON.parse(embedded) as EcsCredential : (embedded ?? data) as EcsCredential;
+    const credentials = await assumeAliyunObjectRole(config, operation, objectKey);
     return { provider: "aliyun-oss", accessKeyId: credentials.AccessKeyId, accessKeySecret: credentials.AccessKeySecret, securityToken: credentials.SecurityToken, expiration: credentials.Expiration, endpoint: config.OSS_ENDPOINT, bucket: config.OSS_BUCKET, region: config.OSS_REGION, objectKey };
   },
   async head(objectKey) {
-    // P2A intentionally verifies with a server-side role. The deployment adapter uses an
-    // authenticated OSS HEAD request; this boundary keeps the API testable without OSS.
-    const source = await metadataCredential(config.ECS_RAM_ROLE_NAME);
-    const client = new OSS({ region: config.OSS_REGION, bucket: config.OSS_BUCKET, endpoint: config.OSS_ENDPOINT, accessKeyId: source.AccessKeyId, accessKeySecret: source.AccessKeySecret, stsToken: source.SecurityToken });
+    // Verification stays server-side, but uses a short-lived, object-scoped read role.
+    // The ECS runtime role only needs permission to assume this role; it never receives
+    // broad direct read access to the archive bucket.
+    const credentials = await assumeAliyunObjectRole(config, "download", objectKey);
+    const client = new OSS({ region: config.OSS_REGION, bucket: config.OSS_BUCKET, endpoint: config.OSS_ENDPOINT, accessKeyId: credentials.AccessKeyId, accessKeySecret: credentials.AccessKeySecret, stsToken: credentials.SecurityToken });
     let result: { res?: { headers?: Record<string, string | string[] | undefined> } };
     try { result = await client.head(objectKey); } catch { throw errors.cloud("OSS HEAD failed"); }
     const headers = result.res?.headers ?? {};

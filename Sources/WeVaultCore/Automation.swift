@@ -67,6 +67,20 @@ public struct AutomationTaskSnapshot: Codable, Hashable, Sendable {
 /// prevents every file-processing phase, including local release and final deletion.
 public enum AutomationCloudGate: Sendable { case unavailable, available }
 
+/// The authorized work performed by an automatic P2 run.  The scheduler owns
+/// durable state transitions; the app owns account authorization and scanning.
+public struct AutomationPipelineResult: Equatable, Sendable {
+    public let completedUnits: Int
+    public let totalUnits: Int
+
+    public init(completedUnits: Int, totalUnits: Int) {
+        self.completedUnits = completedUnits
+        self.totalUnits = totalUnits
+    }
+}
+
+public typealias AutomationPipeline = @Sendable () async throws -> AutomationPipelineResult
+
 /// Execution parameters for the future authorized pipeline. They are intentionally independent
 /// from storage credentials and make the P4 memory/network bounds testable before P2 exists.
 public enum AutomationPipelineLimits {
@@ -103,15 +117,19 @@ public actor AutomationScheduler {
         return task
     }
 
-    /// Processes only due scheduling records. The unavailable P2 gate intentionally creates a
-    /// visible waiting run and does not invoke scanner, hash, upload, release, or file APIs.
-    @discardableResult public func runDueTasks() throws -> [AutomationTaskRun] {
+    /// Processes only due scheduling records. An unavailable cloud gate never invokes a
+    /// scanner, uploader, release service, or file API.  Successful pipelines upload and
+    /// verify only; automatic local release remains deliberately opt-in and user-confirmed.
+    @discardableResult public func runDueTasks(
+        cloudGate override: AutomationCloudGate? = nil,
+        pipeline: AutomationPipeline? = nil
+    ) async throws -> [AutomationTaskRun] {
         let date = now()
         var runs: [AutomationTaskRun] = []
         for task in try store.dueAutomationTasks(at: date) {
             let next = date.addingTimeInterval(TimeInterval(task.intervalHours * 3600))
             let retryOf = try store.latestAutomationRun(taskID: task.id)?.status == .failed ? store.latestAutomationRun(taskID: task.id)?.id : nil
-            switch cloudGate {
+            switch override ?? cloudGate {
             case .unavailable:
                 let run = AutomationTaskRun(taskID: task.id, status: .waitingForCloud, stage: .waitingForCloud, failureReason: "等待 P2 云端临时凭证能力", retryOfRunID: retryOf, startedAt: date, finishedAt: date)
                 try store.saveAutomationRun(run)
@@ -119,13 +137,32 @@ public actor AutomationScheduler {
                 try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))
                 runs.append(run)
             case .available:
-                // P2 will inject the authorized batch pipeline. Keeping this branch inert avoids
-                // accidentally reviving the legacy long-lived S3 configuration path.
-                let run = AutomationTaskRun(taskID: task.id, status: .failed, stage: .scheduling, failureReason: "已授权任务管线尚未接入", retryOfRunID: retryOf, startedAt: date, finishedAt: date)
-                try store.saveAutomationRun(run)
-                try store.logAutomation(runID: run.id, event: "AUTOMATION_PIPELINE_UNAVAILABLE", detail: run.failureReason)
-                try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))
-                runs.append(run)
+                guard let pipeline else {
+                    let run = AutomationTaskRun(taskID: task.id, status: .failed, stage: .scheduling, failureReason: "已授权任务管线尚未接入", retryOfRunID: retryOf, startedAt: date, finishedAt: date)
+                    try store.saveAutomationRun(run)
+                    try store.logAutomation(runID: run.id, event: "AUTOMATION_PIPELINE_UNAVAILABLE", detail: run.failureReason)
+                    try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))
+                    runs.append(run)
+                    continue
+                }
+
+                let running = AutomationTaskRun(taskID: task.id, status: .running, stage: .uploading, retryOfRunID: retryOf, startedAt: date)
+                try store.saveAutomationRun(running)
+                try store.logAutomation(runID: running.id, event: "AUTOMATION_STARTED", detail: nil)
+                do {
+                    let result = try await pipeline()
+                    let completed = AutomationTaskRun(id: running.id, taskID: task.id, status: .completed, stage: .finished, completedUnits: result.completedUnits, totalUnits: result.totalUnits, retryOfRunID: retryOf, startedAt: date, finishedAt: now())
+                    try store.saveAutomationRun(completed)
+                    try store.logAutomation(runID: completed.id, event: "AUTOMATION_UPLOAD_FINISHED", detail: "\(result.completedUnits)/\(result.totalUnits)")
+                    try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))
+                    runs.append(completed)
+                } catch {
+                    let failed = AutomationTaskRun(id: running.id, taskID: task.id, status: .failed, stage: .uploading, failureReason: error.localizedDescription, retryOfRunID: retryOf, startedAt: date, finishedAt: now())
+                    try store.saveAutomationRun(failed)
+                    try store.logAutomation(runID: failed.id, event: "AUTOMATION_UPLOAD_FAILED", detail: failed.failureReason)
+                    try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))
+                    runs.append(failed)
+                }
             }
         }
         return runs
