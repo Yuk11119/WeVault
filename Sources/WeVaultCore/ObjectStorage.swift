@@ -27,10 +27,9 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
     }
 
     public func putObject(localURL: URL, objectKey: String, sha256: String, sizeBytes: Int64) async throws {
-        var request = try signedRequest(method: "PUT", objectKey: objectKey, payloadHash: sha256, metadata: ["sha256": sha256])
-        request.setValue(String(sizeBytes), forHTTPHeaderField: "Content-Length")
-        let (_, response) = try await session.upload(for: request, fromFile: localURL)
-        try validate(response: response, acceptedStatusCodes: 200...299)
+        let request = try signedRequest(method: "PUT", objectKey: objectKey, payloadHash: sha256, metadata: ["sha256": sha256], contentLength: sizeBytes)
+        let (data, response) = try await session.upload(for: request, fromFile: localURL)
+        try validate(response: response, responseBody: data, acceptedStatusCodes: 200...299)
     }
 
     public func headObject(objectKey: String) async throws -> StoredObjectHead {
@@ -68,61 +67,93 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
         try FileManager.default.moveItem(at: temporaryURL, to: destinationURL)
     }
 
-    private func signedRequest(method: String, objectKey: String, payloadHash: String, metadata: [String: String]) throws -> URLRequest {
+    private func signedRequest(method: String, objectKey: String, payloadHash: String, metadata: [String: String], contentLength: Int64? = nil) throws -> URLRequest {
+        if config.provider.localizedCaseInsensitiveContains("aliyun") {
+            return try signedAliyunOSSRequest(method: method, objectKey: objectKey, metadata: metadata, contentLength: contentLength)
+        }
+        return try signedS3Request(method: method, objectKey: objectKey, payloadHash: payloadHash, metadata: metadata, contentLength: contentLength)
+    }
+
+    private func signedAliyunOSSRequest(method: String, objectKey: String, metadata: [String: String], contentLength: Int64?) throws -> URLRequest {
+        let endpoint = try normalizedEndpoint()
+        let target = try targetURL(endpoint: endpoint, objectKey: objectKey)
+        let now = Date()
+        let amzDate = Self.amzDateFormatter.string(from: now)
+        let dateStamp = Self.dateStampFormatter.string(from: now)
+        var headers: [String: String] = [
+            "content-type": "application/octet-stream",
+            "x-oss-content-sha256": "UNSIGNED-PAYLOAD",
+            "x-oss-date": amzDate
+        ]
+        if let sessionToken = config.sessionToken, !sessionToken.isEmpty {
+            headers["x-oss-security-token"] = sessionToken
+        }
+        for (key, value) in metadata {
+            headers["x-oss-meta-\(key.lowercased())"] = value
+        }
+        // URLSession supplies Content-Length for upload(for:fromFile:). OSS V4
+        // does not require it to be an AdditionalHeader, so leave it unsigned
+        // to match the official Swift SDK's default signer.
+        _ = contentLength
+
+        let canonicalHeaders = headers.keys.sorted().map { "\($0):\(headers[$0]!.trimmingCharacters(in: .whitespacesAndNewlines))\n" }.joined()
+        let additionalHeaderValue = ""
+        let canonicalRequest = [
+            method,
+            "/\(Self.encodedPath(config.bucket))/\(Self.encodedPath(objectKey))",
+            target.query ?? "",
+            canonicalHeaders,
+            additionalHeaderValue,
+            "UNSIGNED-PAYLOAD"
+        ].joined(separator: "\n")
+
+        let signingRegion = config.region.hasPrefix("oss-") ? String(config.region.dropFirst(4)) : config.region
+        let credentialScope = "\(dateStamp)/\(signingRegion)/oss/aliyun_v4_request"
+        let stringToSign = [
+            "OSS4-HMAC-SHA256",
+            amzDate,
+            credentialScope,
+            Self.sha256Hex(Data(canonicalRequest.utf8))
+        ].joined(separator: "\n")
+        let signingKey = Self.aliyunSigningKey(secret: config.secretAccessKey, dateStamp: dateStamp, region: signingRegion)
+        let signature = Self.hmacHex(key: signingKey, data: Data(stringToSign.utf8))
+        let authorization = "OSS4-HMAC-SHA256 Credential=\(config.accessKeyID)/\(credentialScope),Signature=\(signature)"
+
+        var request = URLRequest(url: target)
+        request.httpMethod = method
+        request.setValue(Self.rfc822DateFormatter.string(from: now), forHTTPHeaderField: "Date")
+        request.setValue(authorization, forHTTPHeaderField: "Authorization")
+        for (key, value) in headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        return request
+    }
+
+    private func signedS3Request(method: String, objectKey: String, payloadHash: String, metadata: [String: String], contentLength: Int64?) throws -> URLRequest {
         let endpoint = try normalizedEndpoint()
         let target = try targetURL(endpoint: endpoint, objectKey: objectKey)
         let now = Date()
         let amzDate = Self.amzDateFormatter.string(from: now)
         let dateStamp = Self.dateStampFormatter.string(from: now)
         let host = target.host ?? endpoint.host ?? ""
-        guard !host.isEmpty else {
-            throw WeVaultError.cloud("Object storage endpoint is missing a host")
-        }
-
-        var headers: [String: String] = [
-            "host": host,
-            "x-amz-content-sha256": payloadHash,
-            "x-amz-date": amzDate
-        ]
-        // Alibaba Cloud's S3-compatible endpoint accepts the STS token through
-        // this signed header.  It is intentionally supplied only by the
-        // in-memory managed-cloud factory, never persisted in app settings.
+        guard !host.isEmpty else { throw WeVaultError.cloud("Object storage endpoint is missing a host") }
+        var headers: [String: String] = ["host": host, "x-amz-content-sha256": payloadHash, "x-amz-date": amzDate]
         if let sessionToken = config.sessionToken, !sessionToken.isEmpty {
-            headers[config.provider.localizedCaseInsensitiveContains("tencent") ? "x-cos-security-token" : "x-oss-security-token"] = sessionToken
+            headers[config.provider.localizedCaseInsensitiveContains("tencent") ? "x-cos-security-token" : "x-amz-security-token"] = sessionToken
         }
-        let metadataPrefix = config.provider.localizedCaseInsensitiveContains("aliyun") ? "x-oss-meta-" : (config.provider.localizedCaseInsensitiveContains("tencent") ? "x-cos-meta-" : "x-amz-meta-")
-        for (key, value) in metadata {
-            headers["\(metadataPrefix)\(key.lowercased())"] = value
-        }
-
+        let metadataPrefix = config.provider.localizedCaseInsensitiveContains("tencent") ? "x-cos-meta-" : "x-amz-meta-"
+        for (key, value) in metadata { headers["\(metadataPrefix)\(key.lowercased())"] = value }
+        if let contentLength { headers["content-length"] = String(contentLength) }
         let canonicalHeaders = headers.keys.sorted().map { "\($0):\(headers[$0]!.trimmingCharacters(in: .whitespacesAndNewlines))\n" }.joined()
         let signedHeaders = headers.keys.sorted().joined(separator: ";")
-        let canonicalRequest = [
-            method,
-            target.path.isEmpty ? "/" : target.path,
-            target.query ?? "",
-            canonicalHeaders,
-            signedHeaders,
-            payloadHash
-        ].joined(separator: "\n")
-
+        let canonicalRequest = [method, target.path.isEmpty ? "/" : target.path, target.query ?? "", canonicalHeaders, signedHeaders, payloadHash].joined(separator: "\n")
         let credentialScope = "\(dateStamp)/\(config.region)/s3/aws4_request"
-        let stringToSign = [
-            "AWS4-HMAC-SHA256",
-            amzDate,
-            credentialScope,
-            Self.sha256Hex(Data(canonicalRequest.utf8))
-        ].joined(separator: "\n")
-        let signingKey = Self.signingKey(secret: config.secretAccessKey, dateStamp: dateStamp, region: config.region)
-        let signature = Self.hmacHex(key: signingKey, data: Data(stringToSign.utf8))
-        let authorization = "AWS4-HMAC-SHA256 Credential=\(config.accessKeyID)/\(credentialScope), SignedHeaders=\(signedHeaders), Signature=\(signature)"
-
+        let stringToSign = ["AWS4-HMAC-SHA256", amzDate, credentialScope, Self.sha256Hex(Data(canonicalRequest.utf8))].joined(separator: "\n")
+        let signature = Self.hmacHex(key: Self.signingKey(secret: config.secretAccessKey, dateStamp: dateStamp, region: config.region), data: Data(stringToSign.utf8))
         var request = URLRequest(url: target)
         request.httpMethod = method
-        request.setValue(authorization, forHTTPHeaderField: "Authorization")
-        for (key, value) in headers where key != "host" {
-            request.setValue(value, forHTTPHeaderField: key)
-        }
+        request.setValue("AWS4-HMAC-SHA256 Credential=\(config.accessKeyID)/\(credentialScope), SignedHeaders=\(signedHeaders), Signature=\(signature)", forHTTPHeaderField: "Authorization")
+        for (key, value) in headers where key != "host" { request.setValue(value, forHTTPHeaderField: key) }
         return request
     }
 
@@ -156,13 +187,23 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
         return url
     }
 
-    private func validate(response: URLResponse, acceptedStatusCodes: ClosedRange<Int>) throws {
+    private func validate(response: URLResponse, responseBody: Data = Data(), acceptedStatusCodes: ClosedRange<Int>) throws {
         guard let http = response as? HTTPURLResponse else {
             throw WeVaultError.cloud("Missing HTTP response")
         }
         guard acceptedStatusCodes.contains(http.statusCode) else {
-            throw WeVaultError.cloud("Object storage request failed with HTTP \(http.statusCode)")
+            let code = Self.ossErrorCode(in: responseBody).map { " \($0)" } ?? ""
+            let requestID = http.value(forHTTPHeaderField: "x-oss-request-id").map { " request=\($0)" } ?? ""
+            throw WeVaultError.cloud("Object storage request failed: HTTP \(http.statusCode)\(code)\(requestID)")
         }
+    }
+
+    private static func ossErrorCode(in data: Data) -> String? {
+        guard let body = String(data: data, encoding: .utf8),
+              let opening = body.range(of: "<Code>"),
+              let closing = body.range(of: "</Code>", range: opening.upperBound..<body.endIndex) else { return nil }
+        let code = String(body[opening.upperBound..<closing.lowerBound])
+        return code.range(of: "^[A-Za-z0-9_-]{1,80}$", options: .regularExpression) == nil ? nil : code
     }
 
     private static func encodedPath(_ value: String) -> String {
@@ -178,6 +219,13 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
         let dateRegionKey = hmacData(key: SymmetricKey(data: dateKey), data: Data(region.utf8))
         let dateRegionServiceKey = hmacData(key: SymmetricKey(data: dateRegionKey), data: Data("s3".utf8))
         return SymmetricKey(data: hmacData(key: SymmetricKey(data: dateRegionServiceKey), data: Data("aws4_request".utf8)))
+    }
+
+    private static func aliyunSigningKey(secret: String, dateStamp: String, region: String) -> SymmetricKey {
+        let dateKey = hmacData(key: SymmetricKey(data: Data("aliyun_v4\(secret)".utf8)), data: Data(dateStamp.utf8))
+        let dateRegionKey = hmacData(key: SymmetricKey(data: dateKey), data: Data(region.utf8))
+        let dateServiceKey = hmacData(key: SymmetricKey(data: dateRegionKey), data: Data("oss".utf8))
+        return SymmetricKey(data: hmacData(key: SymmetricKey(data: dateServiceKey), data: Data("aliyun_v4_request".utf8)))
     }
 
     private static func hmacData(key: SymmetricKey, data: Data) -> Data {
@@ -209,6 +257,15 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyyMMdd"
+        return formatter
+    }()
+
+    private static let rfc822DateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
         return formatter
     }()
 }

@@ -72,10 +72,14 @@ public enum AutomationCloudGate: Sendable { case unavailable, available }
 public struct AutomationPipelineResult: Equatable, Sendable {
     public let completedUnits: Int
     public let totalUnits: Int
+    public let failedUnits: Int
+    public let failureSummary: String?
 
-    public init(completedUnits: Int, totalUnits: Int) {
+    public init(completedUnits: Int, totalUnits: Int, failedUnits: Int = 0, failureSummary: String? = nil) {
         self.completedUnits = completedUnits
         self.totalUnits = totalUnits
+        self.failedUnits = failedUnits
+        self.failureSummary = failureSummary
     }
 }
 
@@ -98,6 +102,7 @@ public actor AutomationScheduler {
     private let store: ManifestStore
     private let cloudGate: AutomationCloudGate
     private let now: @Sendable () -> Date
+    private var activeTaskIDs: Set<String> = []
 
     public init(store: ManifestStore, taskID: String = "default-automation", cloudGate: AutomationCloudGate = .unavailable, now: @escaping @Sendable () -> Date = Date.init) {
         self.store = store; self.taskID = taskID; self.cloudGate = cloudGate; self.now = now
@@ -117,31 +122,52 @@ public actor AutomationScheduler {
         return task
     }
 
+    /// Makes the next enabled run immediately due. Used by an explicit user action.
+    @discardableResult public func makeDueNow() throws -> AutomationTask? {
+        guard let task = try store.automationTask(id: taskID), !task.isPaused,
+              !activeTaskIDs.contains(taskID) else { return nil }
+        let updated = AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: now(), lastRunAt: task.lastRunAt)
+        try store.saveAutomationTask(updated)
+        return updated
+    }
+
+    /// Wakes only a task whose latest durable run is waiting for prerequisites.
+    @discardableResult public func wakeWaitingTask() throws -> AutomationTask? {
+        guard let task = try store.automationTask(id: taskID), !task.isPaused,
+              try store.latestAutomationRun(taskID: taskID)?.status == .waitingForCloud else { return nil }
+        let updated = AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: now(), lastRunAt: task.lastRunAt)
+        try store.saveAutomationTask(updated)
+        return updated
+    }
+
     /// Processes only due scheduling records. An unavailable cloud gate never invokes a
     /// scanner, uploader, release service, or file API.  Successful pipelines upload and
     /// verify only; automatic local release remains deliberately opt-in and user-confirmed.
     @discardableResult public func runDueTasks(
         cloudGate override: AutomationCloudGate? = nil,
-        pipeline: AutomationPipeline? = nil
+        pipeline: AutomationPipeline? = nil,
+        waitingReason: String? = nil
     ) async throws -> [AutomationTaskRun] {
         let date = now()
         var runs: [AutomationTaskRun] = []
         for task in try store.dueAutomationTasks(at: date) {
             let next = date.addingTimeInterval(TimeInterval(task.intervalHours * 3600))
-            let retryOf = try store.latestAutomationRun(taskID: task.id)?.status == .failed ? store.latestAutomationRun(taskID: task.id)?.id : nil
+            let latest = try store.latestAutomationRun(taskID: task.id)
+            let retryOf = latest?.status == .failed ? latest?.id : nil
+            // Claim before awaiting. Actor methods are re-entrant at suspension points,
+            // so this durable schedule update prevents poll/manual duplicate runs.
+            try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))
             switch override ?? cloudGate {
             case .unavailable:
-                let run = AutomationTaskRun(taskID: task.id, status: .waitingForCloud, stage: .waitingForCloud, failureReason: "等待 P2 云端临时凭证能力", retryOfRunID: retryOf, startedAt: date, finishedAt: date)
+                let run = AutomationTaskRun(taskID: task.id, status: .waitingForCloud, stage: .waitingForCloud, failureReason: waitingReason ?? "请先登录 WeVault 云端并完成设备注册", retryOfRunID: retryOf, startedAt: date, finishedAt: date)
                 try store.saveAutomationRun(run)
                 try store.logAutomation(runID: run.id, event: "AUTOMATION_WAITING_FOR_CLOUD", detail: run.failureReason)
-                try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))
                 runs.append(run)
             case .available:
                 guard let pipeline else {
                     let run = AutomationTaskRun(taskID: task.id, status: .failed, stage: .scheduling, failureReason: "已授权任务管线尚未接入", retryOfRunID: retryOf, startedAt: date, finishedAt: date)
                     try store.saveAutomationRun(run)
                     try store.logAutomation(runID: run.id, event: "AUTOMATION_PIPELINE_UNAVAILABLE", detail: run.failureReason)
-                    try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))
                     runs.append(run)
                     continue
                 }
@@ -149,19 +175,29 @@ public actor AutomationScheduler {
                 let running = AutomationTaskRun(taskID: task.id, status: .running, stage: .uploading, retryOfRunID: retryOf, startedAt: date)
                 try store.saveAutomationRun(running)
                 try store.logAutomation(runID: running.id, event: "AUTOMATION_STARTED", detail: nil)
+                activeTaskIDs.insert(task.id)
                 do {
-                    let result = try await pipeline()
-                    let completed = AutomationTaskRun(id: running.id, taskID: task.id, status: .completed, stage: .finished, completedUnits: result.completedUnits, totalUnits: result.totalUnits, retryOfRunID: retryOf, startedAt: date, finishedAt: now())
-                    try store.saveAutomationRun(completed)
-                    try store.logAutomation(runID: completed.id, event: "AUTOMATION_UPLOAD_FINISHED", detail: "\(result.completedUnits)/\(result.totalUnits)")
-                    try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))
-                    runs.append(completed)
-                } catch {
-                    let failed = AutomationTaskRun(id: running.id, taskID: task.id, status: .failed, stage: .uploading, failureReason: error.localizedDescription, retryOfRunID: retryOf, startedAt: date, finishedAt: now())
-                    try store.saveAutomationRun(failed)
-                    try store.logAutomation(runID: failed.id, event: "AUTOMATION_UPLOAD_FAILED", detail: failed.failureReason)
-                    try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))
-                    runs.append(failed)
+                    defer { activeTaskIDs.remove(task.id) }
+                    do {
+                        let result = try await pipeline()
+                        if result.failedUnits > 0 || result.completedUnits < result.totalUnits {
+                            let reason = result.failureSummary ?? "\(result.failedUnits) 个对象上传或校验失败"
+                            let failed = AutomationTaskRun(id: running.id, taskID: task.id, status: .failed, stage: .uploading, completedUnits: result.completedUnits, totalUnits: result.totalUnits, failureReason: reason, retryOfRunID: retryOf, startedAt: date, finishedAt: now())
+                            try store.saveAutomationRun(failed)
+                            try store.logAutomation(runID: failed.id, event: "AUTOMATION_UPLOAD_FAILED", detail: "\(result.completedUnits)/\(result.totalUnits): \(reason)")
+                            runs.append(failed)
+                        } else {
+                            let completed = AutomationTaskRun(id: running.id, taskID: task.id, status: .completed, stage: .finished, completedUnits: result.completedUnits, totalUnits: result.totalUnits, retryOfRunID: retryOf, startedAt: date, finishedAt: now())
+                            try store.saveAutomationRun(completed)
+                            try store.logAutomation(runID: completed.id, event: "AUTOMATION_UPLOAD_FINISHED", detail: "\(result.completedUnits)/\(result.totalUnits)")
+                            runs.append(completed)
+                        }
+                    } catch {
+                        let failed = AutomationTaskRun(id: running.id, taskID: task.id, status: .failed, stage: .uploading, failureReason: error.localizedDescription, retryOfRunID: retryOf, startedAt: date, finishedAt: now())
+                        try store.saveAutomationRun(failed)
+                        try store.logAutomation(runID: failed.id, event: "AUTOMATION_UPLOAD_FAILED", detail: failed.failureReason)
+                        runs.append(failed)
+                    }
                 }
             }
         }
@@ -171,6 +207,28 @@ public actor AutomationScheduler {
     public func snapshot(logLimit: Int = 10) throws -> AutomationTaskSnapshot? {
         guard let task = try store.automationTask(id: taskID) else { return nil }
         return AutomationTaskSnapshot(task: task, latestRun: try store.latestAutomationRun(taskID: taskID), logs: try store.recentAutomationLogs(taskID: taskID, limit: logLimit))
+    }
+}
+
+/// Selects local candidates for P2's automatic upload phase. Extension restrictions
+/// remain part of P4's release policy and are deliberately not applied here.
+public struct AutomaticUploadCandidateSelector: Sendable {
+    public init() {}
+
+    public func candidates(
+        from files: [FileRecord],
+        settings: ProductSettings,
+        fileExists: @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> [FileRecord] {
+        files.filter { file in
+            guard file.sha256 != nil, fileExists(file.path) else { return false }
+            guard ![.notArchivable, .tombstoned, .localReleased, .releaseEligible].contains(file.status) else { return false }
+            switch file.objectType {
+            case .ordinaryFile: return settings.archiveOrdinaryFiles
+            case .imageHighLayer: return settings.archiveImageHighLayers
+            case .videoRawLayer: return settings.archiveVideoRawLayers
+            }
+        }
     }
 }
 

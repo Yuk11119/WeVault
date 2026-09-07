@@ -26,6 +26,20 @@ private struct OfflineTransport: WeVaultAPITransport {
     func send(_ request: URLRequest) async throws -> (Data, URLResponse) { throw URLError(.notConnectedToInternet) }
 }
 
+private actor RateLimitedThenSuccessfulTransport: WeVaultAPITransport {
+    private var requestCount = 0
+    func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        requestCount += 1
+        if requestCount == 1 {
+            let response = HTTPURLResponse(url: request.url!, statusCode: 429, httpVersion: nil, headerFields: ["Retry-After": "0"])!
+            return (Data(#"{"error":{"code":"RATE_LIMITED","message":"Too many requests"}}"#.utf8), response)
+        }
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        return (Data(#"{"objects":[]}"#.utf8), response)
+    }
+    func count() -> Int { requestCount }
+}
+
 private actor RecordingStorage: ObjectStorageClient {
     private(set) var uploaded: [(String, String, Int64)] = []
     func putObject(localURL: URL, objectKey: String, sha256: String, sizeBytes: Int64) async throws { uploaded.append((objectKey, sha256, sizeBytes)) }
@@ -59,6 +73,15 @@ private func jsonString(_ value: some Encodable) throws -> String {
 }
 
 @Suite("managed cloud P2A contract") struct ManagedWeVaultCloudTests {
+    @Test("rate-limited API calls wait and retry instead of failing the remaining batch")
+    func rateLimitedRequestsAreRetried() async throws {
+        let transport = RateLimitedThenSuccessfulTransport()
+        let client = WeVaultAPIClient(baseURL: URL(string: "https://api.example.test")!, transport: transport)
+        let objects = try await client.fallback(accessToken: "access", deviceId: UUID().uuidString, sha256: String(repeating: "a", count: 64))
+        #expect(objects.isEmpty)
+        #expect(await transport.count() == 2)
+    }
+
     @Test("API failures are stable and cannot enter a release path")
     func apiFailureIsReportedWithoutLocalMutation() async throws {
         let client = WeVaultAPIClient(baseURL: URL(string: "https://api.example.test")!, transport: StubTransport(status: 403, body: #"{"error":{"code":"AUTH_SCOPE_DENIED","message":"denied"}}"#))
@@ -94,7 +117,7 @@ private func jsonString(_ value: some Encodable) throws -> String {
         let transport = SequenceTransport([
             (200, #"{"objects":[]}"#),
             (200, try jsonString(UploadAuthorizationEnvelope(authorizationId: authID, credentials: credentials))),
-            (200, #"{"status":"VERIFIED","objectId":"00000000-0000-4000-8000-000000000010","sha256":"\#(sha)","sizeBytes":14,"verifiedAt":"2026-08-29T00:00:00Z"}"#)
+            (200, #"{"status":"VERIFIED","objectId":"00000000-0000-4000-8000-000000000010","sha256":"\#(sha)","sizeBytes":14,"verifiedAt":"2026-08-29T00:00:00.123Z"}"#)
         ])
         let storage = RecordingStorage()
         let result = try await ManagedCloudContractPipeline.upload(

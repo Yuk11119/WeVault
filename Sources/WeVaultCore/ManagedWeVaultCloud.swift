@@ -2,10 +2,11 @@ import Foundation
 
 /// P2A contract-only client for the managed WeVault service.  It deliberately
 /// has no dependency on product settings or local-release APIs.
-public struct WeVaultAPIFailure: Error, Equatable, Sendable {
+public struct WeVaultAPIFailure: Error, Equatable, Sendable, LocalizedError {
     public let code: String
     public let statusCode: Int
     public let message: String
+    public var errorDescription: String? { "\(code): \(message)" }
 }
 
 public struct WeVaultSession: Codable, Equatable, Sendable { public let accessToken: String; public let refreshToken: String; public let expiresIn: Int }
@@ -42,11 +43,24 @@ public final class WeVaultAPIClient: Sendable {
     public func fallback(accessToken: String, deviceId: String, sha256: String) async throws -> [WeVaultObjectIndexEntry] {
         var components = URLComponents(url: baseURL.appendingPathComponent("v1/objects"), resolvingAgainstBaseURL: false)!; components.queryItems = [URLQueryItem(name: "deviceId", value: deviceId), URLQueryItem(name: "sha256", value: sha256)]
         var request = URLRequest(url: components.url!); request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        let (data, response) = try await transport.send(request); try validate(data, response); return try JSONDecoder.wevault.decode(ObjectList.self, from: data).objects
+        let (data, response) = try await sendWithRateLimitRetry(request); try validate(data, response); return try JSONDecoder.wevault.decode(ObjectList.self, from: data).objects
     }
     private func request<T: Decodable>(_ path: String, method: String, body: some Encodable, token: String?) async throws -> T {
         var request = URLRequest(url: baseURL.appendingPathComponent(path)); request.httpMethod = method; request.setValue("application/json", forHTTPHeaderField: "Content-Type"); if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }; request.httpBody = try JSONEncoder().encode(body)
-        let (data, response) = try await transport.send(request); try validate(data, response); return try JSONDecoder.wevault.decode(T.self, from: data)
+        let (data, response) = try await sendWithRateLimitRetry(request); try validate(data, response); return try JSONDecoder.wevault.decode(T.self, from: data)
+    }
+    private func sendWithRateLimitRetry(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        let maximumRetries = 4
+        for attempt in 0...maximumRetries {
+            let result = try await transport.send(request)
+            guard let http = result.1 as? HTTPURLResponse, http.statusCode == 429, attempt < maximumRetries else { return result }
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+            let resetAfter = http.value(forHTTPHeaderField: "X-RateLimit-Reset").flatMap(Double.init)
+            let fallbackDelay = pow(2.0, Double(attempt + 1))
+            let delay = min(60, max(0.25, retryAfter ?? resetAfter ?? fallbackDelay)) + 0.25
+            try await Task.sleep(for: .seconds(delay))
+        }
+        preconditionFailure("rate-limit retry loop must return")
     }
     private func validate(_ data: Data, _ response: URLResponse) throws { guard let http = response as? HTTPURLResponse else { throw WeVaultAPIFailure(code: "NETWORK", statusCode: 0, message: "Missing HTTP response") }; guard (200...299).contains(http.statusCode) else { let error = try? JSONDecoder.wevault.decode(APIErrorEnvelope.self, from: data); throw WeVaultAPIFailure(code: error?.error.code ?? "HTTP_\(http.statusCode)", statusCode: http.statusCode, message: error?.error.message ?? "Request failed") } }
 }
@@ -65,7 +79,22 @@ private struct LogoutResult: Codable { let status: String }
 public struct WeVaultVerificationResult: Codable, Equatable, Sendable { public let status: String; public let objectId: String; public let sha256: String; public let sizeBytes: Int64; public let verifiedAt: Date }
 private struct ObjectList: Codable { let objects: [WeVaultObjectIndexEntry] }
 private struct APIErrorEnvelope: Codable { struct Detail: Codable { let code: String; let message: String }; let error: Detail }
-private extension JSONDecoder { static let wevault: JSONDecoder = { let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601; return decoder }() }
+private extension JSONDecoder {
+    static let wevault: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let value = try decoder.singleValueContainer().decode(String.self)
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = fractional.date(from: value) { return date }
+            let standard = ISO8601DateFormatter()
+            standard.formatOptions = [.withInternetDateTime]
+            if let date = standard.date(from: value) { return date }
+            throw DecodingError.dataCorruptedError(in: try decoder.singleValueContainer(), debugDescription: "Invalid ISO-8601 date")
+        }
+        return decoder
+    }()
+}
 
 /// Creates a storage client from one server-issued credential.  The credential
 /// object is passed directly to the client and is never written to a manifest,

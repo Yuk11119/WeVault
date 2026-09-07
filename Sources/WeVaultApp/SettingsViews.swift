@@ -119,14 +119,17 @@ struct SettingsSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("WeVault 设置").font(.title2.bold())
-            SetupWizard(initial: draft) { updated in
-                onSave(updated)
-                dismiss()
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("WeVault 设置").font(.title2.bold())
+                SetupWizard(initial: draft) { updated in
+                    onSave(updated)
+                    dismiss()
+                }
+                ManagedLoginSection(account: managedAccount)
+                SelfManagedCloudSection(cloud: selfManagedCloud)
             }
-            ManagedLoginSection(account: managedAccount)
-            SelfManagedCloudSection(cloud: selfManagedCloud)
+            .padding(.vertical)
         }
         .frame(minWidth: 650, minHeight: 680)
     }
@@ -149,21 +152,30 @@ private struct SelfManagedCloudSection: View {
 }
 
 private struct ManagedLoginSection: View {
+    private enum Field: Hashable { case email, password }
+
     @ObservedObject var account: ManagedAccount
     @State private var email = ""
     @State private var password = ""
     @State private var error: String?
+    @FocusState private var focusedField: Field?
 
     var body: some View {
         GroupBox("WeVault 云端账户") {
             if account.isReady {
                 HStack { Text(account.status); Spacer(); Button("退出登录") { Task { await account.logout() } } }
             } else {
-                TextField("邮箱", text: $email).textContentType(.emailAddress)
+                TextField("邮箱", text: $email)
+                    .textContentType(.emailAddress)
+                    .focused($focusedField, equals: .email)
                 SecureField("密码", text: $password)
+                    .focused($focusedField, equals: .password)
                 HStack { Button("登录并注册本机") { Task { do { try await account.login(email: email, password: password) } catch { self.error = error.localizedDescription } } }; if let error { Text(error).foregroundStyle(.red) } }
             }
         }
         .padding(.horizontal)
+        .onAppear {
+            if !account.isReady { focusedField = .email }
+        }
     }
 }

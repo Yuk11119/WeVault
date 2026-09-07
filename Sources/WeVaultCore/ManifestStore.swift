@@ -689,6 +689,22 @@ public final class ManifestStore: @unchecked Sendable {
         }
     }
 
+    /// Stores only a tightly validated provider diagnostic (HTTP status,
+    /// provider error code and request ID). Paths, keys and credentials are
+    /// deliberately rejected and continue through the redacted logger above.
+    public func logDiagnosticOperation(_ event: String, diagnostic: String) throws {
+        guard diagnostic.range(of: "^HTTP [0-9]{3}( [A-Za-z0-9_-]{1,80})?( request=[A-Za-z0-9_-]{1,120})?$", options: .regularExpression) != nil else {
+            try logOperation(event, detail: diagnostic)
+            return
+        }
+        try withStatement("INSERT INTO operations (event, detail, created_at) VALUES (?, ?, ?)") { stmt in
+            bindText(stmt, 1, event)
+            bindText(stmt, 2, diagnostic)
+            sqlite3_bind_double(stmt, 3, Date().timeIntervalSince1970)
+            try stepDone(stmt)
+        }
+    }
+
     public func recentOperations(limit: Int = 20) throws -> [OperationRecord] {
         let safeLimit = min(max(limit, 1), 200)
         var records: [OperationRecord] = []

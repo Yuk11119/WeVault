@@ -8,6 +8,8 @@ struct ContentView: View {
     @ObservedObject var selfManagedCloud: SelfManagedCloud
     let settings: ProductSettings
     let automationSnapshot: AutomationTaskSnapshot?
+    let isAutomationRunning: Bool
+    let runAutomationNow: () -> Void
     let openSettings: () -> Void
     @State private var selection: FileRecord.ID?
 
@@ -304,17 +306,37 @@ struct ContentView: View {
 
     private var automationSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("自动任务").font(.headline)
+            HStack {
+                Text("自动任务").font(.headline)
+                Spacer()
+                Button(isAutomationRunning ? "正在运行…" : "立即运行", action: runAutomationNow)
+                    .disabled(!settings.automaticTasksEnabled || isAutomationRunning)
+            }
             if let snapshot = automationSnapshot {
                 Text(snapshot.task.isPaused ? "已暂停" : "下次运行：\(snapshot.task.nextRunAt.formatted(date: .abbreviated, time: .shortened))")
                     .font(.caption).foregroundStyle(.secondary)
                 if let run = snapshot.latestRun {
-                    Text(run.status == .waitingForCloud ? "等待 P2 云端临时凭证；不会扫描、上传或释放本地副本。" : run.failureReason ?? run.status.rawValue)
+                    Text(automationRunDescription(run))
                         .font(.caption).foregroundStyle(run.status == .failed ? .red : .secondary).fixedSize(horizontal: false, vertical: true)
                 }
             } else {
                 Text("正在恢复任务状态…").font(.caption).foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private func automationRunDescription(_ run: AutomationTaskRun) -> String {
+        switch run.status {
+        case .waitingForCloud:
+            return "\(run.failureReason ?? "等待云端条件")；未扫描、上传或释放本地副本。"
+        case .completed:
+            return "已完成：\(run.completedUnits)/\(run.totalUnits) 项已通过云端校验。"
+        case .failed:
+            return "失败（\(run.completedUnits)/\(run.totalUnits) 已完成）：\(run.failureReason ?? "可重试错误")"
+        case .running:
+            return "正在扫描、上传并等待服务端校验。"
+        default:
+            return run.failureReason ?? run.status.rawValue
         }
     }
 

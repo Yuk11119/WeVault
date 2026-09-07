@@ -1,5 +1,29 @@
 import Foundation
 
+public struct ManagedCloudUploadFailure: Equatable, Sendable {
+    public let filePath: String
+    public let reason: String
+
+    public init(filePath: String, reason: String) {
+        self.filePath = filePath
+        self.reason = reason
+    }
+}
+
+public struct ManagedCloudUploadReport: Sendable {
+    public let snapshots: [String: CloudArchiveSnapshot]
+    public let attemptedCount: Int
+    public let verifiedCount: Int
+    public let failures: [ManagedCloudUploadFailure]
+
+    public init(snapshots: [String: CloudArchiveSnapshot], attemptedCount: Int, verifiedCount: Int, failures: [ManagedCloudUploadFailure]) {
+        self.snapshots = snapshots
+        self.attemptedCount = attemptedCount
+        self.verifiedCount = verifiedCount
+        self.failures = failures
+    }
+}
+
 /// P2's managed-cloud path persists a local archive binding only after the
 /// backend returned VERIFIED. It never performs release or deletion itself.
 public final class ManagedCloudArchiveService: Sendable {
@@ -14,9 +38,26 @@ public final class ManagedCloudArchiveService: Sendable {
         store: ManifestStore,
         progress: (@Sendable (CloudUploadProgress) async -> Void)? = nil
     ) async throws -> [String: CloudArchiveSnapshot] {
+        try await uploadWithReport(files: files, families: families, api: api, accessToken: accessToken, deviceId: deviceId, store: store, progress: progress).snapshots
+    }
+
+    /// Returns counts for this invocation only. The compatibility `upload` method
+    /// continues to return the complete manifest snapshot collection.
+    public func uploadWithReport(
+        files: [FileRecord],
+        families: [FamilyRecord] = [],
+        api: WeVaultAPIClient,
+        accessToken: String,
+        deviceId: String,
+        store: ManifestStore,
+        progress: (@Sendable (CloudUploadProgress) async -> Void)? = nil
+    ) async throws -> ManagedCloudUploadReport {
         let familyByPath = Dictionary(uniqueKeysWithValues: families.map { ($0.highOrRawPath, $0) })
         var completed: [String: (WeVaultObjectIndexEntry, WeVaultTemporaryCredentials?)] = [:]
-        for file in files where file.sha256 != nil && file.status != .notArchivable {
+        let candidates = files.filter { $0.sha256 != nil && $0.status != .notArchivable }
+        var verifiedCount = 0
+        var failures: [ManagedCloudUploadFailure] = []
+        for file in candidates {
             guard let sha = file.sha256 else { continue }
             do {
                 let resolved: (WeVaultObjectIndexEntry, WeVaultTemporaryCredentials?)
@@ -40,14 +81,31 @@ public final class ManagedCloudArchiveService: Sendable {
                 try store.saveCloudObject(cloud, binding: binding, archivedFile: archived)
                 try store.updateFileStatus(path: file.path, status: .verified)
                 try store.logOperation("MANAGED_UPLOAD_VERIFIED", detail: resolved.0.objectId)
+                verifiedCount += 1
                 await progress?(CloudUploadProgress(filePath: file.path, status: .verified))
             } catch {
                 try? store.updateFileStatus(path: file.path, status: .uploadFailed)
-                try? store.logOperation("MANAGED_UPLOAD_FAILED", detail: "\(file.path): \(error.localizedDescription)")
+                if let diagnostic = Self.safeStorageDiagnostic(error.localizedDescription) {
+                    try? store.logDiagnosticOperation("MANAGED_UPLOAD_FAILED", diagnostic: diagnostic)
+                } else {
+                    try? store.logOperation("MANAGED_UPLOAD_FAILED", detail: "\(file.path): \(error.localizedDescription)")
+                }
+                failures.append(ManagedCloudUploadFailure(filePath: file.path, reason: Self.safeStorageDiagnostic(error.localizedDescription) ?? "上传或服务端校验失败"))
                 await progress?(CloudUploadProgress(filePath: file.path, status: .uploadFailed, message: error.localizedDescription))
             }
         }
-        return try store.cloudArchiveSnapshots()
+        return ManagedCloudUploadReport(
+            snapshots: try store.cloudArchiveSnapshots(),
+            attemptedCount: candidates.count,
+            verifiedCount: verifiedCount,
+            failures: failures
+        )
+    }
+
+    private static func safeStorageDiagnostic(_ description: String) -> String? {
+        let pattern = "HTTP [0-9]{3}( [A-Za-z0-9_-]{1,80})?( request=[A-Za-z0-9_-]{1,120})?"
+        guard let range = description.range(of: pattern, options: .regularExpression) else { return nil }
+        return String(description[range])
     }
 
     public func restore(snapshot: ArchivedFileSnapshot, destination: RestoreDestination, api: WeVaultAPIClient, accessToken: String, deviceId: String, store: ManifestStore) async throws -> CloudRestoreResult {
