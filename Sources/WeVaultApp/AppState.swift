@@ -176,7 +176,8 @@ final class AppState: ObservableObject {
                 }
                 gate = .available
                 let threshold = Int64(settings.largeFileThresholdMB * 1024 * 1024)
-                pipeline = { [root, threshold, authorization, settings] in
+                let viewModel = scanViewModel
+                pipeline = { [root, threshold, authorization, settings, viewModel] in
                     let scanned = try await Task.detached(priority: .utility) {
                         let store = try ManifestStore()
                         let placeholders = try store.archivedFileSnapshots().values.compactMap(\.binding.placeholderPath)
@@ -187,6 +188,14 @@ final class AppState: ObservableObject {
                     let candidates = AutomaticUploadCandidateSelector().candidates(from: scanned.files, settings: settings)
                     let store = try ManifestStore()
                     let report = try await ManagedCloudArchiveService().uploadWithReport(files: candidates, families: scanned.families, api: authorization.api, accessToken: authorization.accessToken, deviceId: authorization.deviceID, store: store)
+                    let archivedSnapshots = try store.archivedFileSnapshots()
+                    await viewModel.applyAutomationResult(
+                        scanned,
+                        root: root,
+                        cloudSnapshots: report.snapshots,
+                        archivedSnapshots: archivedSnapshots,
+                        failedPaths: Set(report.failures.map(\.filePath))
+                    )
                     let summary = report.failures.isEmpty ? nil : "\(report.failures.count) 个对象上传或服务端校验失败：\(report.failures[0].reason)"
                     return AutomationPipelineResult(completedUnits: report.verifiedCount, totalUnits: report.attemptedCount, failedUnits: report.failures.count, failureSummary: summary)
                 }

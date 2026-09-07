@@ -192,6 +192,36 @@ public struct ScanSummary: Codable, Equatable, Sendable {
     public let videoPlaybackDiscoveredCount: Int
     public let videoPlaybackDiscoveredBytes: Int64
     public let duplicateReclaimableBytes: Int64
+
+    public init(
+        ordinaryCount: Int,
+        ordinaryBytes: Int64,
+        largeOrdinaryCount: Int,
+        largeOrdinaryBytes: Int64,
+        imageHighCandidateCount: Int,
+        imageHighCandidateBytes: Int64,
+        videoRawCandidateCount: Int,
+        videoRawCandidateBytes: Int64,
+        videoRawDiscoveredCount: Int,
+        videoRawDiscoveredBytes: Int64,
+        videoPlaybackDiscoveredCount: Int,
+        videoPlaybackDiscoveredBytes: Int64,
+        duplicateReclaimableBytes: Int64
+    ) {
+        self.ordinaryCount = ordinaryCount
+        self.ordinaryBytes = ordinaryBytes
+        self.largeOrdinaryCount = largeOrdinaryCount
+        self.largeOrdinaryBytes = largeOrdinaryBytes
+        self.imageHighCandidateCount = imageHighCandidateCount
+        self.imageHighCandidateBytes = imageHighCandidateBytes
+        self.videoRawCandidateCount = videoRawCandidateCount
+        self.videoRawCandidateBytes = videoRawCandidateBytes
+        self.videoRawDiscoveredCount = videoRawDiscoveredCount
+        self.videoRawDiscoveredBytes = videoRawDiscoveredBytes
+        self.videoPlaybackDiscoveredCount = videoPlaybackDiscoveredCount
+        self.videoPlaybackDiscoveredBytes = videoPlaybackDiscoveredBytes
+        self.duplicateReclaimableBytes = duplicateReclaimableBytes
+    }
 }
 
 public struct ScanResult: Codable, Sendable {
@@ -202,6 +232,16 @@ public struct ScanResult: Codable, Sendable {
     public let families: [FamilyRecord]
     public let duplicateGroups: [DuplicateGroup]
     public let summary: ScanSummary
+
+    public init(rootPath: String, scannedAt: Date, largeFileThresholdBytes: Int64, files: [FileRecord], families: [FamilyRecord], duplicateGroups: [DuplicateGroup], summary: ScanSummary) {
+        self.rootPath = rootPath
+        self.scannedAt = scannedAt
+        self.largeFileThresholdBytes = largeFileThresholdBytes
+        self.files = files
+        self.families = families
+        self.duplicateGroups = duplicateGroups
+        self.summary = summary
+    }
 }
 
 public struct OperationRecord: Identifiable, Codable, Hashable, Sendable {

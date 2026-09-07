@@ -211,8 +211,7 @@ struct ContentView: View {
             }
             .padding()
 
-            ScrollView(.horizontal) {
-                Table(viewModel.filteredFiles, selection: $selection, sortOrder: $viewModel.sortOrder) {
+            Table(viewModel.filteredFiles, selection: $selection, sortOrder: $viewModel.sortOrder) {
                     TableColumn("类型", value: \.sortTypeTitle) { file in
                         Text(file.objectType.displayName)
                     }
@@ -242,36 +241,14 @@ struct ContentView: View {
                     }
                     .width(90)
 
-                    TableColumn("Allocated", value: \.allocatedBytes) { file in
-                        Text(humanBytes(file.allocatedBytes))
-                            .monospacedDigit()
+                    TableColumn("上传状态") { file in
+                        let status = UserUploadStatus(file: file, cloudSnapshot: viewModel.cloudSnapshots[file.path])
+                        Label(status.title, systemImage: status.systemImage)
+                            .foregroundStyle(status.color)
                     }
-                    .width(100)
-
-                    TableColumn("SHA", value: \.sortSHATitle) { file in
-                        Text(file.sha256 == nil ? "未计算" : "已计算")
-                            .foregroundStyle(file.sha256 == nil ? .secondary : .primary)
-                    }
-                    .width(72)
-
-                    TableColumn("重复", value: \.sortDuplicateTitle) { file in
-                        Text(file.duplicateGroupID ?? "-")
-                            .monospaced()
-                    }
-                    .width(72)
-
-                    TableColumn("状态", value: \.sortStatusTitle) { file in
-                        Text(file.status.rawValue)
-                    }
-                    .width(130)
-
-                    TableColumn("云端", value: \.path) { file in
-                        Text(viewModel.cloudStatus(for: file))
-                    }
-                    .width(92)
-                }
-                .frame(minWidth: 1006)
+                    .width(min: 100, ideal: 120)
             }
+            .frame(minWidth: 680)
         }
     }
 
@@ -393,9 +370,8 @@ final class ScanViewModel: ObservableObject {
 
     func apply(_ settings: ProductSettings) {
         largeFileThresholdMB = Double(settings.largeFileThresholdMB)
-        if let path = settings.scanRootPath {
-            selectedRoot = URL(fileURLWithPath: path)
-        }
+        selectedRoot = settings.scanRootPath.map { URL(fileURLWithPath: $0) }
+        restorePersistedArchiveView()
     }
 
     var activitySummary: String {
@@ -408,6 +384,87 @@ final class ScanViewModel: ObservableObject {
 
     func reloadActivity() {
         recentOperations = (try? ManifestStore().recentOperations()) ?? []
+    }
+
+    /// Restores verified manifest bindings immediately after launch, so a completed
+    /// background task remains visible without forcing another filesystem scan.
+    private func restorePersistedArchiveView() {
+        guard let selectedRoot else {
+            result = nil
+            cloudSnapshots = [:]
+            archivedSnapshots = [:]
+            return
+        }
+        do {
+            let store = try ManifestStore()
+            let cloud = try store.cloudArchiveSnapshots()
+            let archived = try store.archivedFileSnapshots()
+            let rootPath = selectedRoot.standardizedFileURL.path
+            let visible = archived.values.filter { snapshot in
+                let path = URL(fileURLWithPath: snapshot.archivedFile.filePath).standardizedFileURL.path
+                return path == rootPath || path.hasPrefix(rootPath + "/")
+            }
+            let files = visible.map(Self.displayRecord(for:)).sorted { $0.relativePath < $1.relativePath }
+            let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
+            let ordinary = files.filter { $0.objectType == .ordinaryFile }
+            let largeOrdinary = ordinary.filter { $0.sizeBytes >= threshold }
+            let images = files.filter { $0.objectType == .imageHighLayer }
+            let videos = files.filter { $0.objectType == .videoRawLayer }
+            let summary = ScanSummary(
+                ordinaryCount: ordinary.count,
+                ordinaryBytes: ordinary.reduce(0) { $0 + $1.sizeBytes },
+                largeOrdinaryCount: largeOrdinary.count,
+                largeOrdinaryBytes: largeOrdinary.reduce(0) { $0 + $1.sizeBytes },
+                imageHighCandidateCount: images.count,
+                imageHighCandidateBytes: images.reduce(0) { $0 + $1.sizeBytes },
+                videoRawCandidateCount: videos.count,
+                videoRawCandidateBytes: videos.reduce(0) { $0 + $1.sizeBytes },
+                videoRawDiscoveredCount: videos.count,
+                videoRawDiscoveredBytes: videos.reduce(0) { $0 + $1.sizeBytes },
+                videoPlaybackDiscoveredCount: 0,
+                videoPlaybackDiscoveredBytes: 0,
+                duplicateReclaimableBytes: 0
+            )
+            cloudSnapshots = cloud
+            archivedSnapshots = archived
+            result = ScanResult(
+                rootPath: rootPath,
+                scannedAt: visible.map(\.archivedFile.updatedAt).max() ?? Date(),
+                largeFileThresholdBytes: threshold,
+                files: files,
+                families: [],
+                duplicateGroups: [],
+                summary: summary
+            )
+        } catch {
+            result = nil
+        }
+    }
+
+    /// Publishes a completed background scan into the same state used by the
+    /// center table. A result for an old root must not replace a newer selection.
+    func applyAutomationResult(
+        _ scanResult: ScanResult,
+        root: URL,
+        cloudSnapshots: [String: CloudArchiveSnapshot],
+        archivedSnapshots: [String: ArchivedFileSnapshot],
+        failedPaths: Set<String>
+    ) {
+        self.cloudSnapshots = cloudSnapshots
+        self.archivedSnapshots = archivedSnapshots
+        if selectedRoot?.standardizedFileURL == root.standardizedFileURL {
+            var refreshed = scanResult
+            for index in refreshed.files.indices {
+                let path = refreshed.files[index].path
+                if failedPaths.contains(path) {
+                    refreshed.files[index].status = .uploadFailed
+                } else if cloudSnapshots[path]?.object.verifyStatus == .verified {
+                    refreshed.files[index].status = .verified
+                }
+            }
+            result = Self.scanResultByAddingArchivedDisplayRecords(refreshed, archived: archivedSnapshots, under: root)
+        }
+        reloadActivity()
     }
 
     var filteredFiles: [FileRecord] {
@@ -664,19 +721,6 @@ final class ScanViewModel: ObservableObject {
         }
     }
 
-    func cloudStatus(for file: FileRecord) -> String {
-        if let snapshot = cloudSnapshots[file.path] {
-            return snapshot.object.verifyStatus.rawValue
-        }
-        if file.sha256 == nil {
-            return "无 SHA"
-        }
-        if file.status == .notArchivable {
-            return "不可归档"
-        }
-        return "未上传"
-    }
-
     private func apply(_ progress: CloudUploadProgress) {
         uploadMessage = progress.message ?? "\(URL(fileURLWithPath: progress.filePath).lastPathComponent): \(progress.status.rawValue)"
         guard var current = result else { return }
@@ -807,7 +851,7 @@ enum RecordFilter: String, CaseIterable, Identifiable {
     }
 }
 
-private extension ArchiveObjectType {
+extension ArchiveObjectType {
     var displayName: String {
         switch self {
         case .ordinaryFile: "普通文件"
@@ -821,7 +865,53 @@ private extension FileRecord {
     var sortTypeTitle: String { objectType.displayName }
     var sortConversationTitle: String { conversationName ?? "未解析" }
     var sortMonthTitle: String { month ?? "" }
-    var sortSHATitle: String { sha256 == nil ? "未计算" : "已计算" }
-    var sortDuplicateTitle: String { duplicateGroupID ?? "" }
-    var sortStatusTitle: String { status.rawValue }
+}
+
+enum UserUploadStatus {
+    case uploaded
+    case uploading
+    case failed
+    case notUploaded
+
+    init(file: FileRecord, cloudSnapshot: CloudArchiveSnapshot?) {
+        if cloudSnapshot?.object.verifyStatus == .verified || file.status == .verified {
+            self = .uploaded
+        } else {
+            switch file.status {
+            case .uploadPending, .uploading, .uploaded:
+                self = .uploading
+            case .uploadFailed, .verifyFailed:
+                self = .failed
+            default:
+                self = .notUploaded
+            }
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .uploaded: "已上传"
+        case .uploading: "上传中"
+        case .failed: "上传失败"
+        case .notUploaded: "未上传"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .uploaded: "checkmark.circle.fill"
+        case .uploading: "arrow.up.circle.fill"
+        case .failed: "exclamationmark.circle.fill"
+        case .notUploaded: "circle"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .uploaded: .green
+        case .uploading: .blue
+        case .failed: .red
+        case .notUploaded: .secondary
+        }
+    }
 }
