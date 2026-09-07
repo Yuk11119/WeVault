@@ -192,6 +192,36 @@ public struct ScanSummary: Codable, Equatable, Sendable {
     public let videoPlaybackDiscoveredCount: Int
     public let videoPlaybackDiscoveredBytes: Int64
     public let duplicateReclaimableBytes: Int64
+
+    public init(
+        ordinaryCount: Int,
+        ordinaryBytes: Int64,
+        largeOrdinaryCount: Int,
+        largeOrdinaryBytes: Int64,
+        imageHighCandidateCount: Int,
+        imageHighCandidateBytes: Int64,
+        videoRawCandidateCount: Int,
+        videoRawCandidateBytes: Int64,
+        videoRawDiscoveredCount: Int,
+        videoRawDiscoveredBytes: Int64,
+        videoPlaybackDiscoveredCount: Int,
+        videoPlaybackDiscoveredBytes: Int64,
+        duplicateReclaimableBytes: Int64
+    ) {
+        self.ordinaryCount = ordinaryCount
+        self.ordinaryBytes = ordinaryBytes
+        self.largeOrdinaryCount = largeOrdinaryCount
+        self.largeOrdinaryBytes = largeOrdinaryBytes
+        self.imageHighCandidateCount = imageHighCandidateCount
+        self.imageHighCandidateBytes = imageHighCandidateBytes
+        self.videoRawCandidateCount = videoRawCandidateCount
+        self.videoRawCandidateBytes = videoRawCandidateBytes
+        self.videoRawDiscoveredCount = videoRawDiscoveredCount
+        self.videoRawDiscoveredBytes = videoRawDiscoveredBytes
+        self.videoPlaybackDiscoveredCount = videoPlaybackDiscoveredCount
+        self.videoPlaybackDiscoveredBytes = videoPlaybackDiscoveredBytes
+        self.duplicateReclaimableBytes = duplicateReclaimableBytes
+    }
 }
 
 public struct ScanResult: Codable, Sendable {
@@ -202,6 +232,16 @@ public struct ScanResult: Codable, Sendable {
     public let families: [FamilyRecord]
     public let duplicateGroups: [DuplicateGroup]
     public let summary: ScanSummary
+
+    public init(rootPath: String, scannedAt: Date, largeFileThresholdBytes: Int64, files: [FileRecord], families: [FamilyRecord], duplicateGroups: [DuplicateGroup], summary: ScanSummary) {
+        self.rootPath = rootPath
+        self.scannedAt = scannedAt
+        self.largeFileThresholdBytes = largeFileThresholdBytes
+        self.files = files
+        self.families = families
+        self.duplicateGroups = duplicateGroups
+        self.summary = summary
+    }
 }
 
 public struct OperationRecord: Identifiable, Codable, Hashable, Sendable {
@@ -272,6 +312,7 @@ public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
     public let restoredAt: Date?
     public let lastRestoreCheckAt: Date?
     public let releasedAt: Date?
+    public let quarantinedAt: Date?
     public let quarantinePath: String?
     public let placeholderPath: String?
     public let placeholderCreatedAt: Date?
@@ -288,6 +329,7 @@ public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
         restoredAt: Date? = nil,
         lastRestoreCheckAt: Date? = nil,
         releasedAt: Date? = nil,
+        quarantinedAt: Date? = nil,
         quarantinePath: String? = nil,
         placeholderPath: String? = nil,
         placeholderCreatedAt: Date? = nil,
@@ -303,6 +345,7 @@ public struct ArchiveBinding: Identifiable, Codable, Hashable, Sendable {
         self.restoredAt = restoredAt
         self.lastRestoreCheckAt = lastRestoreCheckAt
         self.releasedAt = releasedAt
+        self.quarantinedAt = quarantinedAt
         self.quarantinePath = quarantinePath
         self.placeholderPath = placeholderPath
         self.placeholderCreatedAt = placeholderCreatedAt
@@ -395,15 +438,19 @@ public struct S3CompatibleStorageConfig: Codable, Equatable, Sendable {
     public var region: String
     public var accessKeyID: String
     public var secretAccessKey: String
+    /// Managed and self-configured P2 flows supply a short-lived STS token.
+    /// This transport struct never decides credential persistence policy.
+    public var sessionToken: String?
     public var pathStyle: Bool
 
-    public init(provider: String = "Aliyun OSS", endpoint: String = "https://s3.oss-cn-hangzhou.aliyuncs.com", bucket: String = "wevault-demo-yuk177", region: String = "cn-hangzhou", accessKeyID: String = "", secretAccessKey: String = "", pathStyle: Bool = false) {
+    public init(provider: String = "Aliyun OSS", endpoint: String = "https://s3.oss-cn-hangzhou.aliyuncs.com", bucket: String = "wevault-demo-yuk177", region: String = "cn-hangzhou", accessKeyID: String = "", secretAccessKey: String = "", sessionToken: String? = nil, pathStyle: Bool = false) {
         self.provider = provider
         self.endpoint = endpoint
         self.bucket = bucket
         self.region = region
         self.accessKeyID = accessKeyID
         self.secretAccessKey = secretAccessKey
+        self.sessionToken = sessionToken
         self.pathStyle = pathStyle
     }
 }

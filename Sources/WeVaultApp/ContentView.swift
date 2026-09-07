@@ -4,7 +4,12 @@ import WeVaultCore
 
 struct ContentView: View {
     @ObservedObject var viewModel: ScanViewModel
+    @ObservedObject var managedAccount: ManagedAccount
+    @ObservedObject var selfManagedCloud: SelfManagedCloud
     let settings: ProductSettings
+    let automationSnapshot: AutomationTaskSnapshot?
+    let isAutomationRunning: Bool
+    let runAutomationNow: () -> Void
     let openSettings: () -> Void
     @State private var selection: FileRecord.ID?
 
@@ -35,7 +40,7 @@ struct ContentView: View {
                 isReleasing: viewModel.isReleasing,
                 onRestoreDefault: {
                     if let selectedArchiveSnapshot {
-                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .defaultDownloads)
+                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .defaultDownloads, managedAccount: managedAccount, selfManagedCloud: selfManagedCloud)
                     }
                 },
                 onRestoreToDirectory: {
@@ -43,7 +48,7 @@ struct ContentView: View {
                 },
                 onRestoreOriginalPath: {
                     if let selectedArchiveSnapshot {
-                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .originalPath)
+                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .originalPath, managedAccount: managedAccount, selfManagedCloud: selfManagedCloud)
                     }
                 },
                 onQuarantineLocal: {
@@ -121,13 +126,17 @@ struct ContentView: View {
 
                 activitySection
 
+                automationSection
+
                 VStack(alignment: .leading, spacing: 8) {
                     Text("云端连接")
                         .font(.headline)
-                    Text("已选择\(settings.cloudMode == .weVault ? "WeVault 云端" : "自配 OSS/COS")。P2 将在登录后提供短期凭证；P1 不保存长期密钥，因此上传与自动释放尚未启用。")
+                    Text(settings.cloudMode == .weVault ? managedAccount.status : "自配 OSS/COS 高级配置使用短期 STS 凭证，不保存长期密钥。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    Button("上传已哈希对象") { viewModel.uploadHashedCandidates(managedAccount: managedAccount, selfManagedCloud: selfManagedCloud, mode: settings.cloudMode) }
+                        .disabled(viewModel.result == nil || viewModel.isUploading || (settings.cloudMode == .weVault && !managedAccount.isReady))
                 }
 
                 if !viewModel.restoreMessage.isEmpty || viewModel.isRestoring {
@@ -202,8 +211,7 @@ struct ContentView: View {
             }
             .padding()
 
-            ScrollView(.horizontal) {
-                Table(viewModel.filteredFiles, selection: $selection, sortOrder: $viewModel.sortOrder) {
+            Table(viewModel.filteredFiles, selection: $selection, sortOrder: $viewModel.sortOrder) {
                     TableColumn("类型", value: \.sortTypeTitle) { file in
                         Text(file.objectType.displayName)
                     }
@@ -233,36 +241,14 @@ struct ContentView: View {
                     }
                     .width(90)
 
-                    TableColumn("Allocated", value: \.allocatedBytes) { file in
-                        Text(humanBytes(file.allocatedBytes))
-                            .monospacedDigit()
+                    TableColumn("上传状态") { file in
+                        let status = UserUploadStatus(file: file, cloudSnapshot: viewModel.cloudSnapshots[file.path])
+                        Label(status.title, systemImage: status.systemImage)
+                            .foregroundStyle(status.color)
                     }
-                    .width(100)
-
-                    TableColumn("SHA", value: \.sortSHATitle) { file in
-                        Text(file.sha256 == nil ? "未计算" : "已计算")
-                            .foregroundStyle(file.sha256 == nil ? .secondary : .primary)
-                    }
-                    .width(72)
-
-                    TableColumn("重复", value: \.sortDuplicateTitle) { file in
-                        Text(file.duplicateGroupID ?? "-")
-                            .monospaced()
-                    }
-                    .width(72)
-
-                    TableColumn("状态", value: \.sortStatusTitle) { file in
-                        Text(file.status.rawValue)
-                    }
-                    .width(130)
-
-                    TableColumn("云端", value: \.path) { file in
-                        Text(viewModel.cloudStatus(for: file))
-                    }
-                    .width(92)
-                }
-                .frame(minWidth: 1006)
+                    .width(min: 100, ideal: 120)
             }
+            .frame(minWidth: 680)
         }
     }
 
@@ -295,6 +281,42 @@ struct ContentView: View {
         }
     }
 
+    private var automationSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("自动任务").font(.headline)
+                Spacer()
+                Button(isAutomationRunning ? "正在运行…" : "立即运行", action: runAutomationNow)
+                    .disabled(!settings.automaticTasksEnabled || isAutomationRunning)
+            }
+            if let snapshot = automationSnapshot {
+                Text(snapshot.task.isPaused ? "已暂停" : "下次运行：\(snapshot.task.nextRunAt.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let run = snapshot.latestRun {
+                    Text(automationRunDescription(run))
+                        .font(.caption).foregroundStyle(run.status == .failed ? .red : .secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                Text("正在恢复任务状态…").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func automationRunDescription(_ run: AutomationTaskRun) -> String {
+        switch run.status {
+        case .waitingForCloud:
+            return "\(run.failureReason ?? "等待云端条件")；未扫描、上传或释放本地副本。"
+        case .completed:
+            return "已完成：\(run.completedUnits)/\(run.totalUnits) 项已通过云端校验。"
+        case .failed:
+            return "失败（\(run.completedUnits)/\(run.totalUnits) 已完成）：\(run.failureReason ?? "可重试错误")"
+        case .running:
+            return "正在扫描、上传并等待服务端校验。"
+        default:
+            return run.failureReason ?? run.status.rawValue
+        }
+    }
+
     private func chooseRestoreDirectory() {
         guard let selectedArchiveSnapshot else { return }
         let panel = NSOpenPanel()
@@ -304,7 +326,7 @@ struct ContentView: View {
         panel.prompt = "恢复到此处"
         panel.directoryURL = CloudRestoreService.defaultRestoreDirectory()
         if panel.runModal() == .OK, let url = panel.url {
-            viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .directory(url))
+            viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .directory(url), managedAccount: managedAccount, selfManagedCloud: selfManagedCloud)
         }
     }
 }
@@ -329,7 +351,6 @@ final class ScanViewModel: ObservableObject {
     @Published var alertMessage: String?
     @Published var largeFileThresholdMB: Double = 50
     @Published var filter: RecordFilter = .all
-    @Published var storageConfig = LocalStorageConfig.load()
     @Published var cloudSnapshots: [String: CloudArchiveSnapshot] = [:]
     @Published var archivedSnapshots: [String: ArchivedFileSnapshot] = [:]
     @Published var isUploading = false
@@ -349,9 +370,8 @@ final class ScanViewModel: ObservableObject {
 
     func apply(_ settings: ProductSettings) {
         largeFileThresholdMB = Double(settings.largeFileThresholdMB)
-        if let path = settings.scanRootPath {
-            selectedRoot = URL(fileURLWithPath: path)
-        }
+        selectedRoot = settings.scanRootPath.map { URL(fileURLWithPath: $0) }
+        restorePersistedArchiveView()
     }
 
     var activitySummary: String {
@@ -364,6 +384,87 @@ final class ScanViewModel: ObservableObject {
 
     func reloadActivity() {
         recentOperations = (try? ManifestStore().recentOperations()) ?? []
+    }
+
+    /// Restores verified manifest bindings immediately after launch, so a completed
+    /// background task remains visible without forcing another filesystem scan.
+    private func restorePersistedArchiveView() {
+        guard let selectedRoot else {
+            result = nil
+            cloudSnapshots = [:]
+            archivedSnapshots = [:]
+            return
+        }
+        do {
+            let store = try ManifestStore()
+            let cloud = try store.cloudArchiveSnapshots()
+            let archived = try store.archivedFileSnapshots()
+            let rootPath = selectedRoot.standardizedFileURL.path
+            let visible = archived.values.filter { snapshot in
+                let path = URL(fileURLWithPath: snapshot.archivedFile.filePath).standardizedFileURL.path
+                return path == rootPath || path.hasPrefix(rootPath + "/")
+            }
+            let files = visible.map(Self.displayRecord(for:)).sorted { $0.relativePath < $1.relativePath }
+            let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
+            let ordinary = files.filter { $0.objectType == .ordinaryFile }
+            let largeOrdinary = ordinary.filter { $0.sizeBytes >= threshold }
+            let images = files.filter { $0.objectType == .imageHighLayer }
+            let videos = files.filter { $0.objectType == .videoRawLayer }
+            let summary = ScanSummary(
+                ordinaryCount: ordinary.count,
+                ordinaryBytes: ordinary.reduce(0) { $0 + $1.sizeBytes },
+                largeOrdinaryCount: largeOrdinary.count,
+                largeOrdinaryBytes: largeOrdinary.reduce(0) { $0 + $1.sizeBytes },
+                imageHighCandidateCount: images.count,
+                imageHighCandidateBytes: images.reduce(0) { $0 + $1.sizeBytes },
+                videoRawCandidateCount: videos.count,
+                videoRawCandidateBytes: videos.reduce(0) { $0 + $1.sizeBytes },
+                videoRawDiscoveredCount: videos.count,
+                videoRawDiscoveredBytes: videos.reduce(0) { $0 + $1.sizeBytes },
+                videoPlaybackDiscoveredCount: 0,
+                videoPlaybackDiscoveredBytes: 0,
+                duplicateReclaimableBytes: 0
+            )
+            cloudSnapshots = cloud
+            archivedSnapshots = archived
+            result = ScanResult(
+                rootPath: rootPath,
+                scannedAt: visible.map(\.archivedFile.updatedAt).max() ?? Date(),
+                largeFileThresholdBytes: threshold,
+                files: files,
+                families: [],
+                duplicateGroups: [],
+                summary: summary
+            )
+        } catch {
+            result = nil
+        }
+    }
+
+    /// Publishes a completed background scan into the same state used by the
+    /// center table. A result for an old root must not replace a newer selection.
+    func applyAutomationResult(
+        _ scanResult: ScanResult,
+        root: URL,
+        cloudSnapshots: [String: CloudArchiveSnapshot],
+        archivedSnapshots: [String: ArchivedFileSnapshot],
+        failedPaths: Set<String>
+    ) {
+        self.cloudSnapshots = cloudSnapshots
+        self.archivedSnapshots = archivedSnapshots
+        if selectedRoot?.standardizedFileURL == root.standardizedFileURL {
+            var refreshed = scanResult
+            for index in refreshed.files.indices {
+                let path = refreshed.files[index].path
+                if failedPaths.contains(path) {
+                    refreshed.files[index].status = .uploadFailed
+                } else if cloudSnapshots[path]?.object.verifyStatus == .verified {
+                    refreshed.files[index].status = .verified
+                }
+            }
+            result = Self.scanResultByAddingArchivedDisplayRecords(refreshed, archived: archivedSnapshots, under: root)
+        }
+        reloadActivity()
     }
 
     var filteredFiles: [FileRecord] {
@@ -385,16 +486,6 @@ final class ScanViewModel: ObservableObject {
 
     var displayFiles: [FileRecord] {
         result?.files ?? []
-    }
-
-    var canUpload: Bool {
-        result != nil &&
-            !isScanning &&
-            !isUploading &&
-            !storageConfig.endpoint.isEmpty &&
-            !storageConfig.bucket.isEmpty &&
-            !storageConfig.accessKeyID.isEmpty &&
-            !storageConfig.secretAccessKey.isEmpty
     }
 
     var uploadScopeSummary: String {
@@ -443,13 +534,12 @@ final class ScanViewModel: ObservableObject {
         }
     }
 
-    func uploadHashedCandidates() {
+    func uploadHashedCandidates(managedAccount: ManagedAccount, selfManagedCloud: SelfManagedCloud, mode: ProductSettings.CloudMode) {
         guard let selectedRoot else { return }
         isUploading = true
         alertMessage = nil
         uploadMessage = "按当前阈值刷新扫描..."
         let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
-        let config = storageConfig
 
         Task {
             do {
@@ -469,11 +559,16 @@ final class ScanViewModel: ObservableObject {
                 archivedSnapshots = refreshed.2
                 uploadMessage = "准备上传：\(uploadableFiles(from: refreshed.0.files).count) 项绑定"
 
-                let service = CloudUploadService()
                 let store = try ManifestStore()
-                let snapshots = try await service.upload(files: refreshed.0.files, families: refreshed.0.families, config: config, store: store) { [weak self] progress in
-                    await MainActor.run {
-                        self?.apply(progress)
+                let snapshots: [String: CloudArchiveSnapshot]
+                if mode == .weVault {
+                    let authorization = try await managedAccount.withAuthorizedDevice()
+                    snapshots = try await ManagedCloudArchiveService().upload(files: refreshed.0.files, families: refreshed.0.families, api: authorization.api, accessToken: authorization.accessToken, deviceId: authorization.deviceID, store: store) { [weak self] progress in
+                        await MainActor.run { self?.apply(progress) }
+                    }
+                } else {
+                    snapshots = try await CloudUploadService().upload(files: refreshed.0.files, families: refreshed.0.families, config: try selfManagedCloud.storageConfig(), store: store) { [weak self] progress in
+                        await MainActor.run { self?.apply(progress) }
                     }
                 }
                 cloudSnapshots = snapshots
@@ -487,17 +582,22 @@ final class ScanViewModel: ObservableObject {
         }
     }
 
-    func restore(snapshot: ArchivedFileSnapshot, destination: RestoreDestination) {
+    func restore(snapshot: ArchivedFileSnapshot, destination: RestoreDestination, managedAccount: ManagedAccount, selfManagedCloud: SelfManagedCloud) {
         guard !isRestoring else { return }
         isRestoring = true
         alertMessage = nil
         restoreMessage = "准备恢复：\(snapshot.archivedFile.originalFilename)"
-        let config = storageConfig
 
         Task {
             do {
                 let store = try ManifestStore()
-                let result = try await CloudRestoreService().restore(snapshot: snapshot, destination: destination, config: config, store: store)
+                let result: CloudRestoreResult
+                if snapshot.object.storageProvider == "WeVault Managed Cloud" {
+                    let authorization = try await managedAccount.withAuthorizedDevice()
+                    result = try await ManagedCloudArchiveService().restore(snapshot: snapshot, destination: destination, api: authorization.api, accessToken: authorization.accessToken, deviceId: authorization.deviceID, store: store)
+                } else {
+                    result = try await CloudRestoreService().restore(snapshot: snapshot, destination: destination, config: try selfManagedCloud.storageConfig(), store: store)
+                }
                 archivedSnapshots = try store.archivedFileSnapshots()
                 cloudSnapshots = try store.cloudArchiveSnapshots()
                 reloadActivity()
@@ -619,19 +719,6 @@ final class ScanViewModel: ObservableObject {
             }
             isReleasing = false
         }
-    }
-
-    func cloudStatus(for file: FileRecord) -> String {
-        if let snapshot = cloudSnapshots[file.path] {
-            return snapshot.object.verifyStatus.rawValue
-        }
-        if file.sha256 == nil {
-            return "无 SHA"
-        }
-        if file.status == .notArchivable {
-            return "不可归档"
-        }
-        return "未上传"
     }
 
     private func apply(_ progress: CloudUploadProgress) {
@@ -764,7 +851,7 @@ enum RecordFilter: String, CaseIterable, Identifiable {
     }
 }
 
-private extension ArchiveObjectType {
+extension ArchiveObjectType {
     var displayName: String {
         switch self {
         case .ordinaryFile: "普通文件"
@@ -778,7 +865,53 @@ private extension FileRecord {
     var sortTypeTitle: String { objectType.displayName }
     var sortConversationTitle: String { conversationName ?? "未解析" }
     var sortMonthTitle: String { month ?? "" }
-    var sortSHATitle: String { sha256 == nil ? "未计算" : "已计算" }
-    var sortDuplicateTitle: String { duplicateGroupID ?? "" }
-    var sortStatusTitle: String { status.rawValue }
+}
+
+enum UserUploadStatus {
+    case uploaded
+    case uploading
+    case failed
+    case notUploaded
+
+    init(file: FileRecord, cloudSnapshot: CloudArchiveSnapshot?) {
+        if cloudSnapshot?.object.verifyStatus == .verified || file.status == .verified {
+            self = .uploaded
+        } else {
+            switch file.status {
+            case .uploadPending, .uploading, .uploaded:
+                self = .uploading
+            case .uploadFailed, .verifyFailed:
+                self = .failed
+            default:
+                self = .notUploaded
+            }
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .uploaded: "已上传"
+        case .uploading: "上传中"
+        case .failed: "上传失败"
+        case .notUploaded: "未上传"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .uploaded: "checkmark.circle.fill"
+        case .uploading: "arrow.up.circle.fill"
+        case .failed: "exclamationmark.circle.fill"
+        case .notUploaded: "circle"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .uploaded: .green
+        case .uploading: .blue
+        case .failed: .red
+        case .notUploaded: .secondary
+        }
+    }
 }

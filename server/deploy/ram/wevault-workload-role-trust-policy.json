@@ -1,0 +1,12 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Principal": {
+        "RAM": ["acs:ram::1833534089420641:role/wevault-ecs-runtime-staging"]
+      }
+    }
+  ]
+}

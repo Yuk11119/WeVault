@@ -12,6 +12,14 @@ public struct CloudUploadProgress: Sendable {
     }
 }
 
+/// P2A intentionally exposes both cloud routes without changing the existing
+/// automatic upload/release path.  The managed route is opt-in for contract
+/// tests until the P2 product UI owns account sign-in and migration.
+public enum CloudUploadProvider: String, Sendable {
+    case selfConfiguredS3
+    case managedWeVault
+}
+
 public final class CloudUploadService: Sendable {
     public typealias ClientFactory = @Sendable (S3CompatibleStorageConfig) -> any ObjectStorageClient
 
@@ -19,6 +27,26 @@ public final class CloudUploadService: Sendable {
 
     public init(clientFactory: @escaping ClientFactory = { S3CompatibleObjectStorageClient(config: $0) }) {
         self.clientFactory = clientFactory
+    }
+
+    /// Managed-cloud contract entry point.  It does not receive a ManifestStore
+    /// and therefore cannot create a verified binding or invoke any local
+    /// release/quarantine/tombstone behavior.  The existing `upload` method
+    /// remains the user-configured S3 path used by the current app UI.
+    public func uploadManagedContract(
+        api: WeVaultAPIClient,
+        accessToken: String,
+        deviceId: String,
+        fileURL: URL,
+        storageFactory: any ManagedWeVaultStorageClientFactory = STSObjectStorageClientFactory()
+    ) async throws -> ManagedCloudUploadOutcome {
+        try await ManagedCloudContractPipeline.upload(
+            api: api,
+            accessToken: accessToken,
+            deviceId: deviceId,
+            fileURL: fileURL,
+            storageFactory: storageFactory
+        )
     }
 
     public func upload(

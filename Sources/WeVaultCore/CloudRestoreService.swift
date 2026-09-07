@@ -36,6 +36,16 @@ public final class CloudRestoreService: Sendable {
         config: S3CompatibleStorageConfig,
         store: ManifestStore
     ) async throws -> CloudRestoreResult {
+        try await restore(snapshot: snapshot, destination: destination, client: clientFactory(config), objectKey: snapshot.object.objectKey, store: store)
+    }
+
+    public func restore(
+        snapshot: ArchivedFileSnapshot,
+        destination: RestoreDestination = .defaultDownloads,
+        client: any ObjectStorageClient,
+        objectKey: String,
+        store: ManifestStore
+    ) async throws -> CloudRestoreResult {
         guard snapshot.object.verifyStatus == .verified,
               snapshot.binding.archiveState == .verified || snapshot.binding.archiveState == .restored || snapshot.binding.archiveState == .localReleased else {
             throw WeVaultError.cloud("Only verified cloud objects can be restored")
@@ -60,7 +70,7 @@ public final class CloudRestoreService: Sendable {
         try store.logOperation("RESTORE_STARTED", detail: targetURL.path)
 
         do {
-            let finalURL = try await downloadAndVerify(snapshot: snapshot, targetURL: targetURL, restoreToOriginalPath: restoreToOriginalPath, config: config)
+            let finalURL = try await downloadAndVerify(snapshot: snapshot, targetURL: targetURL, restoreToOriginalPath: restoreToOriginalPath, client: client, objectKey: objectKey)
             let digest = try sha256File(finalURL)
             let completedAt = Date()
             try store.updateRestoreState(
@@ -89,7 +99,7 @@ public final class CloudRestoreService: Sendable {
         }
     }
 
-    private func downloadAndVerify(snapshot: ArchivedFileSnapshot, targetURL: URL, restoreToOriginalPath: Bool, config: S3CompatibleStorageConfig) async throws -> URL {
+    private func downloadAndVerify(snapshot: ArchivedFileSnapshot, targetURL: URL, restoreToOriginalPath: Bool, client: any ObjectStorageClient, objectKey: String) async throws -> URL {
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
@@ -114,7 +124,7 @@ public final class CloudRestoreService: Sendable {
             }
         }
 
-        try await clientFactory(config).getObject(objectKey: snapshot.object.objectKey, destinationURL: temporaryURL)
+        try await client.getObject(objectKey: objectKey, destinationURL: temporaryURL)
         let stat = try fileStat(temporaryURL.path)
         guard stat.size == snapshot.archivedFile.sizeBytes else {
             throw WeVaultError.cloud("Restored size mismatch for \(snapshot.archivedFile.originalFilename)")

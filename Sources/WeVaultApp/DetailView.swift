@@ -22,6 +22,10 @@ struct DetailView: View {
         return families.first { $0.highOrRawPath == file.path }
     }
 
+    var uploadStatus: UserUploadStatus? {
+        file.map { UserUploadStatus(file: $0, cloudSnapshot: cloudSnapshot) }
+    }
+
     var canRestore: Bool {
         guard let archivedSnapshot else { return false }
         return archivedSnapshot.object.verifyStatus == .verified &&
@@ -71,45 +75,41 @@ struct DetailView: View {
                             .textSelection(.enabled)
 
                         detailSection("对象") {
-                            row("类型", file.objectType.rawValue)
-                            row("状态", file.status.rawValue)
+                            row("类型", file.objectType.displayName)
+                            row("上传状态", uploadStatus?.title ?? "未上传")
                             row("候选说明", file.candidateReason ?? family?.reason ?? "-")
                             row("会话/来源", file.conversationName ?? "未解析")
-                            row("会话解析", file.conversationResolution)
                             row("月份", file.month ?? "-")
-                            row("账号 hash", file.accountHash)
                         }
 
                         detailSection("文件") {
                             row("原始路径", file.path)
                             row("大小", humanBytes(file.sizeBytes))
-                            row("Allocated", humanBytes(file.allocatedBytes))
-                            row("SHA-256", file.sha256 ?? "未计算")
-                            row("inode / nlink", "\(file.inode) / \(file.nlink)")
-                            row("mtime", file.mtime.formatted(date: .numeric, time: .standard))
-                            row("重复组", file.duplicateGroupID ?? "-")
+                            DisclosureGroup("查看文件技术信息") {
+                                row("Allocated", humanBytes(file.allocatedBytes))
+                                row("SHA-256", file.sha256 ?? "未计算")
+                                row("inode / nlink", "\(file.inode) / \(file.nlink)")
+                                row("mtime", file.mtime.formatted(date: .numeric, time: .standard))
+                                row("重复组", file.duplicateGroupID ?? "-")
+                                row("账号 hash", file.accountHash)
+                                row("会话解析", file.conversationResolution)
+                            }
                         }
 
                         if let cloudSnapshot {
-                            detailSection("云端") {
-                                row("Cloud Object ID", cloudSnapshot.object.cloudObjectID)
-                                row("Provider", cloudSnapshot.object.storageProvider)
-                                row("Bucket", cloudSnapshot.object.bucketOrContainer)
-                                row("Object Key", cloudSnapshot.object.objectKey)
+                            detailSection("云端归档") {
+                                row("上传状态", uploadStatus?.title ?? "未上传")
                                 row("上传时间", cloudSnapshot.object.uploadedAt.formatted(date: .numeric, time: .standard))
                                 row("校验时间", cloudSnapshot.object.verifiedAt?.formatted(date: .numeric, time: .standard) ?? "-")
-                                row("校验状态", cloudSnapshot.object.verifyStatus.rawValue)
-                                row("引用数量", "\(cloudSnapshot.object.refCount)")
-                                row("Binding", cloudSnapshot.binding.bindingID)
-                                row("本地状态", cloudSnapshot.binding.localState.rawValue)
-                                row("隔离路径", cloudSnapshot.binding.quarantinePath ?? "-")
-                                row("占位路径", cloudSnapshot.binding.placeholderPath ?? "-")
-                                row("占位格式", cloudSnapshot.binding.placeholderFormat ?? "-")
-                                row("占位 SHA", cloudSnapshot.binding.placeholderSHA256 ?? "-")
-                                row("占位大小", cloudSnapshot.binding.placeholderSize.map(humanBytes) ?? "-")
-                                row("释放时间", cloudSnapshot.binding.releasedAt?.formatted(date: .numeric, time: .standard) ?? "-")
-                                row("恢复时间", cloudSnapshot.binding.restoredAt?.formatted(date: .numeric, time: .standard) ?? "-")
-                                row("最后恢复校验", cloudSnapshot.binding.lastRestoreCheckAt?.formatted(date: .numeric, time: .standard) ?? "-")
+                                DisclosureGroup("查看云端技术信息") {
+                                    row("Cloud Object ID", cloudSnapshot.object.cloudObjectID)
+                                    row("Provider", cloudSnapshot.object.storageProvider)
+                                    row("Bucket", cloudSnapshot.object.bucketOrContainer)
+                                    row("Object Key", cloudSnapshot.object.objectKey)
+                                    row("校验状态", cloudSnapshot.object.verifyStatus.rawValue)
+                                    row("Binding", cloudSnapshot.binding.bindingID)
+                                    row("本地状态", cloudSnapshot.binding.localState.rawValue)
+                                }
                             }
                         }
 
@@ -201,7 +201,7 @@ struct DetailView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             } else {
-                ContentUnavailableView("请选择一项", systemImage: "doc.text.magnifyingglass", description: Text("详情会显示原始路径、SHA、family 成员和归档候选原因。"))
+                ContentUnavailableView("请选择一项", systemImage: "doc.text.magnifyingglass", description: Text("选择文件后可查看是否已上传及恢复选项。"))
             }
         }
     }

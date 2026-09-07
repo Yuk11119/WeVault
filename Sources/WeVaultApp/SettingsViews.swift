@@ -107,21 +107,75 @@ struct SetupWizard: View {
 struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var draft: ProductSettings
+    @ObservedObject var managedAccount: ManagedAccount
+    @ObservedObject var selfManagedCloud: SelfManagedCloud
     let onSave: (ProductSettings) -> Void
 
-    init(settings: ProductSettings, onSave: @escaping (ProductSettings) -> Void) {
+    init(settings: ProductSettings, managedAccount: ManagedAccount, selfManagedCloud: SelfManagedCloud, onSave: @escaping (ProductSettings) -> Void) {
         _draft = State(initialValue: settings)
+        self.managedAccount = managedAccount
+        self.selfManagedCloud = selfManagedCloud
         self.onSave = onSave
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("WeVault 设置").font(.title2.bold())
-            SetupWizard(initial: draft) { updated in
-                onSave(updated)
-                dismiss()
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("WeVault 设置").font(.title2.bold())
+                SetupWizard(initial: draft) { updated in
+                    onSave(updated)
+                    dismiss()
+                }
+                ManagedLoginSection(account: managedAccount)
+                SelfManagedCloudSection(cloud: selfManagedCloud)
             }
+            .padding(.vertical)
         }
         .frame(minWidth: 650, minHeight: 680)
+    }
+}
+
+private struct SelfManagedCloudSection: View {
+    @ObservedObject var cloud: SelfManagedCloud
+    @State private var config = SelfManagedTemporaryConfig()
+    @State private var error: String?
+    var body: some View {
+        GroupBox("自配 OSS / COS 高级设置") {
+            Text("仅接受短期 STS 凭证；不会保存长期 AccessKey 或 Secret。凭证仅存入本机 Keychain。")
+                .font(.caption).foregroundStyle(.secondary)
+            Picker("提供商", selection: $config.provider) { Text("阿里云 OSS").tag("Aliyun OSS (STS)"); Text("腾讯云 COS").tag("Tencent COS (STS)") }
+            TextField("Endpoint", text: $config.endpoint); TextField("Bucket", text: $config.bucket); TextField("Region", text: $config.region)
+            TextField("临时 AccessKey ID", text: $config.accessKeyID); SecureField("临时 AccessKey Secret", text: $config.secretAccessKey); SecureField("Security Token", text: $config.securityToken); TextField("过期时间（ISO-8601）", text: $config.expiration)
+            HStack { Button("保存短期凭证") { do { try cloud.save(config); error = nil } catch { self.error = error.localizedDescription } }; if let error { Text(error).foregroundStyle(.red) } }
+        }.padding(.horizontal)
+    }
+}
+
+private struct ManagedLoginSection: View {
+    private enum Field: Hashable { case email, password }
+
+    @ObservedObject var account: ManagedAccount
+    @State private var email = ""
+    @State private var password = ""
+    @State private var error: String?
+    @FocusState private var focusedField: Field?
+
+    var body: some View {
+        GroupBox("WeVault 云端账户") {
+            if account.isReady {
+                HStack { Text(account.status); Spacer(); Button("退出登录") { Task { await account.logout() } } }
+            } else {
+                TextField("邮箱", text: $email)
+                    .textContentType(.emailAddress)
+                    .focused($focusedField, equals: .email)
+                SecureField("密码", text: $password)
+                    .focused($focusedField, equals: .password)
+                HStack { Button("登录并注册本机") { Task { do { try await account.login(email: email, password: password) } catch { self.error = error.localizedDescription } } }; if let error { Text(error).foregroundStyle(.red) } }
+            }
+        }
+        .padding(.horizontal)
+        .onAppear {
+            if !account.isReady { focusedField = .email }
+        }
     }
 }

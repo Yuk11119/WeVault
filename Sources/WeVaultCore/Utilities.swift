@@ -6,6 +6,7 @@ public enum WeVaultError: Error, LocalizedError {
     case sqlite(String)
     case fileSystem(String)
     case cloud(String)
+    case manifest(ManifestFailure)
 
     public var errorDescription: String? {
         switch self {
@@ -17,6 +18,17 @@ public enum WeVaultError: Error, LocalizedError {
             return "File system error: \(value)"
         case .cloud(let value):
             return "Cloud error: \(value)"
+        case .manifest(let failure):
+            switch failure {
+            case .keychainUnavailable: return "Manifest keychain is unavailable"
+            case .keyMissing: return "Manifest key is missing"
+            case .invalidKey: return "Manifest key is invalid"
+            case .keyMismatch: return "Manifest key does not match this manifest"
+            case .malformedEncryptedField: return "Manifest encrypted data is malformed"
+            case .authenticationFailed: return "Manifest encrypted data failed authentication"
+            case .sqliteCorrupt: return "Manifest SQLite database is unreadable"
+            case .missingNeedsCloudIndexFallback: return "Manifest is missing; cloud index recovery is required"
+            }
         }
     }
 }
