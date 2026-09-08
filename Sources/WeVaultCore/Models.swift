@@ -454,3 +454,10 @@ public struct S3CompatibleStorageConfig: Codable, Equatable, Sendable {
         self.pathStyle = pathStyle
     }
 }
+
+extension ScanSummary {
+    public static let zero = ScanSummary(ordinaryCount: 0, ordinaryBytes: 0, largeOrdinaryCount: 0, largeOrdinaryBytes: 0, imageHighCandidateCount: 0, imageHighCandidateBytes: 0, videoRawCandidateCount: 0, videoRawCandidateBytes: 0, videoRawDiscoveredCount: 0, videoRawDiscoveredBytes: 0, videoPlaybackDiscoveredCount: 0, videoPlaybackDiscoveredBytes: 0, duplicateReclaimableBytes: 0)
+    public func adding(_ other: ScanSummary) -> ScanSummary {
+        ScanSummary(ordinaryCount: ordinaryCount + other.ordinaryCount, ordinaryBytes: ordinaryBytes + other.ordinaryBytes, largeOrdinaryCount: largeOrdinaryCount + other.largeOrdinaryCount, largeOrdinaryBytes: largeOrdinaryBytes + other.largeOrdinaryBytes, imageHighCandidateCount: imageHighCandidateCount + other.imageHighCandidateCount, imageHighCandidateBytes: imageHighCandidateBytes + other.imageHighCandidateBytes, videoRawCandidateCount: videoRawCandidateCount + other.videoRawCandidateCount, videoRawCandidateBytes: videoRawCandidateBytes + other.videoRawCandidateBytes, videoRawDiscoveredCount: videoRawDiscoveredCount + other.videoRawDiscoveredCount, videoRawDiscoveredBytes: videoRawDiscoveredBytes + other.videoRawDiscoveredBytes, videoPlaybackDiscoveredCount: videoPlaybackDiscoveredCount + other.videoPlaybackDiscoveredCount, videoPlaybackDiscoveredBytes: videoPlaybackDiscoveredBytes + other.videoPlaybackDiscoveredBytes, duplicateReclaimableBytes: duplicateReclaimableBytes + other.duplicateReclaimableBytes)
+    }
+}

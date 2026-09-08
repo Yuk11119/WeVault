@@ -5,6 +5,37 @@ import WeVaultCore
 
 @MainActor
 final class AppState: ObservableObject {
+    static let shared = AppState()
+    let restoreCenter = RestoreCenterModel()
+    private var restoreWindow: NSWindowController?
+
+    func openRestoreURL(_ url: URL) {
+        #if DEBUG
+        if let root = DevelopmentIsolation.root {
+            try? Data(url.absoluteString.utf8).write(to: root.appendingPathComponent("last-incoming-url.txt"))
+        }
+        #endif
+        do { openRestoreCenter(bindingID: try RestoreLink(url: url).bindingID) }
+        catch { openRestoreCenter(); restoreCenter.rejectLink(error.localizedDescription) }
+    }
+
+    func openRestoreCenter(bindingID: String? = nil) {
+        if restoreWindow == nil {
+            let controller = NSHostingController(rootView: RestoreCenterView(appState: self, model: restoreCenter, operations: scanViewModel))
+            let window = NSWindow(contentViewController: controller)
+            window.title = "WeVault 恢复中心"
+            window.setContentSize(NSSize(width: 960, height: 640))
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.isReleasedWhenClosed = false
+            window.center()
+            restoreWindow = NSWindowController(window: window)
+        }
+        restoreCenter.load(bindingID: bindingID)
+        restoreWindow?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        restoreWindow?.window?.makeKeyAndOrderFront(nil)
+    }
+
     @Published private(set) var settings: ProductSettings
     @Published var isSettingsPresented = false
     @Published var manualScanRequestID: UUID?
@@ -20,8 +51,10 @@ final class AppState: ObservableObject {
     private var automationLoop: Task<Void, Never>?
     private var accountReadinessCancellable: AnyCancellable?
     private var activeAutomationRefreshes = 0
+    private var configurationGeneration = 0
 
     init(defaults: UserDefaults = .standard) {
+        let defaults = DevelopmentIsolation.root == nil ? defaults : UserDefaults(suiteName: "online.wevault.p5-fixtures")!
         self.defaults = defaults
         if let data = defaults.data(forKey: settingsKey),
            let decoded = try? JSONDecoder().decode(ProductSettings.self, from: data) {
@@ -31,21 +64,30 @@ final class AppState: ObservableObject {
         } else {
             settings = .default
         }
-        scheduler = try? AutomationScheduler(store: ManifestStore())
+        if DevelopmentIsolation.root != nil {
+            settings = ProductSettings(onboardingCompleted: true, automaticTasksEnabled: false)
+        }
+        do { scheduler = try AutomationScheduler(store: ManifestStore()) }
+        catch { scheduler = nil; scanViewModel.alertMessage = error.localizedDescription }
         // Restore the persisted root before the first due-task evaluation.
         scanViewModel.apply(settings)
         accountReadinessCancellable = managedAccount.$isReady
             .removeDuplicates()
             .dropFirst()
             .sink { [weak self] ready in
-                self?.refreshAutomation(wakeWaiting: ready)
+                Task { [weak self] in
+                    guard let self else { return }
+                    self.configurationGeneration += 1
+                    await self.scheduler?.cancelActiveRun()
+                    self.refreshAutomation(wakeWaiting: ready)
+                }
             }
         refreshAutomation(wakeWaiting: prerequisitesAppearReady)
         automationLoop = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard !Task.isCancelled else { return }
-                await self?.refreshAutomationNow()
+                self?.refreshAutomation()
             }
         }
     }
@@ -53,12 +95,18 @@ final class AppState: ObservableObject {
     func save(_ newSettings: ProductSettings) {
         var normalized = newSettings
         normalized.normalize()
+        if DevelopmentIsolation.root != nil { normalized.automaticTasksEnabled = false; normalized.scanRootPath = nil }
+        configurationGeneration += 1
         settings = normalized
         scanViewModel.apply(normalized)
         if let data = try? JSONEncoder().encode(normalized) {
             defaults.set(data, forKey: settingsKey)
         }
-        refreshAutomation(wakeWaiting: prerequisitesAppearReady)
+        Task { [weak self] in
+            guard let self else { return }
+            await self.scheduler?.cancelActiveRun()
+            self.refreshAutomation(wakeWaiting: self.prerequisitesAppearReady)
+        }
     }
 
     func completeOnboarding(_ newSettings: ProductSettings) {
@@ -80,7 +128,8 @@ final class AppState: ObservableObject {
     var automationSummary: String {
         guard let snapshot = automationSnapshot else { return "自动任务准备中" }
         if snapshot.task.isPaused { return "自动任务已暂停" }
-        if let run = snapshot.latestRun, run.status == .running { return "自动任务正在运行" }
+        if let run = snapshot.latestRun, run.status == .running { return "\(run.stage.displayName)：\(run.completedUnits)/\(run.totalUnits)" }
+        if let run = snapshot.latestRun, run.status == .failed { return "自动任务失败：\(run.failureReason ?? "请重试")" }
         if let run = snapshot.latestRun, run.status == .waitingForCloud { return run.failureReason ?? "自动任务等待云端条件" }
         return "下次自动任务：\(snapshot.task.nextRunAt.formatted(date: .abbreviated, time: .shortened))"
     }
@@ -127,7 +176,6 @@ final class AppState: ObservableObject {
 
     private func beginAutomationRefresh() {
         activeAutomationRefreshes += 1
-        isAutomationRunning = true
     }
 
     private func endAutomationRefresh() {
@@ -137,13 +185,23 @@ final class AppState: ObservableObject {
 
     private func refreshAutomationNow() async {
         guard let scheduler else { return }
+        if activeAutomationRefreshes > 0 {
+            automationSnapshot = try? await scheduler.snapshot()
+            return
+        }
         beginAutomationRefresh()
         defer { endAutomationRefresh() }
         let settings = settings
+        let generation = configurationGeneration
         do {
-            _ = try await scheduler.configure(settings: settings)
+            let configured = try await scheduler.configure(settings: settings)
+            if configured.isPaused || configured.nextRunAt > Date() {
+                automationSnapshot = try await scheduler.snapshot()
+                return
+            }
+            isAutomationRunning = true
             let gate: AutomationCloudGate
-            let pipeline: AutomationPipeline?
+            let pipeline: ContextAutomationPipeline?
             var waitingReason: String?
             if settings.cloudMode != .weVault {
                 gate = .unavailable
@@ -169,46 +227,32 @@ final class AppState: ObservableObject {
                     gate = .unavailable
                     pipeline = nil
                     waitingReason = "云端授权不可用：\(error.localizedDescription)"
-                    _ = try await scheduler.runDueTasks(cloudGate: gate, pipeline: pipeline, waitingReason: waitingReason)
+                    _ = try await scheduler.runDueTasks(cloudGate: gate, contextPipeline: pipeline, waitingReason: waitingReason)
                     automationSnapshot = try await scheduler.snapshot()
                     scanViewModel.reloadActivity()
                     return
                 }
+                guard generation == configurationGeneration, self.settings == settings, managedAccount.isReady else { return }
                 gate = .available
-                let threshold = Int64(settings.largeFileThresholdMB * 1024 * 1024)
-                let viewModel = scanViewModel
-                pipeline = { [root, threshold, authorization, settings, viewModel] in
-                    let scanned = try await Task.detached(priority: .utility) {
-                        let store = try ManifestStore()
-                        let placeholders = try store.archivedFileSnapshots().values.compactMap(\.binding.placeholderPath)
-                        let result = try WeChatScanner().scan(root: root, options: ScanOptions(largeFileThresholdBytes: threshold, knownPlaceholderPaths: Set(placeholders)))
-                        try store.save(scanResult: result)
-                        return result
-                    }.value
-                    let candidates = AutomaticUploadCandidateSelector().candidates(from: scanned.files, settings: settings)
+                pipeline = { [root, authorization, settings] context in
                     let store = try ManifestStore()
-                    let report = try await ManagedCloudArchiveService().uploadWithReport(files: candidates, families: scanned.families, api: authorization.api, accessToken: authorization.accessToken, deviceId: authorization.deviceID, store: store)
-                    let archivedSnapshots = try store.archivedFileSnapshots()
-                    await viewModel.applyAutomationResult(
-                        scanned,
-                        root: root,
-                        cloudSnapshots: report.snapshots,
-                        archivedSnapshots: archivedSnapshots,
-                        failedPaths: Set(report.failures.map(\.filePath))
-                    )
-                    let summary = report.failures.isEmpty ? nil : "\(report.failures.count) 个对象上传或服务端校验失败：\(report.failures[0].reason)"
-                    return AutomationPipelineResult(completedUnits: report.verifiedCount, totalUnits: report.attemptedCount, failedUnits: report.failures.count, failureSummary: summary)
+                    return try await AutomaticArchivePipeline(store: store).run(root: root, settings: settings, context: context, authorizeArchive: { snapshot, connection in
+                        try await ManagedCloudArchiveService().isAuthorizedArchive(snapshot, api: authorization.api, accessToken: authorization.accessToken, deviceID: authorization.deviceID, store: connection)
+                    }) { files, families, connection in
+                        try await ManagedCloudArchiveService().uploadBatch(files: files, families: families, api: authorization.api, accessToken: authorization.accessToken, deviceID: authorization.deviceID, store: connection)
+                    }
                 }
             } else {
                 gate = .unavailable
                 pipeline = nil
                 waitingReason = "扫描目录不可用"
             }
-            _ = try await scheduler.runDueTasks(cloudGate: gate, pipeline: pipeline, waitingReason: waitingReason)
+            _ = try await scheduler.runDueTasks(cloudGate: gate, contextPipeline: pipeline, waitingReason: waitingReason)
             automationSnapshot = try await scheduler.snapshot()
+            scanViewModel.loadAutomaticPage(reset: true)
             scanViewModel.reloadActivity()
         } catch {
-            // The manifest operation log remains the durable diagnostic source.
+            scanViewModel.alertMessage = error.localizedDescription
         }
     }
 

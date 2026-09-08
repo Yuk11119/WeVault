@@ -16,9 +16,11 @@ public struct LocalReleaseResult: Sendable {
 
 public final class LocalReleaseService: Sendable {
     public let quarantineRoot: URL
+    let checkpoint: @Sendable (String) throws -> Void
 
-    public init(quarantineRoot: URL = LocalReleaseService.defaultQuarantineRoot()) {
+    public init(quarantineRoot: URL = LocalReleaseService.defaultQuarantineRoot(), checkpoint: @escaping @Sendable (String) throws -> Void = { _ in }) {
         self.quarantineRoot = quarantineRoot
+        self.checkpoint = checkpoint
     }
 
     public static func defaultQuarantineRoot() -> URL {

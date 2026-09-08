@@ -3,7 +3,12 @@ import SwiftUI
 /// `swift run` starts a bare executable rather than a Finder-launched app bundle.
 /// Explicit activation prevents the visible SwiftUI window from remaining behind
 /// the terminal (or another app) as a non-key window.
+@MainActor
 final class WeVaultAppDelegate: NSObject, NSApplicationDelegate {
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls { AppState.shared.openRestoreURL(url) }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         activateStatusWindow()
     }
@@ -17,7 +22,7 @@ final class WeVaultAppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
-            NSApp.windows.first(where: { $0.canBecomeKey })?.makeKeyAndOrderFront(nil)
+            (NSApp.windows.first(where: { $0.title == "WeVault 恢复中心" }) ?? NSApp.windows.first(where: { $0.canBecomeKey }))?.makeKeyAndOrderFront(nil)
         }
     }
 }
@@ -25,7 +30,7 @@ final class WeVaultAppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct WeVaultApp: App {
     @NSApplicationDelegateAdaptor(WeVaultAppDelegate.self) private var appDelegate
-    @StateObject private var appState = AppState()
+    @StateObject private var appState = AppState.shared
 
     var body: some Scene {
         WindowGroup("WeVault 状态中心", id: "status") {
@@ -83,6 +88,7 @@ private struct MenuBarView: View {
     var body: some View {
         Text(appState.automationSummary)
         Button("打开状态中心") { openWindow(id: "status") }
+        Button("打开恢复中心") { appState.openRestoreCenter() }
         Button("立即扫描") {
             openWindow(id: "status")
             appState.requestManualScan()

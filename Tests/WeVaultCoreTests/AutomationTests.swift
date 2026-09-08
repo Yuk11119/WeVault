@@ -36,7 +36,7 @@ struct AutomationTests {
         var resumed = paused; resumed.automaticTasksEnabled = true; resumed.runIntervalHours = 6
         let resumedTask = try await scheduler.configure(settings: resumed)
         #expect(!resumedTask.isPaused)
-        #expect(resumedTask.nextRunAt == now.addingTimeInterval(21_600))
+        #expect(resumedTask.nextRunAt == now)
     }
 
     @Test("a failed run is linked only when the next scheduled cycle retries")
@@ -77,7 +77,7 @@ struct AutomationTests {
         #expect(run.stage == .finished)
         #expect(run.completedUnits == 3)
         #expect(run.totalUnits == 3)
-        #expect((try await scheduler.snapshot())?.logs.first?.event == "AUTOMATION_UPLOAD_FINISHED")
+        #expect((try await scheduler.snapshot())?.logs.first?.event == "AUTOMATION_FINISHED")
     }
 
     @Test("partial pipeline failures retain counts and fail the run")
@@ -94,7 +94,7 @@ struct AutomationTests {
         #expect(run.completedUnits == 2)
         #expect(run.totalUnits == 3)
         #expect(run.failureReason == "1 个对象校验失败")
-        #expect((try await scheduler.snapshot())?.logs.first?.event == "AUTOMATION_UPLOAD_FAILED")
+        #expect((try await scheduler.snapshot())?.logs.first?.event == "AUTOMATION_FAILED")
     }
 
     @Test("waiting task wakes immediately when prerequisites become ready")
@@ -147,7 +147,7 @@ struct AutomationTests {
 
     @Test("automatic upload candidates honor type switches but not release extensions")
     func uploadCandidateSelection() {
-        var settings = ProductSettings()
+        var settings = ProductSettings(largeFileThresholdMB: 0)
         settings.archiveImageHighLayers = false
         settings.allowedExtensions = ["zip"]
         let ordinary = candidate(path: "/ordinary.pdf", type: .ordinaryFile)
@@ -169,7 +169,7 @@ struct AutomationTests {
         let now = Date()
         let snapshot = archivedSnapshot(path: file.path, digest: digest, archivedAt: now.addingTimeInterval(-8 * 86_400))
         let engine = AutomaticReleaseRuleEngine()
-        #expect(engine.decision(for: snapshot, settings: ProductSettings(), now: now) == .eligible)
+        #expect(engine.decision(for: snapshot, settings: ProductSettings(largeFileThresholdMB: 0), now: now) == .eligible)
         var restricted = ProductSettings(); restricted.allowedExtensions = ["zip"]
         #expect(engine.decision(for: snapshot, settings: restricted, now: now) == .ineligible("扩展名不在允许范围"))
         #expect(engine.decision(for: snapshot, settings: ProductSettings(), now: now, fileExists: { _ in false }) == .ineligible("本地对象不存在"))
@@ -183,9 +183,9 @@ struct AutomationTests {
         let file = directory.appendingPathComponent("report.pdf"); try Data("archive".utf8).write(to: file)
         let digest = try sha256File(file); let now = Date()
         let snapshot = archivedSnapshot(path: file.path, digest: digest, archivedAt: now, localState: .quarantined, quarantinePath: file.path, quarantinedAt: now.addingTimeInterval(-8 * 86_400))
-        #expect(AutomaticReleaseRuleEngine().quarantineIsDue(snapshot, settings: ProductSettings(), now: now) == .eligible)
-        #expect(AutomaticReleaseRuleEngine().dueQuarantineSnapshots([snapshot], settings: ProductSettings(), now: now) == [snapshot])
-        #expect(AutomaticReleaseRuleEngine().quarantineIsDue(snapshot, settings: ProductSettings(), now: now.addingTimeInterval(-2 * 86_400)) == .ineligible("quarantine 保留期未到"))
+        #expect(AutomaticReleaseRuleEngine().quarantineIsDue(snapshot, settings: ProductSettings(largeFileThresholdMB: 0), now: now) == .eligible)
+        #expect(AutomaticReleaseRuleEngine().dueQuarantineSnapshots([snapshot], settings: ProductSettings(largeFileThresholdMB: 0), now: now) == [snapshot])
+        #expect(AutomaticReleaseRuleEngine().quarantineIsDue(snapshot, settings: ProductSettings(largeFileThresholdMB: 0), now: now.addingTimeInterval(-2 * 86_400)) == .ineligible("quarantine 保留期未到"))
     }
 
     private func archivedSnapshot(path: String, digest: String, archivedAt: Date, localState: LocalArchiveState = .localPresent, quarantinePath: String? = nil, quarantinedAt: Date? = nil) -> ArchivedFileSnapshot {

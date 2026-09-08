@@ -50,6 +50,7 @@ public final class ManagedCloudArchiveService: Sendable {
         accessToken: String,
         deviceId: String,
         store: ManifestStore,
+        includeAllSnapshots: Bool = true,
         progress: (@Sendable (CloudUploadProgress) async -> Void)? = nil
     ) async throws -> ManagedCloudUploadReport {
         let familyByPath = Dictionary(uniqueKeysWithValues: families.map { ($0.highOrRawPath, $0) })
@@ -58,10 +59,18 @@ public final class ManagedCloudArchiveService: Sendable {
         var verifiedCount = 0
         var failures: [ManagedCloudUploadFailure] = []
         for file in candidates {
+            try Task.checkCancellation()
+            if let existing = try store.archivedSnapshot(path: file.path), existing.archivedFile.sha256 == file.sha256, existing.archivedFile.sizeBytes == file.sizeBytes, existing.object.verifyStatus == .verified, existing.object.storageProvider == "WeVault Managed Cloud",
+               try store.workGet(String.self, scope: "managed-binding-owner", key: existing.binding.bindingID) == deviceId {
+                verifiedCount += 1
+                continue
+            }
             guard let sha = file.sha256 else { continue }
             do {
                 let resolved: (WeVaultObjectIndexEntry, WeVaultTemporaryCredentials?)
-                if let known = completed[sha] {
+                if let cached = try store.workGet(CloudObject.self, scope: "managed-verified-cache", key: deviceId + "|" + sha), cached.sizeBytes == file.sizeBytes {
+                    resolved = (WeVaultObjectIndexEntry(objectId: cached.cloudObjectID, sha256: cached.sha256, sizeBytes: cached.sizeBytes, verifiedAt: cached.verifiedAt ?? Date()), nil)
+                } else if let known = completed[sha] {
                     resolved = known
                 } else {
                     let outcome = try await ManagedCloudContractPipeline.upload(api: api, accessToken: accessToken, deviceId: deviceId, fileURL: URL(fileURLWithPath: file.path))
@@ -79,11 +88,14 @@ public final class ManagedCloudArchiveService: Sendable {
                 let binding = ArchiveBinding(bindingID: "binding-\(sha256Hex("\(file.path)|\(resolved.0.objectId)"))", filePath: file.path, cloudObjectID: resolved.0.objectId, archiveState: .verified, localState: .localPresent)
                 let archived = ArchivedFile(filePath: file.path, objectType: file.objectType, originalFilename: file.filename, relativePath: file.relativePath, accountHash: file.accountHash, accountName: file.accountName, month: file.month, sizeBytes: file.sizeBytes, sha256: sha, mtime: file.mtime, familyID: familyByPath[file.path]?.id, displayOrPlaybackPath: familyByPath[file.path]?.displayOrPlaybackPath, bubbleOrThumbPath: familyByPath[file.path]?.bubbleOrThumbPath, archivedAt: Date(), updatedAt: Date())
                 try store.saveCloudObject(cloud, binding: binding, archivedFile: archived)
+                try store.workPut(scope: "managed-verified-cache", key: deviceId + "|" + sha, value: cloud)
+                try store.workPut(scope: "managed-binding-owner", key: binding.bindingID, value: deviceId)
                 try store.updateFileStatus(path: file.path, status: .verified)
                 try store.logOperation("MANAGED_UPLOAD_VERIFIED", detail: resolved.0.objectId)
                 verifiedCount += 1
                 await progress?(CloudUploadProgress(filePath: file.path, status: .verified))
             } catch {
+                if AutomationFailure.isFatal(error) { throw error }
                 try? store.updateFileStatus(path: file.path, status: .uploadFailed)
                 if let diagnostic = Self.safeStorageDiagnostic(error.localizedDescription) {
                     try? store.logDiagnosticOperation("MANAGED_UPLOAD_FAILED", diagnostic: diagnostic)
@@ -95,11 +107,19 @@ public final class ManagedCloudArchiveService: Sendable {
             }
         }
         return ManagedCloudUploadReport(
-            snapshots: try store.cloudArchiveSnapshots(),
+            snapshots: includeAllSnapshots ? try store.cloudArchiveSnapshots() : [:],
             attemptedCount: candidates.count,
             verifiedCount: verifiedCount,
             failures: failures
         )
+    }
+
+    public func isAuthorizedArchive(_ snapshot: ArchivedFileSnapshot, api: WeVaultAPIClient, accessToken: String, deviceID: String, store: ManifestStore) async throws -> Bool {
+        if try store.workGet(String.self, scope: "managed-binding-owner", key: snapshot.binding.bindingID) == deviceID { return true }
+        let matches = try await api.fallback(accessToken: accessToken, deviceId: deviceID, sha256: snapshot.object.sha256)
+        guard matches.contains(where: { $0.objectId == snapshot.object.cloudObjectID && $0.sha256 == snapshot.archivedFile.sha256 && $0.sizeBytes == snapshot.archivedFile.sizeBytes }) else { return false }
+        try store.workPut(scope: "managed-binding-owner", key: snapshot.binding.bindingID, value: deviceID)
+        return true
     }
 
     private static func safeStorageDiagnostic(_ description: String) -> String? {

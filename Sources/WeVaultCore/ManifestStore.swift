@@ -8,12 +8,13 @@ public final class ManifestStore: @unchecked Sendable {
     private var cipher: ManifestCipher!
     public private(set) var recoveryState: ManifestRecoveryState = .ready
 
-    public init(databaseURL: URL = ManifestStore.defaultDatabaseURL(), keyProvider: any ManifestKeyProvider = KeychainManifestKeyProvider.shared) throws {
+    public init(databaseURL: URL = ManifestStore.defaultDatabaseURL(), keyProvider: (any ManifestKeyProvider)? = nil) throws {
+        let keyProvider = keyProvider ?? DevelopmentIsolation.keyProvider
         self.databaseURL = databaseURL
         self.keyProvider = keyProvider
         let existed = FileManager.default.fileExists(atPath: databaseURL.path)
         // A missing production manifest after a key was provisioned is not a first launch.
-        if !existed, databaseURL == Self.defaultDatabaseURL(), try keyProvider.existingKey() != nil {
+        if !existed, databaseURL == Self.defaultDatabaseURL(), DevelopmentIsolation.root == nil, try keyProvider.existingKey() != nil {
             recoveryState = .needsCloudIndexFallback
             throw WeVaultError.manifest(.missingNeedsCloudIndexFallback)
         }
@@ -21,6 +22,7 @@ public final class ManifestStore: @unchecked Sendable {
         if sqlite3_open(databaseURL.path, &db) != SQLITE_OK {
             throw WeVaultError.manifest(.sqliteCorrupt)
         }
+        sqlite3_busy_timeout(db, 5000)
         try execute("PRAGMA journal_mode=WAL")
         // Encrypted identifiers use authenticated ciphertext with independent nonces; SQLite's
         // plaintext foreign-key comparison is therefore replaced by keyed token joins.
@@ -73,8 +75,17 @@ public final class ManifestStore: @unchecked Sendable {
     }
 
     public static func defaultDatabaseURL() -> URL {
+        if let root = DevelopmentIsolation.root { return root.appendingPathComponent("archive.sqlite") }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return base.appendingPathComponent("WeVault", isDirectory: true).appendingPathComponent("archive.sqlite")
+    }
+
+    public func hasPendingRelease(bindingID: String) throws -> Bool {
+        try workGet(ReleaseJournal.self, scope: "release-journal", key: bindingID) != nil
+    }
+
+    public func reopen() throws -> ManifestStore {
+        try ManifestStore(databaseURL: databaseURL, keyProvider: keyProvider)
     }
 
     public func save(scanResult: ScanResult) throws {
@@ -101,6 +112,8 @@ public final class ManifestStore: @unchecked Sendable {
     }
 
     private func migrate() throws {
+        try execute("CREATE TABLE IF NOT EXISTS pipeline_records (id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, token TEXT NOT NULL, grouping TEXT, payload BLOB NOT NULL, UNIQUE(scope, token))")
+        try execute("CREATE INDEX IF NOT EXISTS pipeline_group ON pipeline_records(scope, grouping)")
         try execute("""
         CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY,
@@ -544,7 +557,19 @@ public final class ManifestStore: @unchecked Sendable {
     }
 
     public func archivedFileSnapshots() throws -> [String: ArchivedFileSnapshot] {
-        let sql = """
+        Dictionary(try readArchivedSnapshots().map { ($0.archivedFile.filePath, $0) }, uniquingKeysWith: { _, last in last })
+    }
+
+    public func archivedFileSnapshot(bindingID: String) throws -> ArchivedFileSnapshot? {
+        try readArchivedSnapshots(bindingID: bindingID).first
+    }
+
+    public func archivedFilePage(limit: Int = 50, offset: Int = 0) throws -> [ArchivedFileSnapshot] {
+        try readArchivedSnapshots(limit: min(100, max(1, limit)), offset: max(0, offset))
+    }
+
+    private func readArchivedSnapshots(bindingID: String? = nil, limit: Int? = nil, offset: Int = 0) throws -> [ArchivedFileSnapshot] {
+        var sql = """
         SELECT af.file_path, af.object_type, af.original_filename, af.relative_path, af.account_hash, af.account_name,
                af.month, af.size_bytes, af.sha256, af.mtime, af.family_id, af.display_or_playback_path,
                af.bubble_or_thumb_path, af.archived_at, af.updated_at,
@@ -558,9 +583,14 @@ public final class ManifestStore: @unchecked Sendable {
         JOIN archive_bindings ab ON ab.file_path_token = af.file_path_token
         JOIN cloud_objects co ON co.cloud_object_token = ab.cloud_object_token
         """
-        var snapshots: [String: ArchivedFileSnapshot] = [:]
+        if bindingID != nil { sql += " WHERE ab.binding_token = ?" }
+        sql += " ORDER BY af.archived_at DESC, ab.binding_token ASC"
+        if let limit { sql += " LIMIT \(limit) OFFSET \(offset)" }
+        var snapshots: [ArchivedFileSnapshot] = []
         try withStatement(sql) { stmt in
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            if let bindingID { bindText(stmt, 1, cipher.token(bindingID, domain: "archive_bindings.binding_id")) }
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
                 let fileToken = columnText(stmt, 38), bindingToken = columnText(stmt, 39)
                 let archivedFile = try readArchivedFile(stmt, token: fileToken)
                 let binding = ArchiveBinding(
@@ -581,8 +611,10 @@ public final class ManifestStore: @unchecked Sendable {
                     placeholderSize: optionalInt64(stmt, 27)
                 )
                 let object = try readCloudObject(stmt, offset: 28, token: columnText(stmt, 40))
-                snapshots[archivedFile.filePath] = ArchivedFileSnapshot(archivedFile: archivedFile, binding: binding, object: object)
+                snapshots.append(ArchivedFileSnapshot(archivedFile: archivedFile, binding: binding, object: object))
+                status = sqlite3_step(stmt)
             }
+            guard status == SQLITE_DONE else { throw WeVaultError.sqlite("无法读取归档记录") }
         }
         return snapshots
     }
@@ -658,14 +690,136 @@ public final class ManifestStore: @unchecked Sendable {
         try execute("BEGIN IMMEDIATE TRANSACTION")
         do {
             try upsert(object)
-            try upsert(binding)
-            try upsert(archivedFile)
+            if let existing = try archivedFileSnapshot(bindingID: binding.bindingID),
+               existing.archivedFile.sha256 == archivedFile.sha256,
+               existing.archivedFile.sizeBytes == archivedFile.sizeBytes {
+                // Repeated uploads must not reset cooling, restore or quarantine state.
+            } else {
+                try upsert(binding)
+                try upsert(archivedFile)
+            }
             try refreshRefCount(cloudObjectID: object.cloudObjectID)
             try execute("COMMIT")
         } catch {
             try? execute("ROLLBACK")
             throw error
         }
+    }
+
+    // Encrypted disk-backed work records. Scope names never contain user paths.
+    public func workPut<T: Encodable>(scope: String, key: String, value: T, group: String? = nil) throws {
+        let token = cipher.token(key, domain: scope)
+        let json = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
+        try withStatement("INSERT INTO pipeline_records(scope,token,grouping,payload) VALUES(?,?,?,?) ON CONFLICT(scope,token) DO UPDATE SET payload=excluded.payload,grouping=excluded.grouping") { stmt in
+            bindText(stmt, 1, scope); bindText(stmt, 2, token)
+            bindOptionalText(stmt, 3, group.map { cipher.token($0, domain: scope + ".group") })
+            bindData(stmt, 4, try encrypted(json, table: scope, column: "payload", token: token)); try stepDone(stmt)
+        }
+    }
+
+    public func workGet<T: Decodable>(_ type: T.Type, scope: String, key: String) throws -> T? {
+        var value: T?
+        let token = cipher.token(key, domain: scope)
+        try withStatement("SELECT payload FROM pipeline_records WHERE scope=? AND token=?") { stmt in
+            bindText(stmt, 1, scope); bindText(stmt, 2, token)
+            let status = sqlite3_step(stmt)
+            if status == SQLITE_ROW {
+                let json = try decryptColumn(stmt, 0, table: scope, column: "payload", token: token)
+                value = try JSONDecoder().decode(T.self, from: Data(json.utf8))
+            } else if status != SQLITE_DONE { throw WeVaultError.sqlite(lastError) }
+        }
+        return value
+    }
+
+    public func workPage<T: Decodable>(_ type: T.Type, scope: String, after: Int64 = 0, limit: Int = 50) throws -> [(id: Int64, value: T)] {
+        var rows: [(Int64, T)] = []
+        try withStatement("SELECT id,token,payload FROM pipeline_records WHERE scope=? AND id>? ORDER BY id LIMIT ?") { stmt in
+            bindText(stmt, 1, scope); sqlite3_bind_int64(stmt, 2, after); sqlite3_bind_int(stmt, 3, Int32(min(100, max(1, limit))))
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
+                let json = try decryptColumn(stmt, 2, table: scope, column: "payload", token: columnText(stmt, 1))
+                rows.append((sqlite3_column_int64(stmt, 0), try JSONDecoder().decode(T.self, from: Data(json.utf8))))
+                status = sqlite3_step(stmt)
+            }
+            guard status == SQLITE_DONE else { throw WeVaultError.sqlite(lastError) }
+        }
+        return rows
+    }
+
+    public func workCount(scope: String, group: String) throws -> Int {
+        var count = 0
+        try withStatement("SELECT COUNT(*) FROM pipeline_records WHERE scope=? AND grouping=?") { stmt in
+            bindText(stmt, 1, scope); bindText(stmt, 2, cipher.token(group, domain: scope + ".group"))
+            guard sqlite3_step(stmt) == SQLITE_ROW else { throw WeVaultError.sqlite(lastError) }
+            count = Int(sqlite3_column_int(stmt, 0))
+        }
+        return count
+    }
+
+    public func workDelete(scope: String, key: String? = nil) throws {
+        try withStatement("DELETE FROM pipeline_records WHERE scope=?" + (key == nil ? "" : " AND token=?")) { stmt in
+            bindText(stmt, 1, scope)
+            if let key { bindText(stmt, 2, cipher.token(key, domain: scope)) }
+            try stepDone(stmt)
+        }
+    }
+
+    public func readTransaction<T>(_ body: () throws -> T) throws -> T {
+        try execute("BEGIN DEFERRED TRANSACTION")
+        do {
+            let value = try body()
+            try execute("COMMIT")
+            return value
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
+    public func discardAbandonedScans() throws {
+        let current = try currentScanSession()
+        var cursor: Int64 = 0
+        while true {
+            let rows = try workPage(String.self, scope: "scan-sessions", after: cursor)
+            if rows.isEmpty { break }
+            for row in rows {
+                cursor = row.id
+                if row.value == current { continue }
+                for suffix in [".files", ".families", ".members", ".metadata", ".groups"] { try workDelete(scope: row.value + suffix) }
+                try workDelete(scope: "scan-sessions", key: row.value)
+            }
+        }
+    }
+
+    public func publishScan(session: String) throws {
+        // Publishing is an atomic pointer change; aborted scans leave the previous view intact.
+        try workPut(scope: "scan-publication", key: "current", value: session)
+    }
+
+    public func currentScanSession() throws -> String? {
+        try workGet(String.self, scope: "scan-publication", key: "current")
+    }
+
+    public func archivedSnapshot(path: String) throws -> ArchivedFileSnapshot? {
+        var binding: String?
+        try withStatement("SELECT binding_id,binding_token FROM archive_bindings WHERE file_path_token=? ORDER BY rowid DESC LIMIT 1") { stmt in
+            bindText(stmt, 1, cipher.token(path, domain: "files.path"))
+            let status = sqlite3_step(stmt)
+            if status == SQLITE_ROW { binding = try decryptColumn(stmt, 0, table: "archive_bindings", column: "binding_id", token: columnText(stmt, 1)) }
+            else if status != SQLITE_DONE { throw WeVaultError.sqlite(lastError) }
+        }
+        return try binding.flatMap { try archivedFileSnapshot(bindingID: $0) }
+    }
+
+    public func archiveBindingPage(after: Int64 = 0) throws -> [(id: Int64, bindingID: String)] {
+        var rows: [(Int64, String)] = []
+        try withStatement("SELECT rowid,binding_id,binding_token FROM archive_bindings WHERE rowid>? ORDER BY rowid LIMIT 50") { stmt in
+            sqlite3_bind_int64(stmt, 1, after)
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
+                rows.append((sqlite3_column_int64(stmt, 0), try decryptColumn(stmt, 1, table: "archive_bindings", column: "binding_id", token: columnText(stmt, 2))))
+                status = sqlite3_step(stmt)
+            }
+            guard status == SQLITE_DONE else { throw WeVaultError.sqlite(lastError) }
+        }
+        return rows
     }
 
     public func updateFileStatus(path: String, status: ArchiveStatus) throws {
@@ -755,7 +909,7 @@ public final class ManifestStore: @unchecked Sendable {
 
     public func saveAutomationRun(_ run: AutomationTaskRun) throws {
         try withStatement("INSERT OR REPLACE INTO automation_task_runs (id, task_id, status, stage, completed_units, total_units, failure_reason, retry_of_run_id, started_at, finished_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") { stmt in
-            bindText(stmt, 1, run.id); bindText(stmt, 2, run.taskID); bindText(stmt, 3, run.status.rawValue); bindText(stmt, 4, run.stage.rawValue); sqlite3_bind_int(stmt, 5, Int32(run.completedUnits)); sqlite3_bind_int(stmt, 6, Int32(run.totalUnits)); bindOptionalText(stmt, 7, run.failureReason); bindOptionalText(stmt, 8, run.retryOfRunID); bindOptionalDate(stmt, 9, run.startedAt); bindOptionalDate(stmt, 10, run.finishedAt); sqlite3_bind_double(stmt, 11, Date().timeIntervalSince1970); try stepDone(stmt)
+            bindText(stmt, 1, run.id); bindText(stmt, 2, run.taskID); bindText(stmt, 3, run.status.rawValue); bindText(stmt, 4, run.stage.rawValue); sqlite3_bind_int(stmt, 5, Int32(run.completedUnits)); sqlite3_bind_int(stmt, 6, Int32(run.totalUnits)); try bindOptionalEncrypted(stmt, 7, run.failureReason, table: "automation_task_runs", column: "failure_reason", token: run.id); bindOptionalText(stmt, 8, run.retryOfRunID); bindOptionalDate(stmt, 9, run.startedAt); bindOptionalDate(stmt, 10, run.finishedAt); sqlite3_bind_double(stmt, 11, Date().timeIntervalSince1970); try stepDone(stmt)
         }
     }
 
@@ -763,20 +917,25 @@ public final class ManifestStore: @unchecked Sendable {
         var run: AutomationTaskRun?
         try withStatement("SELECT id, task_id, status, stage, completed_units, total_units, failure_reason, retry_of_run_id, started_at, finished_at FROM automation_task_runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1") { stmt in
             bindText(stmt, 1, taskID)
-            if sqlite3_step(stmt) == SQLITE_ROW { run = AutomationTaskRun(id: columnText(stmt, 0), taskID: columnText(stmt, 1), status: AutomationRunStatus(rawValue: columnText(stmt, 2)) ?? .failed, stage: AutomationStage(rawValue: columnText(stmt, 3)) ?? .finished, completedUnits: Int(sqlite3_column_int(stmt, 4)), totalUnits: Int(sqlite3_column_int(stmt, 5)), failureReason: optionalText(stmt, 6), retryOfRunID: optionalText(stmt, 7), startedAt: optionalDate(stmt, 8), finishedAt: optionalDate(stmt, 9)) }
+            if sqlite3_step(stmt) == SQLITE_ROW { run = AutomationTaskRun(id: columnText(stmt, 0), taskID: columnText(stmt, 1), status: AutomationRunStatus(rawValue: columnText(stmt, 2)) ?? .failed, stage: AutomationStage(rawValue: columnText(stmt, 3)) ?? .finished, completedUnits: Int(sqlite3_column_int(stmt, 4)), totalUnits: Int(sqlite3_column_int(stmt, 5)), failureReason: sqlite3_column_type(stmt, 6) == SQLITE_BLOB ? try decryptOptionalColumn(stmt, 6, table: "automation_task_runs", column: "failure_reason", token: columnText(stmt, 0)) : optionalText(stmt, 6), retryOfRunID: sqlite3_column_type(stmt, 7) == SQLITE_BLOB ? try decryptOptionalColumn(stmt, 7, table: "automation_task_runs", column: "retry_of_run_id", token: columnText(stmt, 0)) : optionalText(stmt, 7), startedAt: optionalDate(stmt, 8), finishedAt: optionalDate(stmt, 9)) }
         }
         return run
     }
 
     public func logAutomation(runID: String?, event: String, detail: String?) throws {
-        try withStatement("INSERT INTO automation_task_logs (run_id, event, detail, created_at) VALUES (?, ?, ?, ?)") { stmt in bindOptionalText(stmt, 1, runID); bindText(stmt, 2, event); bindOptionalText(stmt, 3, detail); sqlite3_bind_double(stmt, 4, Date().timeIntervalSince1970); try stepDone(stmt) }
+        let token = UUID().uuidString
+        try withStatement("INSERT INTO automation_task_logs (run_id, event, detail, created_at, id_token) VALUES (?, ?, ?, ?, ?)") { stmt in
+            bindOptionalText(stmt, 1, runID); bindText(stmt, 2, event)
+            try bindOptionalEncrypted(stmt, 3, detail, table: "automation_task_logs", column: "detail", token: token)
+            sqlite3_bind_double(stmt, 4, Date().timeIntervalSince1970); bindText(stmt, 5, token); try stepDone(stmt)
+        }
     }
 
     public func recentAutomationLogs(taskID: String, limit: Int = 20) throws -> [AutomationTaskLog] {
         var logs: [AutomationTaskLog] = []; let safeLimit = min(max(limit, 1), 200)
-        try withStatement("SELECT l.id, l.run_id, l.event, l.detail, l.created_at FROM automation_task_logs l JOIN automation_task_runs r ON r.id = l.run_id WHERE r.task_id = ? ORDER BY l.id DESC LIMIT ?") { stmt in
+        try withStatement("SELECT l.id, l.run_id, l.event, l.detail, l.created_at, l.id_token FROM automation_task_logs l JOIN automation_task_runs r ON r.id = l.run_id WHERE r.task_id = ? ORDER BY l.id DESC LIMIT ?") { stmt in
             bindText(stmt, 1, taskID); sqlite3_bind_int(stmt, 2, Int32(safeLimit))
-            while sqlite3_step(stmt) == SQLITE_ROW { logs.append(AutomationTaskLog(id: sqlite3_column_int64(stmt, 0), runID: optionalText(stmt, 1), event: columnText(stmt, 2), detail: optionalText(stmt, 3), createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4)))) }
+            while sqlite3_step(stmt) == SQLITE_ROW { logs.append(AutomationTaskLog(id: sqlite3_column_int64(stmt, 0), runID: optionalText(stmt, 1), event: columnText(stmt, 2), detail: sqlite3_column_type(stmt, 3) == SQLITE_BLOB ? try decryptOptionalColumn(stmt, 3, table: "automation_task_logs", column: "detail", token: columnText(stmt, 5)) : optionalText(stmt, 3), createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4)))) }
         }
         return logs
     }

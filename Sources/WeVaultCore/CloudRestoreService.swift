@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public enum RestoreDestination: Sendable {
     case defaultDownloads
@@ -46,11 +47,26 @@ public final class CloudRestoreService: Sendable {
         objectKey: String,
         store: ManifestStore
     ) async throws -> CloudRestoreResult {
+        let operationKey = OperationCoordinator.bindingKey(snapshot.binding.bindingID, store: store)
+        try OperationCoordinator.shared.acquire(operationKey)
+        defer { OperationCoordinator.shared.release(operationKey) }
+        if case .originalPath = destination, try store.hasPendingRelease(bindingID: snapshot.binding.bindingID) {
+            // Infer the configured quarantine root from the durable journal for isolated stores.
+            let journal = try store.workGet(ReleaseJournal.self, scope: "release-journal", key: snapshot.binding.bindingID)!
+            let root = URL(fileURLWithPath: journal.quarantinePath).deletingLastPathComponent().deletingLastPathComponent()
+            try LocalReleaseService(quarantineRoot: root).prepareForRestore(bindingID: snapshot.binding.bindingID, store: store)
+        }
+        guard let snapshot = try store.archivedFileSnapshot(bindingID: snapshot.binding.bindingID) else {
+            throw WeVaultError.fileSystem("归档绑定不存在")
+        }
         guard snapshot.object.verifyStatus == .verified,
-              snapshot.binding.archiveState == .verified || snapshot.binding.archiveState == .restored || snapshot.binding.archiveState == .localReleased else {
+              snapshot.binding.archiveState == .verified || snapshot.binding.archiveState == .restored || snapshot.binding.archiveState == .localReleased || snapshot.binding.archiveState == .restoreFailed || snapshot.binding.archiveState == .restorePending else {
             throw WeVaultError.cloud("Only verified cloud objects can be restored")
         }
-        guard snapshot.binding.cloudObjectID == snapshot.object.cloudObjectID else {
+        guard snapshot.binding.cloudObjectID == snapshot.object.cloudObjectID,
+              snapshot.binding.filePath == snapshot.archivedFile.filePath,
+              snapshot.object.sha256 == snapshot.archivedFile.sha256,
+              snapshot.object.sizeBytes == snapshot.archivedFile.sizeBytes else {
             throw WeVaultError.cloud("Archive binding does not match cloud object")
         }
 
@@ -59,11 +75,12 @@ public final class CloudRestoreService: Sendable {
             if case .originalPath = destination { return true }
             return false
         }()
+        let previousLocalState = reconciledLocalState(snapshot)
         let now = Date()
         try store.updateRestoreState(
             bindingID: snapshot.binding.bindingID,
             archiveState: .restorePending,
-            localState: snapshot.binding.localState,
+            localState: previousLocalState,
             restoredAt: snapshot.binding.restoredAt,
             lastRestoreCheckAt: now
         )
@@ -76,7 +93,7 @@ public final class CloudRestoreService: Sendable {
             try store.updateRestoreState(
                 bindingID: snapshot.binding.bindingID,
                 archiveState: .restored,
-                localState: .restored,
+                localState: restoreToOriginalPath ? .restored : previousLocalState,
                 restoredAt: completedAt,
                 lastRestoreCheckAt: completedAt
             )
@@ -90,7 +107,7 @@ public final class CloudRestoreService: Sendable {
             try? store.updateRestoreState(
                 bindingID: snapshot.binding.bindingID,
                 archiveState: .restoreFailed,
-                localState: .restoreFailed,
+                localState: previousLocalState,
                 restoredAt: snapshot.binding.restoredAt,
                 lastRestoreCheckAt: Date()
             )
@@ -101,8 +118,10 @@ public final class CloudRestoreService: Sendable {
 
     private func downloadAndVerify(snapshot: ArchivedFileSnapshot, targetURL: URL, restoreToOriginalPath: Bool, client: any ObjectStorageClient, objectKey: String) async throws -> URL {
         let fileManager = FileManager.default
+        if restoreToOriginalPath { try validateRetainedLayers(snapshot) }
         try fileManager.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
+        try validateTargetType(targetURL)
         if fileManager.fileExists(atPath: targetURL.path) {
             let existingHash = try sha256File(targetURL)
             if existingHash == snapshot.archivedFile.sha256 {
@@ -110,7 +129,7 @@ public final class CloudRestoreService: Sendable {
             }
             if restoreToOriginalPath {
                 try Tombstone.validatePlaceholder(at: targetURL, binding: snapshot.binding)
-                try fileManager.removeItem(at: targetURL)
+                // Keep the placeholder until the download is verified.
             } else {
                 throw WeVaultError.fileSystem("Refusing to overwrite existing file at \(targetURL.path)")
             }
@@ -118,8 +137,9 @@ public final class CloudRestoreService: Sendable {
 
         let temporaryURL = targetURL.deletingLastPathComponent()
             .appendingPathComponent(".\(targetURL.lastPathComponent).wevault-download-\(UUID().uuidString)")
+        var preserveTemporary = false
         defer {
-            if fileManager.fileExists(atPath: temporaryURL.path) {
+            if !preserveTemporary && fileManager.fileExists(atPath: temporaryURL.path) {
                 try? fileManager.removeItem(at: temporaryURL)
             }
         }
@@ -133,12 +153,77 @@ public final class CloudRestoreService: Sendable {
         guard digest == snapshot.archivedFile.sha256 else {
             throw WeVaultError.cloud("Restored SHA-256 mismatch for \(snapshot.archivedFile.originalFilename)")
         }
-        try fileManager.moveItem(at: temporaryURL, to: targetURL)
+        try Task.checkCancellation()
+        if restoreToOriginalPath { try validateRetainedLayers(snapshot) }
+        try validateTargetType(targetURL)
+        if fileManager.fileExists(atPath: targetURL.path) {
+            guard restoreToOriginalPath else { throw WeVaultError.fileSystem("恢复目标已存在，请重试以选择新文件名") }
+            if try sha256File(targetURL) == snapshot.archivedFile.sha256 { return targetURL }
+            try Tombstone.validatePlaceholder(at: targetURL, binding: snapshot.binding)
+            // Swap atomically, retaining the displaced file until its identity is checked.
+            let status = temporaryURL.path.withCString { source in
+                targetURL.path.withCString { target in renamex_np(source, target, UInt32(RENAME_SWAP)) }
+            }
+            guard status == 0 else { throw WeVaultError.fileSystem("无法安全替换占位文件") }
+            do {
+                try validateTargetType(temporaryURL)
+                guard try sha256File(temporaryURL) == snapshot.binding.placeholderSHA256,
+                      Tombstone.isTombstone(temporaryURL) else {
+                    throw WeVaultError.fileSystem("占位文件在替换时发生变化")
+                }
+            } catch {
+                let rollback = temporaryURL.path.withCString { source in
+                    targetURL.path.withCString { target in renamex_np(source, target, UInt32(RENAME_SWAP)) }
+                }
+                if rollback != 0 { preserveTemporary = true }
+                throw WeVaultError.fileSystem("替换时目标发生变化，已尝试回滚；保留恢复入口和冲突副本")
+            }
+        } else {
+            let status = temporaryURL.path.withCString { source in
+                targetURL.path.withCString { target in renamex_np(source, target, UInt32(RENAME_EXCL)) }
+            }
+            guard status == 0 else { throw WeVaultError.fileSystem("目标已变化或无法写入，未覆盖现有文件") }
+        }
         let finalDigest = try sha256File(targetURL)
         guard finalDigest == snapshot.archivedFile.sha256 else {
             throw WeVaultError.cloud("Final restored SHA-256 mismatch for \(snapshot.archivedFile.originalFilename)")
         }
         return targetURL
+    }
+
+    /// Earlier versions wrote RESTORE_FAILED into the local state even when the
+    /// original/placeholder was untouched. Repair only that legacy failure state.
+    private func reconciledLocalState(_ snapshot: ArchivedFileSnapshot) -> LocalArchiveState {
+        guard snapshot.binding.localState == .restoreFailed else { return snapshot.binding.localState }
+        let target = URL(fileURLWithPath: snapshot.archivedFile.filePath)
+        if (try? Tombstone.validatePlaceholder(at: target, binding: snapshot.binding)) != nil { return .tombstoned }
+        if (try? sha256File(target)) == snapshot.archivedFile.sha256 { return .localPresent }
+        if let path = snapshot.binding.quarantinePath, FileManager.default.fileExists(atPath: path) { return .quarantined }
+        if !FileManager.default.fileExists(atPath: target.path) { return .localReleased }
+        return .restoreFailed
+    }
+
+    private func validateTargetType(_ url: URL) throws {
+        var info = stat()
+        if lstat(url.path, &info) == 0 {
+            guard (info.st_mode & S_IFMT) == S_IFREG else {
+                throw WeVaultError.fileSystem("恢复目标不是普通文件，拒绝覆盖或跟随符号链接")
+            }
+        } else if errno != ENOENT { throw WeVaultError.fileSystem("无法检查恢复目标") }
+    }
+
+    private func validateRetainedLayers(_ snapshot: ArchivedFileSnapshot) throws {
+        guard snapshot.archivedFile.objectType != .ordinaryFile else { return }
+        let file = snapshot.archivedFile
+        guard let display = file.displayOrPlaybackPath,
+              FileManager.default.fileExists(atPath: display) else {
+            throw WeVaultError.fileSystem("普通查看或播放层缺失，请改为下载目录恢复")
+        }
+        if file.objectType == .videoRawLayer {
+            guard let thumb = file.bubbleOrThumbPath, FileManager.default.fileExists(atPath: thumb) else {
+                throw WeVaultError.fileSystem("视频封面或缩略图缺失，请改为下载目录恢复")
+            }
+        }
     }
 
     private func removeMatchingQuarantineCopyIfNeeded(snapshot: ArchivedFileSnapshot, restoredURL: URL, store: ManifestStore) throws {
@@ -158,6 +243,11 @@ public final class CloudRestoreService: Sendable {
     }
 
     private func resolvedTargetURL(for archivedFile: ArchivedFile, destination: RestoreDestination) throws -> URL {
+        guard !archivedFile.originalFilename.isEmpty,
+              archivedFile.originalFilename != ".", archivedFile.originalFilename != "..",
+              !archivedFile.originalFilename.contains("/"), !archivedFile.originalFilename.contains("\u{0}") else {
+            throw WeVaultError.fileSystem("归档文件名无效")
+        }
         switch destination {
         case .defaultDownloads:
             return uniqueURL(in: Self.defaultRestoreDirectory(), filename: archivedFile.originalFilename)

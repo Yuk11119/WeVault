@@ -20,12 +20,20 @@ final class ManagedAccount: ObservableObject {
 
     private let service = "online.wevault.api"
     private let account = "managed-session-v1"
-    private let api = WeVaultAPIClient(baseURL: URL(string: "https://api.wevault.online")!)
+    private let api: WeVaultAPIClient
+    private let memoryOnly: Bool
+    private let permitsLogin: Bool
     private var record: ManagedAccountRecord?
 
-    init() { load() }
+    init(api: WeVaultAPIClient? = nil, memoryOnly: Bool = false) {
+        self.api = api ?? WeVaultAPIClient(baseURL: URL(string: "https://api.wevault.online")!)
+        self.memoryOnly = memoryOnly || DevelopmentIsolation.root != nil
+        self.permitsLogin = DevelopmentIsolation.root == nil || DevelopmentIsolation.permitsInteractiveAuthentication || api != nil
+        if !self.memoryOnly { load() }
+    }
 
     func login(email: String, password: String, displayName: String = Host.current().localizedName ?? "Mac") async throws {
+        guard permitsLogin else { throw WeVaultError.cloud("隔离测试模式不连接真实云端") }
         let session = try await api.login(email: email, password: password)
         let clientDeviceID = record?.clientDeviceID ?? UUID().uuidString
         let device = try await api.registerDevice(accessToken: session.accessToken, clientDeviceId: clientDeviceID, displayName: displayName)
@@ -62,11 +70,11 @@ final class ManagedAccount: ObservableObject {
 
     private func save(_ value: ManagedAccountRecord) throws {
         let data = try JSONEncoder().encode(value)
-        try writeKeychain(data); record = value; email = value.email; isReady = value.deviceID != nil
+        if !memoryOnly { try writeKeychain(data) }; record = value; email = value.email; isReady = value.deviceID != nil
     }
 
     private func remove() {
-        SecItemDelete([kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: account] as CFDictionary)
+        if !memoryOnly { SecItemDelete([kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: account] as CFDictionary) }
         record = nil; email = nil; isReady = false
     }
 

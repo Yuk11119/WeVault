@@ -10,9 +10,7 @@ struct DetailView: View {
     let archivedSnapshot: ArchivedFileSnapshot?
     let isRestoring: Bool
     let isReleasing: Bool
-    let onRestoreDefault: () -> Void
-    let onRestoreToDirectory: () -> Void
-    let onRestoreOriginalPath: () -> Void
+    let onOpenRestoreCenter: () -> Void
     let onQuarantineLocal: (Bool) -> Void
     let onRollbackLocal: () -> Void
     let onFinalizeLocalRelease: () -> Void
@@ -24,13 +22,6 @@ struct DetailView: View {
 
     var uploadStatus: UserUploadStatus? {
         file.map { UserUploadStatus(file: $0, cloudSnapshot: cloudSnapshot) }
-    }
-
-    var canRestore: Bool {
-        guard let archivedSnapshot else { return false }
-        return archivedSnapshot.object.verifyStatus == .verified &&
-            (archivedSnapshot.binding.archiveState == .verified || archivedSnapshot.binding.archiveState == .restored || archivedSnapshot.binding.archiveState == .localReleased) &&
-            !isRestoring
     }
 
     var canQuarantineLocal: Bool {
@@ -130,19 +121,8 @@ struct DetailView: View {
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
-                                HStack {
-                                    Button("恢复到下载目录", action: onRestoreDefault)
-                                        .disabled(!canRestore)
-                                    Button("选择目录恢复", action: onRestoreToDirectory)
-                                        .disabled(!canRestore)
-                                }
-                                if file.objectType == .imageHighLayer || file.objectType == .videoRawLayer {
-                                    Button("受控恢复到原微信路径", action: onRestoreOriginalPath)
-                                        .disabled(!canRestore)
-                                    Text("不会覆盖已有的不同文件；不会生成占位文件。")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
+                                Button("打开恢复中心", action: onOpenRestoreCenter)
+                                    .disabled(isRestoring || isReleasing)
                             }
                         }
 

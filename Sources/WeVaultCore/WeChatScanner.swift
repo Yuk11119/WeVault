@@ -66,6 +66,173 @@ public final class WeChatScanner: Sendable {
         )
     }
 
+    /// Pull-based delivery provides backpressure: enumeration waits for each consumer batch.
+    public func scanBatches(root: URL, options: ScanOptions, store: ManifestStore,
+                            session: String = UUID().uuidString,
+                            progress: @Sendable (AutomationStage, Int) async throws -> Void = { _, _ in },
+                            consume: @Sendable ([FileRecord], [FamilyRecord]) async throws -> Void) async throws -> String {
+        try store.discardAbandonedScans()
+        try store.workPut(scope: "scan-sessions", key: session, value: session)
+        let accounts = try accountDirectories(for: root.standardizedFileURL)
+        let filesScope = session + ".files", membersScope = session + ".members"
+        var batch: [FileRecord] = [], batchFamilies: [FamilyRecord] = []
+        var count = 0
+        var playbackStats = ByteCountStats()
+        func deliver() async throws {
+            guard !batch.isEmpty else { return }
+            try Task.checkCancellation()
+            try await progress(.hashing, count)
+            for index in batch.indices where batch[index].status != .notArchivable {
+                do {
+                    batch[index].sha256 = try sha256File(URL(fileURLWithPath: batch[index].path))
+                    batch[index].status = .hashed
+                } catch is CancellationError { throw CancellationError() }
+                catch { batch[index].status = .notArchivable; batch[index].candidateReason = "文件无法读取或扫描时已变化" }
+            }
+            for file in batch { try store.workPut(scope: filesScope, key: file.path, value: file, group: file.objectType == .ordinaryFile ? file.sha256 : nil) }
+            for family in batchFamilies { try store.workPut(scope: session + ".families", key: family.highOrRawPath, value: family) }
+            try await consume(batch, batchFamilies)
+            batch.removeAll(keepingCapacity: true); batchFamilies.removeAll(keepingCapacity: true)
+            try await progress(.scanning, count)
+        }
+        do {
+            for account in accounts {
+                let accountHash = String(sha256Hex(account.lastPathComponent).prefix(16))
+                for folder in ["file", "attach", "video"] {
+                    let directory = account.appendingPathComponent("msg/" + folder)
+                    let partitions: [URL]
+                    if folder == "attach" {
+                        let resources = try scanDirectories(directory)
+                        partitions = try resources.sorted { $0.path < $1.path }.flatMap { resource in
+                            guard (try resource.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true else { return [URL]() }
+                            return try FileManager.default.contentsOfDirectory(at: resource, includingPropertiesForKeys: [.isDirectoryKey], options: .skipsHiddenFiles).filter { isMonth($0.lastPathComponent) }.sorted { $0.path < $1.path }
+                        }
+                    } else {
+                        partitions = (try scanDirectories(directory)).filter { isMonth($0.lastPathComponent) }.sorted { $0.path < $1.path }
+                    }
+                    for partition in partitions {
+                        guard let enumerator = FileManager.default.enumerator(at: partition, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { continue }
+                        for case let url as URL in enumerator {
+                            try Task.checkCancellation()
+                            let attributes = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                            guard attributes.isRegularFile == true, attributes.isSymbolicLink != true else { continue }
+                            let relative = url.pathRelative(to: directory)
+                            let parts = relative.split(separator: "/").map(String.init)
+                            let month = parts.first(where: isMonth)
+                            if folder == "file" {
+                                guard let first = parts.first, isMonth(first) else { continue }
+                                if options.knownPlaceholderPaths.contains(url.path) { continue }
+                                if let existing = try store.archivedSnapshot(path: url.path), existing.binding.placeholderPath == url.path { continue }
+                                let st = try fileStat(url.path)
+                                let placeholder = Tombstone.isTombstone(url)
+                                batch.append(FileRecord(path: url.path, relativePath: url.pathRelative(to: account.deletingLastPathComponent()), objectType: .ordinaryFile, accountHash: accountHash, accountName: account.lastPathComponent, filename: url.lastPathComponent, fileExtension: url.pathExtension.lowercased(), month: month, sizeBytes: st.size, allocatedBytes: st.allocated, inode: st.inode, nlink: st.nlink, mtime: st.mtime, status: placeholder ? .notArchivable : .discovered, candidateReason: placeholder ? "WeVault 占位文件不可重新归档" : nil))
+                                count += 1
+                                if batch.count == 50 { try await deliver() }
+                            } else {
+                                let prefix: String, role: String
+                                if folder == "attach" {
+                                    guard let found = datFamilyPrefix(url.lastPathComponent) else { continue }
+                                    prefix = found; role = imageRole(url.lastPathComponent)
+                                } else {
+                                    guard let found = videoFamilyPrefixAndRole(url.lastPathComponent) else { continue }
+                                    prefix = found.prefix; role = found.role
+                                }
+                                let key = folder == "attach"
+                                    ? [accountHash, account.lastPathComponent, month ?? "", resourceIDForAttachPath(url.pathComponents) ?? "", prefix].joined(separator: "|")
+                                    : [accountHash, account.lastPathComponent, month ?? "", prefix].joined(separator: "|")
+                                var member = try store.workGet(ScanFamilyMembers.self, scope: membersScope, key: folder + key) ?? ScanFamilyMembers(key: key, image: folder == "attach", paths: [:])
+                                member.paths[role] = url
+                                try store.workPut(scope: membersScope, key: folder + key, value: member)
+                                if folder == "video", role == "play", let size = try? fileStat(url.path).size { playbackStats.count += 1; playbackStats.bytes += size }
+                                // Emit complete primary families as soon as their retained layers arrive.
+                                // _h_M-only families wait until enumeration resolves _h precedence.
+                                if !member.image || member.paths["high"] != nil {
+                                    let ready = member.image ? buildImageFamilies([key: member.paths]) : buildVideoFamilies([key: member.paths])
+                                    for family in ready where family.isCandidate && family.bubbleOrThumbPath != nil {
+                                        if try store.workGet(FamilyRecord.self, scope: session + ".families", key: family.highOrRawPath) == nil,
+                                           !batch.contains(where: { $0.path == family.highOrRawPath }) {
+                                            batch.append(contentsOf: try recordsForCandidateFamilies([family])); batchFamilies.append(family); count += 1
+                                            if batch.count == 50 { try await deliver() }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        try await deliver()
+                    }
+                }
+            }
+            var cursor: Int64 = 0
+            while true {
+                let rows = try store.workPage(ScanFamilyMembers.self, scope: membersScope, after: cursor)
+                if rows.isEmpty { break }
+                for row in rows {
+                    try Task.checkCancellation()
+                    let member = row.value
+                    let families = member.image ? buildImageFamilies([member.key: member.paths]) : buildVideoFamilies([member.key: member.paths])
+                    for family in families {
+                        if try store.workGet(FileRecord.self, scope: filesScope, key: family.highOrRawPath) == nil {
+                            batch.append(contentsOf: try recordsForCandidateFamilies([family])); batchFamilies.append(family); count += 1
+                        }
+                    }
+                    if batch.count >= 50 { try await deliver() }
+                    cursor = row.id
+                }
+            }
+            try await deliver()
+            // Disk-indexed grouping spans account and batch boundaries without retaining paths.
+            cursor = 0
+            var summary = ScanSummary.zero
+            while true {
+                let rows = try store.workPage(FileRecord.self, scope: filesScope, after: cursor)
+                if rows.isEmpty { break }
+                var duplicates: [FileRecord] = []
+                var groups: [DuplicateGroup] = []
+                for row in rows {
+                    try Task.checkCancellation()
+                    var file = row.value
+                    if file.objectType == .ordinaryFile, let sha = file.sha256,
+                       try store.workCount(scope: filesScope, group: sha) > 1 {
+                        file.duplicateGroupID = "dup-" + sha
+                        if file.status != .verified && file.status != .uploadFailed { file.status = .duplicateGrouped }
+                        if try store.workGet(Bool.self, scope: session + ".groups", key: sha) == nil {
+                            let n = try store.workCount(scope: filesScope, group: sha)
+                            groups.append(DuplicateGroup(id: "dup-" + sha, sha256: sha, sizeBytes: file.sizeBytes, duplicateCount: n, reclaimableBytes: Int64(n - 1) * file.sizeBytes, paths: []))
+                            try store.workPut(scope: session + ".groups", key: sha, value: true)
+                        }
+                        try store.workPut(scope: filesScope, key: file.path, value: file, group: sha)
+                        if file.sizeBytes < options.largeFileThresholdBytes { duplicates.append(file) }
+                    }
+                    cursor = row.id
+                }
+                summary = summary.adding(summarize(files: rows.map(\.value), duplicateGroups: groups, threshold: options.largeFileThresholdBytes, videoPlaybackStats: ByteCountStats()))
+                if !duplicates.isEmpty { try await consume(duplicates, []) }
+            }
+            try Task.checkCancellation()
+            try store.workPut(scope: session + ".metadata", key: "root", value: root.standardizedFileURL.path)
+            summary = summary.adding(summarize(files: [], duplicateGroups: [], threshold: options.largeFileThresholdBytes, videoPlaybackStats: playbackStats))
+            try store.workPut(scope: session + ".metadata", key: "summary", value: summary)
+            try store.workDelete(scope: session + ".groups")
+            let old = try store.currentScanSession()
+            try store.publishScan(session: session)
+            try? store.workDelete(scope: membersScope)
+            if let old, old != session {
+                for suffix in [".files", ".families", ".metadata"] { try? store.workDelete(scope: old + suffix) }
+                try? store.workDelete(scope: "scan-sessions", key: old)
+            }
+            return session
+        } catch {
+            for suffix in [".files", ".families", ".members", ".metadata", ".groups"] { try? store.workDelete(scope: session + suffix) }
+            try? store.workDelete(scope: "scan-sessions", key: session)
+            throw error
+        }
+    }
+
+    private func scanDirectories(_ directory: URL) throws -> [URL] {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey], options: .skipsHiddenFiles)
+    }
+
     private func accountDirectories(for root: URL) throws -> [URL] {
         if root.lastPathComponent.hasPrefix("wxid_") {
             return [root]
@@ -397,4 +564,10 @@ public final class WeChatScanner: Sendable {
 private struct ByteCountStats {
     var count = 0
     var bytes: Int64 = 0
+}
+
+private struct ScanFamilyMembers: Codable {
+    let key: String
+    let image: Bool
+    var paths: [String: URL]
 }

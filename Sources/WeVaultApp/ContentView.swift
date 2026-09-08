@@ -38,17 +38,9 @@ struct ContentView: View {
                 archivedSnapshot: selectedArchiveSnapshot,
                 isRestoring: viewModel.isRestoring,
                 isReleasing: viewModel.isReleasing,
-                onRestoreDefault: {
+                onOpenRestoreCenter: {
                     if let selectedArchiveSnapshot {
-                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .defaultDownloads, managedAccount: managedAccount, selfManagedCloud: selfManagedCloud)
-                    }
-                },
-                onRestoreToDirectory: {
-                    chooseRestoreDirectory()
-                },
-                onRestoreOriginalPath: {
-                    if let selectedArchiveSnapshot {
-                        viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .originalPath, managedAccount: managedAccount, selfManagedCloud: selfManagedCloud)
+                        AppState.shared.openRestoreCenter(bindingID: selectedArchiveSnapshot.binding.bindingID)
                     }
                 },
                 onQuarantineLocal: {
@@ -90,6 +82,7 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                Button("打开恢复中心") { AppState.shared.openRestoreCenter() }
                 Button("打开设置", action: openSettings)
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -103,7 +96,7 @@ struct ContentView: View {
                         .textSelection(.enabled)
                     HStack {
                         Button("开始扫描", action: viewModel.scan)
-                            .disabled(viewModel.selectedRoot == nil || viewModel.isScanning)
+                            .disabled(viewModel.selectedRoot == nil || viewModel.isScanning || isAutomationRunning)
                         Button("修改设置", action: openSettings)
                     }
                 }
@@ -124,6 +117,13 @@ struct ContentView: View {
                     ProgressView("只读扫描中...")
                 }
 
+                if viewModel.isAutomaticPage {
+                    HStack {
+                        Button("上一页") { viewModel.loadAutomaticPage(previous: true) }.disabled(viewModel.automaticPageNumber <= 1)
+                        Text("第 \(viewModel.automaticPageNumber) / \(viewModel.automaticTotalPages) 页")
+                        Button("下一页") { viewModel.loadAutomaticPage(next: true) }.disabled(!viewModel.hasNextAutomaticPage)
+                    }
+                }
                 activitySection
 
                 automationSection
@@ -136,7 +136,7 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Button("上传已哈希对象") { viewModel.uploadHashedCandidates(managedAccount: managedAccount, selfManagedCloud: selfManagedCloud, mode: settings.cloudMode) }
-                        .disabled(viewModel.result == nil || viewModel.isUploading || (settings.cloudMode == .weVault && !managedAccount.isReady))
+                        .disabled(viewModel.result == nil || viewModel.isUploading || isAutomationRunning || (settings.cloudMode == .weVault && !managedAccount.isReady))
                 }
 
                 if !viewModel.restoreMessage.isEmpty || viewModel.isRestoring {
@@ -206,7 +206,7 @@ struct ContentView: View {
                 }
                 .pickerStyle(.segmented)
                 Spacer()
-                Text("\(viewModel.filteredFiles.count) 项")
+                Text(viewModel.isAutomaticPage ? "共 \(viewModel.automaticFilteredCount) 项 · 本页 \(viewModel.filteredFiles.count) 项" : "\(viewModel.filteredFiles.count) 项")
                     .foregroundStyle(.secondary)
             }
             .padding()
@@ -286,7 +286,7 @@ struct ContentView: View {
             HStack {
                 Text("自动任务").font(.headline)
                 Spacer()
-                Button(isAutomationRunning ? "正在运行…" : "立即运行", action: runAutomationNow)
+                Button(isAutomationRunning ? "正在运行…" : (automationSnapshot?.latestRun?.status == .failed ? "立即重试" : "立即运行"), action: runAutomationNow)
                     .disabled(!settings.automaticTasksEnabled || isAutomationRunning)
             }
             if let snapshot = automationSnapshot {
@@ -307,28 +307,17 @@ struct ContentView: View {
         case .waitingForCloud:
             return "\(run.failureReason ?? "等待云端条件")；未扫描、上传或释放本地副本。"
         case .completed:
-            return "已完成：\(run.completedUnits)/\(run.totalUnits) 项已通过云端校验。"
+            return "已完成：\(run.completedUnits)/\(run.totalUnits) 项处理步骤（上传校验、隔离及到期释放）。"
         case .failed:
             return "失败（\(run.completedUnits)/\(run.totalUnits) 已完成）：\(run.failureReason ?? "可重试错误")"
         case .running:
-            return "正在扫描、上传并等待服务端校验。"
+            return "\(run.stage.displayName)：\(run.completedUnits)/\(run.totalUnits)"
         default:
             return run.failureReason ?? run.status.rawValue
         }
     }
 
-    private func chooseRestoreDirectory() {
-        guard let selectedArchiveSnapshot else { return }
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "恢复到此处"
-        panel.directoryURL = CloudRestoreService.defaultRestoreDirectory()
-        if panel.runModal() == .OK, let url = panel.url {
-            viewModel.restore(snapshot: selectedArchiveSnapshot, destination: .directory(url), managedAccount: managedAccount, selfManagedCloud: selfManagedCloud)
-        }
-    }
+
 }
 
 enum WeChatDirectory {
@@ -350,7 +339,9 @@ final class ScanViewModel: ObservableObject {
     @Published var isScanning = false
     @Published var alertMessage: String?
     @Published var largeFileThresholdMB: Double = 50
-    @Published var filter: RecordFilter = .all
+    @Published var filter: RecordFilter = .all {
+        didSet { if isAutomaticPage { loadAutomaticPage(reset: true) } }
+    }
     @Published var cloudSnapshots: [String: CloudArchiveSnapshot] = [:]
     @Published var archivedSnapshots: [String: ArchivedFileSnapshot] = [:]
     @Published var isUploading = false
@@ -360,11 +351,94 @@ final class ScanViewModel: ObservableObject {
     @Published var isReleasing = false
     @Published var releaseMessage = ""
     @Published var recentOperations: [OperationRecord] = []
-    @Published var sortOrder = [KeyPathComparator(\FileRecord.filename, comparator: .localizedStandard)]
+    @Published var sortOrder = [KeyPathComparator(\FileRecord.filename, comparator: .localizedStandard)] {
+        didSet { if isAutomaticPage { loadAutomaticPage(reset: true) } }
+    }
+
+    @Published var isAutomaticPage = false
+    @Published var hasNextAutomaticPage = false
+    @Published var automaticPageNumber = 1
+    private var loadedScanSession: String?
+    private let archiveStoreFactory: () throws -> ManifestStore
+    @Published private(set) var automaticFilteredCount = 0
+    var automaticTotalPages: Int { max(1, (automaticFilteredCount + 49) / 50) }
+    private var automaticCursors: [FileRecord?] = [nil]
+
+    private func matchesFilter(_ file: FileRecord) -> Bool {
+        switch filter {
+        case .all: return true
+        case .ordinary: return file.objectType == .ordinaryFile
+        case .image: return file.objectType == .imageHighLayer
+        case .video: return file.objectType == .videoRawLayer
+        case .duplicates: return file.duplicateGroupID != nil
+        }
+    }
+
+    private func precedes(_ lhs: FileRecord, _ rhs: FileRecord) -> Bool {
+        for comparator in sortOrder {
+            let result = comparator.compare(lhs, rhs)
+            if result != .orderedSame { return result == .orderedAscending }
+        }
+        return lhs.path < rhs.path
+    }
+
+    func loadAutomaticPage(reset: Bool = false, next: Bool = false, previous: Bool = false) {
+        guard let root = selectedRoot else { return }
+        do {
+            let store = try archiveStoreFactory()
+            try store.readTransaction {
+            guard let session = try store.currentScanSession(),
+                  try store.workGet(String.self, scope: session + ".metadata", key: "root") == root.standardizedFileURL.path else { return }
+            if reset || loadedScanSession != session { automaticCursors = [nil]; automaticPageNumber = 1; loadedScanSession = session; hasNextAutomaticPage = false }
+            if next, hasNextAutomaticPage { automaticPageNumber += 1 }
+            if previous, automaticPageNumber > 1 { automaticPageNumber -= 1 }
+            // Decrypt in bounded batches: keep only the next 51 globally ordered
+            // matches, never the full scan or plaintext sort keys on disk.
+            let boundary = automaticCursors[automaticPageNumber - 1]
+            var rows: [FileRecord] = []
+            var cursor: Int64 = 0
+            var count = 0
+            while true {
+                let batch = try store.workPage(FileRecord.self, scope: session + ".files", after: cursor)
+                guard let last = batch.last else { break }
+                cursor = last.id
+                for row in batch where matchesFilter(row.value) {
+                    count += 1
+                    if let boundary, !precedes(boundary, row.value) { continue }
+                    let index = rows.firstIndex { precedes(row.value, $0) } ?? rows.endIndex
+                    if index < 51 {
+                        rows.insert(row.value, at: index)
+                        if rows.count > 51 { rows.removeLast() }
+                    }
+                }
+            }
+            automaticFilteredCount = count
+            hasNextAutomaticPage = rows.count > 50
+            if let last = rows.prefix(50).last, automaticCursors.count == automaticPageNumber { automaticCursors.append(last) }
+            var visible: [FileRecord] = [], families: [FamilyRecord] = []
+            archivedSnapshots = [:]; cloudSnapshots = [:]
+            for row in rows.prefix(50) {
+                var file = row
+                if let snapshot = try store.archivedSnapshot(path: file.path), snapshot.archivedFile.sha256 == file.sha256 {
+                    archivedSnapshots[file.path] = snapshot
+                    cloudSnapshots[file.path] = CloudArchiveSnapshot(object: snapshot.object, binding: snapshot.binding)
+                    file = Self.displayRecord(for: snapshot)
+                    file.duplicateGroupID = row.duplicateGroupID
+                }
+                if let family = try store.workGet(FamilyRecord.self, scope: session + ".families", key: file.path) { families.append(family) }
+                visible.append(file)
+            }
+            let summary = try store.workGet(ScanSummary.self, scope: session + ".metadata", key: "summary") ?? .zero
+            isAutomaticPage = true
+            result = ScanResult(rootPath: root.path, scannedAt: Date(), largeFileThresholdBytes: Int64(largeFileThresholdMB * 1024 * 1024), files: visible, families: families, duplicateGroups: [], summary: summary)
+            }
+        } catch { alertMessage = error.localizedDescription }
+    }
 
     let manifestURL = ManifestStore.defaultDatabaseURL()
 
-    init() {
+    init(archiveStoreFactory: @escaping () throws -> ManifestStore = { try ManifestStore() }) {
+        self.archiveStoreFactory = archiveStoreFactory
         selectedRoot = nil
     }
 
@@ -396,9 +470,13 @@ final class ScanViewModel: ObservableObject {
             return
         }
         do {
-            let store = try ManifestStore()
-            let cloud = try store.cloudArchiveSnapshots()
-            let archived = try store.archivedFileSnapshots()
+            let store = try archiveStoreFactory()
+            if let session = try store.currentScanSession(),
+               try store.workGet(String.self, scope: session + ".metadata", key: "root") == selectedRoot.standardizedFileURL.path {
+                loadAutomaticPage(reset: true); return
+            }
+            let cloud: [String: CloudArchiveSnapshot] = [:]
+            let archived = Dictionary(try store.archivedFilePage().map { ($0.archivedFile.filePath, $0) }, uniquingKeysWith: { first, _ in first })
             let rootPath = selectedRoot.standardizedFileURL.path
             let visible = archived.values.filter { snapshot in
                 let path = URL(fileURLWithPath: snapshot.archivedFile.filePath).standardizedFileURL.path
@@ -438,6 +516,7 @@ final class ScanViewModel: ObservableObject {
             )
         } catch {
             result = nil
+            alertMessage = error.localizedDescription
         }
     }
 
@@ -469,6 +548,7 @@ final class ScanViewModel: ObservableObject {
 
     var filteredFiles: [FileRecord] {
         guard let files = result?.files else { return [] }
+        if isAutomaticPage { return files }
         let filtered: [FileRecord] = switch filter {
         case .all:
             files
@@ -506,11 +586,15 @@ final class ScanViewModel: ObservableObject {
 
     func scan() {
         guard let selectedRoot else { return }
+        do { try OperationCoordinator.shared.acquire(OperationCoordinator.pipelineKey()) }
+        catch { alertMessage = error.localizedDescription; return }
         isScanning = true
+        isAutomaticPage = false
         alertMessage = nil
         let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
 
         Task {
+            defer { OperationCoordinator.shared.release(OperationCoordinator.pipelineKey()) }
             do {
                 let scanResult = try await Task.detached(priority: .userInitiated) {
                     let scanner = WeChatScanner()
@@ -536,12 +620,15 @@ final class ScanViewModel: ObservableObject {
 
     func uploadHashedCandidates(managedAccount: ManagedAccount, selfManagedCloud: SelfManagedCloud, mode: ProductSettings.CloudMode) {
         guard let selectedRoot else { return }
+        do { try OperationCoordinator.shared.acquire(OperationCoordinator.pipelineKey()) }
+        catch { alertMessage = error.localizedDescription; return }
         isUploading = true
         alertMessage = nil
         uploadMessage = "按当前阈值刷新扫描..."
         let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
 
         Task {
+            defer { OperationCoordinator.shared.release(OperationCoordinator.pipelineKey()) }
             do {
                 let refreshed = try await Task.detached(priority: .userInitiated) {
                     let scanner = WeChatScanner()
@@ -583,14 +670,14 @@ final class ScanViewModel: ObservableObject {
     }
 
     func restore(snapshot: ArchivedFileSnapshot, destination: RestoreDestination, managedAccount: ManagedAccount, selfManagedCloud: SelfManagedCloud) {
-        guard !isRestoring else { return }
+        guard !isRestoring, !isReleasing else { return }
         isRestoring = true
-        alertMessage = nil
         restoreMessage = "准备恢复：\(snapshot.archivedFile.originalFilename)"
 
         Task {
             do {
                 let store = try ManifestStore()
+                guard let snapshot = try store.archivedFileSnapshot(bindingID: snapshot.binding.bindingID) else { throw WeVaultError.fileSystem("归档记录不存在") }
                 let result: CloudRestoreResult
                 if snapshot.object.storageProvider == "WeVault Managed Cloud" {
                     let authorization = try await managedAccount.withAuthorizedDevice()
@@ -598,17 +685,16 @@ final class ScanViewModel: ObservableObject {
                 } else {
                     result = try await CloudRestoreService().restore(snapshot: snapshot, destination: destination, config: try selfManagedCloud.storageConfig(), store: store)
                 }
-                archivedSnapshots = try store.archivedFileSnapshots()
-                cloudSnapshots = try store.cloudArchiveSnapshots()
+                try refreshArchiveSnapshots(store: store)
                 reloadActivity()
                 restoreMessage = "恢复完成并通过 SHA-256 校验：\(result.destinationURL.path)"
-                NSWorkspace.shared.activateFileViewerSelecting([result.destinationURL])
+                if case .originalPath = destination, snapshot.archivedFile.objectType != .ordinaryFile {
+                    restoreMessage += snapshot.archivedFile.objectType == .imageHighLayer ? "\n请回微信保存高清/原图。" : "\n请回微信执行高质量保存/导出。"
+                } else { NSWorkspace.shared.activateFileViewerSelecting([result.destinationURL]) }
             } catch {
-                alertMessage = error.localizedDescription
                 restoreMessage = "恢复失败：\(error.localizedDescription)"
                 if let store = try? ManifestStore() {
-                    archivedSnapshots = (try? store.archivedFileSnapshots()) ?? archivedSnapshots
-                    cloudSnapshots = (try? store.cloudArchiveSnapshots()) ?? cloudSnapshots
+                    try? refreshArchiveSnapshots(store: store)
                 }
             }
             isRestoring = false
@@ -616,7 +702,7 @@ final class ScanViewModel: ObservableObject {
     }
 
     func quarantineLocal(snapshot: ArchivedFileSnapshot, createTombstone: Bool) {
-        guard !isReleasing else { return }
+        guard !isReleasing, !isRestoring else { return }
         isReleasing = true
         alertMessage = nil
         releaseMessage = "准备释放本地原件：\(snapshot.archivedFile.originalFilename)"
@@ -626,28 +712,9 @@ final class ScanViewModel: ObservableObject {
                 let store = try ManifestStore()
                 let releaseService = LocalReleaseService()
                 let result: LocalReleaseResult
-                switch snapshot.archivedFile.objectType {
-                case .ordinaryFile:
-                    result = try releaseService.quarantine(
-                        snapshot: snapshot,
-                        store: store,
-                        userConfirmed: true,
-                        skipRestoreTest: true,
-                        createTombstone: createTombstone
-                    )
-                case .imageHighLayer:
-                    result = try releaseService.quarantineImageHighLayer(
-                        snapshot: snapshot,
-                        store: store,
-                        userConfirmed: true
-                    )
-                case .videoRawLayer:
-                    result = try releaseService.quarantineVideoRawLayer(
-                        snapshot: snapshot,
-                        store: store,
-                        userConfirmed: true
-                    )
-                }
+                result = try await Task.detached(priority: .utility) {
+                    try releaseService.isolate(snapshot: snapshot, store: store, authorization: .manual(confirmed: true, skipRestoreTest: true), createTombstone: createTombstone)
+                }.value
                 try refreshArchiveSnapshots(store: store)
                 reloadActivity()
                 if snapshot.archivedFile.objectType == .imageHighLayer {
@@ -673,7 +740,7 @@ final class ScanViewModel: ObservableObject {
     }
 
     func rollbackLocal(snapshot: ArchivedFileSnapshot) {
-        guard !isReleasing else { return }
+        guard !isReleasing, !isRestoring else { return }
         isReleasing = true
         alertMessage = nil
         releaseMessage = "准备从隔离区回滚：\(snapshot.archivedFile.originalFilename)"
@@ -681,7 +748,12 @@ final class ScanViewModel: ObservableObject {
         Task {
             do {
                 let store = try ManifestStore()
-                let result = try LocalReleaseService().rollback(snapshot: snapshot, store: store)
+                let key = OperationCoordinator.bindingKey(snapshot.binding.bindingID, store: store)
+                try OperationCoordinator.shared.acquire(key)
+                defer { OperationCoordinator.shared.release(key) }
+                guard try !store.hasPendingRelease(bindingID: snapshot.binding.bindingID) else { throw WeVaultError.fileSystem("请先重试未完成的本地释放任务") }
+                guard let current = try store.archivedFileSnapshot(bindingID: snapshot.binding.bindingID) else { throw WeVaultError.fileSystem("归档绑定不存在") }
+                let result = try LocalReleaseService().rollback(snapshot: current, store: store)
                 try refreshArchiveSnapshots(store: store)
                 reloadActivity()
                 releaseMessage = "已回滚并通过 SHA-256 校验：\(result.originalURL.path)"
@@ -698,7 +770,7 @@ final class ScanViewModel: ObservableObject {
     }
 
     func finalizeLocalRelease(snapshot: ArchivedFileSnapshot) {
-        guard !isReleasing else { return }
+        guard !isReleasing, !isRestoring else { return }
         isReleasing = true
         alertMessage = nil
         releaseMessage = "准备确认释放空间：\(snapshot.archivedFile.originalFilename)"
@@ -706,7 +778,9 @@ final class ScanViewModel: ObservableObject {
         Task {
             do {
                 let store = try ManifestStore()
-                _ = try LocalReleaseService().finalizeRelease(snapshot: snapshot, store: store)
+                _ = try await Task.detached(priority: .utility) {
+                    try LocalReleaseService().finalizeSafely(snapshot: snapshot, store: store, authorization: .manual(confirmed: true, skipRestoreTest: true))
+                }.value
                 try refreshArchiveSnapshots(store: store)
                 reloadActivity()
                 releaseMessage = "已删除隔离副本；云端对象和 manifest 仍保留，可从云端恢复。"
@@ -741,8 +815,17 @@ final class ScanViewModel: ObservableObject {
     }
 
     private func refreshArchiveSnapshots(store: ManifestStore) throws {
-        archivedSnapshots = try store.archivedFileSnapshots()
-        cloudSnapshots = try store.cloudArchiveSnapshots()
+        if let session = try store.currentScanSession(), let root = selectedRoot,
+           try store.workGet(String.self, scope: session + ".metadata", key: "root") == root.standardizedFileURL.path {
+            loadAutomaticPage(); return
+        }
+        archivedSnapshots = [:]; cloudSnapshots = [:]
+        for file in result?.files ?? [] {
+            if let snapshot = try store.archivedSnapshot(path: file.path) {
+                archivedSnapshots[file.path] = snapshot
+                cloudSnapshots[file.path] = CloudArchiveSnapshot(object: snapshot.object, binding: snapshot.binding)
+            }
+        }
         if let current = result, let selectedRoot {
             result = Self.scanResultByAddingArchivedDisplayRecords(current, archived: archivedSnapshots, under: selectedRoot)
         }

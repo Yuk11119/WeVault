@@ -412,8 +412,8 @@ struct WeChatScannerTests {
             #expect(String(data: Data(payload.data.prefix(2)), encoding: .ascii) == "PK")
             #expect(payload.data.range(of: Data(requiredPart.utf8)) != nil)
             #expect(payload.data.range(of: Data(Tombstone.magic.utf8)) != nil)
-            #expect(payload.data.range(of: Data("查看归档内容".utf8)) != nil)
-            #expect(payload.data.range(of: Data("https://wevault.example/archive/\(ordinary.binding.bindingID)".utf8)) != nil)
+            #expect(payload.data.range(of: Data("恢复入口".utf8)) != nil)
+            #expect(payload.data.range(of: Data("wevault://restore/\(ordinary.binding.bindingID)".utf8)) != nil)
         }
 
         let zipPayload = try #require(try Tombstone.payload(for: renamedSnapshot(ordinary, filename: "archive.zip"), createdAt: createdAt))

@@ -14,7 +14,7 @@ struct SetupWizard: View {
     var body: some View {
         Form {
             Section("欢迎使用 WeVault") {
-                Text("WeVault 会归档已验证的微信大对象；P1 只保存本地策略，不会自动释放文件，也不会保存云端密钥。")
+                Text("WeVault 按规则扫描、上传并校验微信大对象，冷却期后隔离原件，隔离期到期后删除本地副本。默认不额外下载恢复测试副本。")
                     .fixedSize(horizontal: false, vertical: true)
             }
             policySections
@@ -55,7 +55,9 @@ struct SetupWizard: View {
 
     var scheduleSection: some View {
         Section("自动化策略") {
-            Toggle("完成 P2 云端接入后启用自动任务", isOn: $draft.automaticTasksEnabled)
+            Toggle("启用自动归档、隔离及到期释放", isOn: $draft.automaticTasksEnabled)
+            Text("自动任务仅支持 WeVault 托管云端；释放依据云端校验、本地 SHA 和当前规则，不额外下载恢复测试副本。暂停将停止派发新任务，正在提交的文件操作会先安全完成。")
+                .font(.caption).foregroundStyle(.secondary)
             Stepper("运行频率：每 \(draft.runIntervalHours) 小时", value: $draft.runIntervalHours, in: 1...720)
             Stepper("自动释放冷却期：\(draft.coolingPeriodDays) 天", value: $draft.coolingPeriodDays, in: 0...365)
             Stepper("quarantine 保留：\(draft.quarantineRetentionDays) 天", value: $draft.quarantineRetentionDays, in: 1...365)
@@ -80,8 +82,8 @@ struct SetupWizard: View {
     var cloudSection: some View {
         Section("云端模式") {
             Picker("模式", selection: $draft.cloudMode) {
-                Text("WeVault 云端（P2 登录后可用）").tag(ProductSettings.CloudMode.weVault)
-                Text("自配 OSS/COS（P2 高级设置后可用）").tag(ProductSettings.CloudMode.selfManaged)
+                Text("WeVault 云端").tag(ProductSettings.CloudMode.weVault)
+                Text("自配 OSS/COS（手动操作）").tag(ProductSettings.CloudMode.selfManaged)
             }
             Text("此版本不输入或保存长期 AccessKey / Secret。")
                 .font(.caption)
@@ -121,7 +123,15 @@ struct SettingsSheet: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("WeVault 设置").font(.title2.bold())
+                HStack {
+                    Text("WeVault 设置").font(.title2.bold())
+                    Spacer()
+                    Button("关闭设置") { dismiss() }
+                }.padding(.horizontal)
+                if DevelopmentIsolation.permitsInteractiveAuthentication {
+                    Text("隔离验收：自动任务关闭，凭证只保留在内存；请使用测试账号。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 SetupWizard(initial: draft) { updated in
                     onSave(updated)
                     dismiss()
@@ -141,7 +151,7 @@ private struct SelfManagedCloudSection: View {
     @State private var error: String?
     var body: some View {
         GroupBox("自配 OSS / COS 高级设置") {
-            Text("仅接受短期 STS 凭证；不会保存长期 AccessKey 或 Secret。凭证仅存入本机 Keychain。")
+            Text(DevelopmentIsolation.root == nil ? "仅接受短期 STS 凭证；不会保存长期 AccessKey 或 Secret。凭证仅存入本机 Keychain。" : "隔离验收：短期 STS 配置仅保留在内存。")
                 .font(.caption).foregroundStyle(.secondary)
             Picker("提供商", selection: $config.provider) { Text("阿里云 OSS").tag("Aliyun OSS (STS)"); Text("腾讯云 COS").tag("Tencent COS (STS)") }
             TextField("Endpoint", text: $config.endpoint); TextField("Bucket", text: $config.bucket); TextField("Region", text: $config.region)

@@ -22,6 +22,10 @@ let package = Package(
             dependencies: ["WeVaultCore"]
         ),
         .testTarget(
+            name: "WeVaultAppTests",
+            dependencies: ["WeVaultApp", "WeVaultCore"]
+        ),
+        .testTarget(
             name: "WeVaultCoreTests",
             dependencies: ["WeVaultCore"]
         )

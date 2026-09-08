@@ -53,14 +53,15 @@ func sha256Hex(_ string: String) -> String {
     return digest.map { String(format: "%02x", $0) }.joined()
 }
 
-func sha256File(_ url: URL) throws -> String {
+func sha256File(_ url: URL, checkCancellation: Bool = true) throws -> String {
     let handle = try FileHandle(forReadingFrom: url)
     defer {
         try? handle.close()
     }
 
     var hasher = SHA256()
-    while autoreleasepool(invoking: {
+    while try autoreleasepool(invoking: {
+        if checkCancellation { try Task.checkCancellation() }
         let data = handle.readData(ofLength: 1024 * 1024)
         if data.isEmpty {
             return false
