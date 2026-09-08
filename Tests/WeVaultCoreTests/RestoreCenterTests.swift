@@ -11,6 +11,10 @@ struct RestoreCenterTests {
             let id = "binding-" + String(repeating: "a", count: length)
             let link = try RestoreLink(bindingID: id)
             #expect(try RestoreLink(url: link.url).bindingID == id)
+            #expect(try RestoreLink(url: URL(string: "wevault://restore/binding%02" + String(repeating: "a", count: length))!).bindingID == id)
+            for corrupted in ["wevault://restore/%62inding%02", "wevault://restore/binding-%02", "wevault://restore/binding%03", "wevault://restore/binding%02%02"] {
+                #expect(throws: WeVaultError.self) { try RestoreLink(url: URL(string: corrupted + String(repeating: "a", count: length))!) }
+            }
             #expect(try RestoreLink(url: URL(string: link.url.absoluteString + "?OR=PowerPoint")!).url == link.url)
             for suffix in ["/", "/extra", "?path=/tmp/file", "#fragment", "?", "?OR=PowerPoint&OR=PowerPoint", "?OR=Word", "?OR=PowerPoint&path=x", "?%4fR=PowerPoint"] {
                 #expect(throws: WeVaultError.self) { try RestoreLink(url: URL(string: link.url.absoluteString + suffix)!) }
@@ -18,6 +22,21 @@ struct RestoreCenterTests {
         }
         for raw in ["https://restore/binding-a", "wevault://delete/binding-a", "wevault://user@restore/binding-a", "wevault://restore:80/binding-a", "wevault://restore/../x", "wevault://restore/%62inding-" + String(repeating: "a", count: 32)] {
             #expect(throws: WeVaultError.self) { try RestoreLink(url: URL(string: raw)!) }
+        }
+    }
+
+    @Test("pasted PDF line breaks and exact browser links resolve without relaxing URL events")
+    func pastedLinks() throws {
+        for count in [32, 64] {
+            let id = "binding-" + String(repeating: "a", count: count)
+            let link = try RestoreLink(bindingID: id)
+            #expect(try RestoreLink(lookupText: id.replacingOccurrences(of: "-", with: "-\n")).bindingID == id)
+            #expect(try RestoreLink(lookupText: link.url.absoluteString.replacingOccurrences(of: "binding-", with: "binding-\r\n")).bindingID == id)
+            #expect(try RestoreLink(lookupText: link.browserURL.absoluteString).bindingID == id)
+            for raw in ["https://evil.test/restore#" + id, "https://api.wevault.online/restore?x=1#" + id, "https://api.wevault.online:443/restore#" + id, link.browserURL.absoluteString + "/extra", "https://api.wevault.online/restore#%62" + String(id.dropFirst()), id + " extra"] {
+                #expect(throws: WeVaultError.self) { try RestoreLink(lookupText: raw) }
+            }
+            #expect(throws: WeVaultError.self) { try RestoreLink(url: link.browserURL) }
         }
     }
 
@@ -164,6 +183,11 @@ struct RestoreCenterTests {
                 #expect(pdf.pageCount == 1)
                 #expect(pdf.string?.contains("这不是原文件") == true)
                 #expect(pdf.page(at: 0)?.annotations.contains(where: { $0.url == expected }) == true)
+                let browser = try RestoreLink(bindingID: snapshot.binding.bindingID).browserURL
+                #expect(pdf.page(at: 0)?.annotations.contains(where: { $0.url == browser }) == true)
+                #expect(pdf.string?.contains(snapshot.binding.bindingID) == true)
+                #expect(pdf.string?.contains(expected.absoluteString) == true)
+                #expect(pdf.string?.contains(browser.absoluteString) == true)
             } else {
                 #expect(payload.data.range(of: Data(expected.absoluteString.utf8)) != nil)
                 #expect(payload.data.range(of: Data(snapshot.archivedFile.sha256.utf8)) != nil)

@@ -35,7 +35,8 @@ public enum Tombstone {
     }
 
     public static func tombstoneText(for snapshot: ArchivedFileSnapshot, createdAt: Date) throws -> String {
-        let placeholderURL = try RestoreLink(bindingID: snapshot.binding.bindingID).url.absoluteString
+        let restoreLink = try RestoreLink(bindingID: snapshot.binding.bindingID)
+        let placeholderURL = restoreLink.url.absoluteString
         let body = """
         \(magic)
         这不是原文件。
@@ -109,11 +110,20 @@ public enum Tombstone {
             .flatMap { line in line.range(of: "wevault://restore/").map { range in String(line[range.lowerBound...]) } } ?? ""
     }
 
+    private static func browserLinkURL(_ text: String) -> String {
+        guard let url = URL(string: linkURL(text)), let link = try? RestoreLink(url: url) else { return "" }
+        return link.browserURL.absoluteString
+    }
+
     private static func hyperlinkRelationship(_ text: String) -> String {
         "<Relationship Id=\"rIdRestore\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"\(xmlEscape(linkURL(text)))\" TargetMode=\"External\"/>"
     }
 
-    private static func pdfData(text: String) -> Data {
+    private static func pdfData(text originalText: String) -> Data {
+        let text = originalText.replacingOccurrences(of: "归档编号：", with: "归档编号：\n")
+            .replacingOccurrences(of: "恢复入口：", with: "恢复入口：\n")
+            + "\n浏览器恢复入口（WPS 推荐）：\n" + browserLinkURL(originalText)
+            + "\n链接打不开时，复制完整归档编号到 WeVault 恢复中心，点击“定位”。"
         let data = NSMutableData()
         var page = CGRect(x: 0, y: 0, width: 612, height: 792)
         guard let consumer = CGDataConsumer(data: data),
@@ -125,6 +135,10 @@ public enum Tombstone {
         if warning.location != NSNotFound {
             content.addAttributes([NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("PingFangSC-Semibold" as CFString, 22, nil), NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(red: 0.75, green: 0.05, blue: 0.05, alpha: 1)], range: warning)
         }
+        // Keep copyable identifiers and URLs on one line, even for 64-digit IDs.
+        for line in text.components(separatedBy: "\n") where line.hasPrefix("binding-") || line.hasPrefix("wevault://") || line.hasPrefix("https://") {
+            content.addAttribute(NSAttributedString.Key(kCTFontAttributeName as String), value: CTFontCreateWithName("Menlo-Regular" as CFString, 8, nil), range: (text as NSString).range(of: line))
+        }
         let setter = CTFramesetterCreateWithAttributedString(content)
         let frame = CTFramesetterCreateFrame(setter, CFRange(location: 0, length: 0), CGPath(rect: CGRect(x: 48, y: 140, width: 516, height: 604), transform: nil), nil)
         CTFrameDraw(frame, context)
@@ -133,10 +147,15 @@ public enum Tombstone {
         CTFrameGetLineOrigins(frame, CFRange(location: 0, length: 0), &origins)
         let linkY = max(70, (origins.last?.y ?? 100) + 140 - 50)
         let linkRect = CGRect(x: 48, y: linkY, width: 516, height: 30)
-        let label = NSAttributedString(string: "点击打开 WeVault 恢复中心", attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font, NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(red: 0, green: 0.25, blue: 0.8, alpha: 1)])
+        let label = NSAttributedString(string: "点击通过浏览器恢复（WPS 推荐）", attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font, NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(red: 0, green: 0.25, blue: 0.8, alpha: 1)])
         context.textPosition = CGPoint(x: 48, y: linkY + 10)
         CTLineDraw(CTLineCreateWithAttributedString(label), context)
-        if let url = URL(string: linkURL(text)) { context.setURL(url as CFURL, for: linkRect) }
+        if let url = URL(string: browserLinkURL(text)) { context.setURL(url as CFURL, for: linkRect) }
+        let directRect = linkRect.offsetBy(dx: 0, dy: -40)
+        let direct = NSAttributedString(string: "直接打开 WeVault 恢复中心", attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font, NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(red: 0, green: 0.25, blue: 0.8, alpha: 1)])
+        context.textPosition = CGPoint(x: 48, y: directRect.minY + 10)
+        CTLineDraw(CTLineCreateWithAttributedString(direct), context)
+        if let url = URL(string: linkURL(text)) { context.setURL(url as CFURL, for: directRect) }
         context.endPDFPage(); context.closePDF()
         return data as Data
     }

@@ -69,3 +69,20 @@ test("forwarded client addresses are accepted only from the local Nginx proxy", 
     assert.equal(proxied.json().ip, "198.51.100.8");
   } finally { await app.close(); }
 });
+
+test("restore bridge is public, isolated from storage, and receives no binding in the request", async () => {
+  const app = await appForTest();
+  try {
+    const page = await app.inject({ method: "GET", url: "/restore" });
+    assert.equal(page.statusCode, 200);
+    assert.match(page.headers["content-type"]!, /text\/html/);
+    assert.equal(page.headers["referrer-policy"], "no-referrer");
+    assert.match(page.headers["content-security-policy"]!, /default-src 'none'/);
+    assert.match(page.body, /src="\/restore.js"/);
+    const script = await app.inject({ method: "GET", url: "/restore.js" });
+    assert.equal(script.statusCode, 200);
+    assert.match(script.body, /location.hash.slice\(1\)/);
+    assert.match(script.body, /wevault:\/\/restore\//);
+    assert.doesNotMatch(script.body, /fetch\(|XMLHttpRequest|innerHTML|location\.href\s*=/);
+  } finally { await app.close(); }
+});

@@ -48,4 +48,8 @@ Automatic release does not download an extra restore-test copy. Pause stops new 
 resuming rechecks actual files and preserves already verified bindings.
 
 See [P4 behavior and isolated acceptance](Documentation/P4.md) for batching, recovery
-journals, current settings and verification results. Real WeChat acceptance remains P6.
+journals, current settings and verification results.
+
+See [P6 real WeChat acceptance](Documentation/P6.md) for the completed PDF, image and
+Raw-video round trips, scanner and recovery-link fixes, and remaining Beta coverage
+limits. Original files are restored; independent backups remain and automation stays paused.

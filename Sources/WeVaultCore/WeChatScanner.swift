@@ -125,7 +125,7 @@ public final class WeChatScanner: Sendable {
                                 if let existing = try store.archivedSnapshot(path: url.path), existing.binding.placeholderPath == url.path { continue }
                                 let st = try fileStat(url.path)
                                 let placeholder = Tombstone.isTombstone(url)
-                                batch.append(FileRecord(path: url.path, relativePath: url.pathRelative(to: account.deletingLastPathComponent()), objectType: .ordinaryFile, accountHash: accountHash, accountName: account.lastPathComponent, filename: url.lastPathComponent, fileExtension: url.pathExtension.lowercased(), month: month, sizeBytes: st.size, allocatedBytes: st.allocated, inode: st.inode, nlink: st.nlink, mtime: st.mtime, status: placeholder ? .notArchivable : .discovered, candidateReason: placeholder ? "WeVault 占位文件不可重新归档" : nil))
+                                batch.append(FileRecord(path: url.path, relativePath: url.pathRelative(to: account.deletingLastPathComponent()), objectType: .ordinaryFile, accountHash: accountHash, accountName: account.lastPathComponent, filename: url.lastPathComponent, fileExtension: url.pathExtension.lowercased(), month: month, sizeBytes: st.size, allocatedBytes: st.allocated, inode: st.inode, nlink: st.nlink, mtime: st.mtime, status: placeholder ? .notArchivable : .discovered, candidateReason: placeholder ? "疑似转发了 WeVault tombstone 占位文件；请恢复原件后重新发送" : nil))
                                 count += 1
                                 if batch.count == 50 { try await deliver() }
                             } else {
@@ -371,7 +371,7 @@ public final class WeChatScanner: Sendable {
             let high = members["high"] ?? members["highMedium"]
             guard let high else { return nil }
             let display = members["normal"] ?? members["medium"]
-            let bubble = members["bubble"] ?? members["thumb"]
+            let bubble = members["bubble"] ?? members["thumb"] ?? cachedImageBubble(high: high, accountName: accountName, month: month, resourceID: parts[3], prefix: prefix)
             let isCandidate = display != nil
             let reason = isCandidate
                 ? "高清层候选：普通查看层保留在本地"
@@ -388,9 +388,25 @@ public final class WeChatScanner: Sendable {
                 bubbleOrThumbPath: bubble?.path,
                 isCandidate: isCandidate,
                 reason: reason,
-                memberPaths: members.values.map(\.path).sorted()
+                memberPaths: Array(Set(members.values.map(\.path) + [bubble?.path].compactMap { $0 })).sorted()
             )
         }.sorted { $0.highOrRawPath < $1.highOrRawPath }
+    }
+
+    /// Resolve only the exact retained cache member; never enumerate or archive cache data.
+    private func cachedImageBubble(high: URL, accountName: String, month: String?, resourceID: String, prefix: String) -> URL? {
+        guard let month, isMonth(month), !resourceID.isEmpty else { return nil }
+        var attach = high.deletingLastPathComponent()
+        while attach.path != "/" {
+            if attach.lastPathComponent == "attach", attach.deletingLastPathComponent().lastPathComponent == "msg" { break }
+            attach.deleteLastPathComponent()
+        }
+        guard attach.path != "/" else { return nil }
+        let account = attach.deletingLastPathComponent().deletingLastPathComponent()
+        guard account.lastPathComponent == accountName else { return nil }
+        let bubble = account.appendingPathComponent("cache/\(month)/Message/\(resourceID)/Bubble/\(prefix)_b.dat")
+        guard (try? requireRegularFile(bubble)) != nil else { return nil }
+        return bubble
     }
 
     private func buildVideoFamilies(_ groups: [String: [String: URL]]) -> [FamilyRecord] {
@@ -470,7 +486,7 @@ public final class WeChatScanner: Sendable {
     }
 
     private func hashLargeOrdinaryCandidates(_ files: inout [FileRecord], threshold: Int64) {
-        for index in files.indices where files[index].objectType == .ordinaryFile && files[index].sizeBytes >= threshold {
+        for index in files.indices where files[index].objectType == .ordinaryFile && files[index].status != .notArchivable && files[index].sizeBytes >= threshold {
             if let digest = try? sha256File(URL(fileURLWithPath: files[index].path)) {
                 files[index].sha256 = digest
                 files[index].status = .hashed
@@ -481,7 +497,7 @@ public final class WeChatScanner: Sendable {
 
     private func hashAndGroupOrdinaryDuplicates(_ files: inout [FileRecord]) throws -> [DuplicateGroup] {
         var ordinaryBySize: [Int64: [Int]] = [:]
-        for index in files.indices where files[index].objectType == .ordinaryFile {
+        for index in files.indices where files[index].objectType == .ordinaryFile && files[index].status != .notArchivable {
             ordinaryBySize[files[index].sizeBytes, default: []].append(index)
         }
 
@@ -495,7 +511,7 @@ public final class WeChatScanner: Sendable {
         }
 
         var byHash: [String: [Int]] = [:]
-        for index in files.indices where files[index].objectType == .ordinaryFile {
+        for index in files.indices where files[index].objectType == .ordinaryFile && files[index].status != .notArchivable {
             guard let digest = files[index].sha256 else { continue }
             byHash[digest, default: []].append(index)
         }
@@ -524,7 +540,7 @@ public final class WeChatScanner: Sendable {
 
     private func summarize(files: [FileRecord], duplicateGroups: [DuplicateGroup], threshold: Int64, videoPlaybackStats: ByteCountStats) -> ScanSummary {
         let ordinary = files.filter { $0.objectType == .ordinaryFile }
-        let largeOrdinary = ordinary.filter { $0.sizeBytes >= threshold }
+        let largeOrdinary = ordinary.filter { $0.status != .notArchivable && $0.sizeBytes >= threshold }
         let imageCandidates = files.filter { $0.objectType == .imageHighLayer && $0.status != .notArchivable }
         let videoRawDiscovered = files.filter { $0.objectType == .videoRawLayer }
         let videoCandidates = videoRawDiscovered.filter { $0.status != .notArchivable }

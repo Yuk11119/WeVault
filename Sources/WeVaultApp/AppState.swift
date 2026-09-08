@@ -16,7 +16,10 @@ final class AppState: ObservableObject {
         }
         #endif
         do { openRestoreCenter(bindingID: try RestoreLink(url: url).bindingID) }
-        catch { openRestoreCenter(); restoreCenter.rejectLink(error.localizedDescription) }
+        catch {
+            openRestoreCenter()
+            restoreCenter.rejectLink("恢复链接不完整或格式不受支持。请复制占位文件中的完整归档编号，在上方粘贴并点击“定位”。")
+        }
     }
 
     func openRestoreCenter(bindingID: String? = nil) {

@@ -158,7 +158,7 @@ struct DetailView: View {
                                         Button("从隔离区回滚", action: onRollbackLocal)
                                             .disabled(!canRollbackLocal)
                                     }
-                                    Text("阶段 6 只移动 _h.dat / _h_M.dat 高清层到工具 quarantine；原高清路径保持为空，不生成 tombstone。普通查看层和气泡/缩略层必须继续留在本地。")
+                                    Text("只移动 _h.dat / _h_M.dat 高清层到工具 quarantine；原高清路径保持为空，不生成 tombstone。普通查看层和气泡/缩略层必须继续留在本地。")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 case .videoRawLayer:
@@ -170,7 +170,7 @@ struct DetailView: View {
                                         Button("从隔离区回滚", action: onRollbackLocal)
                                             .disabled(!canRollbackLocal)
                                     }
-                                    Text("阶段 7 只移动 _raw.mp4 到工具 quarantine；Raw 原路径保持为空，不生成 tombstone。普通播放 .mp4 和封面/缩略图必须继续留在本地；保存/导出会降级为普通播放版，高质量导出前请先恢复 Raw 层。")
+                                    Text("只移动 _raw.mp4 到工具 quarantine；Raw 原路径保持为空，不生成 tombstone。普通播放 .mp4 和封面/缩略图必须继续留在本地；保存/导出会降级为普通播放版，高质量导出前请先恢复 Raw 层。")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -226,11 +226,11 @@ struct DetailView: View {
     private func releaseCopy(for objectType: ArchiveObjectType) -> Text {
         switch objectType {
         case .ordinaryFile:
-            return Text("阶段 5 仅支持已校验普通文件的受控本地释放；支持同类型 tombstone 的文件默认在微信原路径生成强标识占位文件，占位不是原件。")
+            return Text("仅对已校验普通文件执行受控本地释放；支持同类型 tombstone 的文件默认在微信原路径生成强标识占位文件，占位不是原件。")
         case .imageHighLayer:
-            return Text("阶段 6 支持图片高清层受控释放：普通查看版本保留在本地，高清/原图需要时从云端恢复；不会生成 tombstone，也不会移动 .dat / _M.dat / _b.dat / _t.dat。")
+            return Text("图片高清层受控释放：普通查看版本保留在本地，高清/原图需要时从云端恢复；不会生成 tombstone，也不会移动 .dat / _M.dat / _b.dat / _t.dat。")
         case .videoRawLayer:
-            return Text("阶段 7 支持视频 Raw 层受控释放：普通播放版本、封面或缩略图保留在本地；保存/导出高质量版本前需要从云端恢复 _raw.mp4。")
+            return Text("视频 Raw 层受控释放：普通播放版本、封面或缩略图保留在本地；保存/导出高质量版本前需要从云端恢复 _raw.mp4。")
         }
     }
 }

@@ -40,8 +40,7 @@ final class RestoreCenterModel: ObservableObject {
 
     func find() {
         do {
-            let text = lookup.trimmingCharacters(in: .whitespacesAndNewlines)
-            let link = text.contains("://") ? try RestoreLink(url: URL(string: text) ?? URL(fileURLWithPath: "/")) : try RestoreLink(bindingID: text)
+            let link = try RestoreLink(lookupText: lookup)
             load(bindingID: link.bindingID)
         } catch { rejectLink(error.localizedDescription) }
     }

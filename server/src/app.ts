@@ -1,3 +1,4 @@
+import { restorePage, restoreScript } from "./restore-page.js";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
@@ -58,6 +59,14 @@ export const createApp = async (deps: { config: Config; db: Database; mailer: Ma
     request.log.error({ err: error, requestId: request.id }, "Unhandled API error");
     return reply.status(500).send({ error: { code: "INTERNAL_ERROR", message: "Internal server error" } });
   });
+  for (const [path, body, type] of [["/restore", restorePage, "text/html; charset=utf-8"], ["/restore.js", restoreScript, "text/javascript; charset=utf-8"]] as const) {
+    app.get(path, async (_request, reply) => reply
+      .header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+      .header("Referrer-Policy", "no-referrer")
+      .header("X-Content-Type-Options", "nosniff")
+      .header("Cache-Control", "no-store")
+      .type(type).send(body));
+  }
   app.get("/healthz", async () => { await db.query("SELECT 1"); return { status: "ok" }; });
 
   app.post("/v1/auth/register", { config: { rateLimit: { max: 5, timeWindow: "1 hour" } } }, async (request, reply) => {

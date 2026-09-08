@@ -62,3 +62,9 @@ Set `MANAGED_CLOUD_PROVIDER=aliyun-oss` for the existing RAM-backed OSS deployme
 ## Staging acceptance
 
 `deploy/staging-acceptance.sh` is safe to run from an operator machine after DNS and HTTPS are live. It always checks health, HTTPS redirection, security headers, error envelopes and unauthenticated API protection. If `WEVAULT_ACCESS_TOKEN` and `WEVAULT_DEVICE_ID` are exported in the current shell, it also checks that an authenticated object query is accepted without exposing an object location. The script never creates users, uploads objects, releases local files, or prints a supplied token.
+
+## Browser restore bridge
+
+`GET /restore` and `GET /restore.js` serve the PDF reader compatibility page. The link is `https://api.wevault.online/restore#binding-…`: the identifier stays in the fragment, never in the HTTP request. The page validates a 32/64-hex binding ID, offers an explicit native-app link and copy fallback, and makes no storage/authentication requests. Opening a link only selects a local record; restoration remains an explicit app operation. CSP, no-referrer, nosniff and no-store headers apply.
+
+The September 8 deployment changed only `src/app.ts`, `src/restore-page.ts` and their built JavaScript, then restarted `wevault-api-staging`. Previous app source and JavaScript are saved at `/opt/wevault-api/backups/restore-link-20260908/`; rollback restores these two app files and restarts that one PM2 process. No migration or credential change is required.

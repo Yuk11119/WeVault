@@ -40,6 +40,12 @@ struct RestoreCenterModelTests {
         model.find()
         #expect(model.selected?.binding.bindingID == id)
         #expect(model.error == nil)
+        for text in ["binding-\n" + String(repeating: "a", count: 64), "wevault://restore/binding%02" + String(repeating: "a", count: 64), try RestoreLink(bindingID: id).browserURL.absoluteString] {
+            model.lookup = text
+            model.find()
+            #expect(model.selected?.binding.bindingID == id)
+            #expect(model.error == nil)
+        }
         model.lookup = "wevault://restore/\(id)?path=other"
         model.find()
         #expect(model.selected == nil)
