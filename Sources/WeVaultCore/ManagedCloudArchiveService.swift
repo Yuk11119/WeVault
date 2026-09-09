@@ -114,10 +114,16 @@ public final class ManagedCloudArchiveService: Sendable {
         )
     }
 
-    public func isAuthorizedArchive(_ snapshot: ArchivedFileSnapshot, api: WeVaultAPIClient, accessToken: String, deviceID: String, store: ManifestStore) async throws -> Bool {
-        if try store.workGet(String.self, scope: "managed-binding-owner", key: snapshot.binding.bindingID) == deviceID { return true }
+    public func isAuthorizedArchive(_ snapshot: ArchivedFileSnapshot, api: WeVaultAPIClient, accessToken: String, deviceID: String, store: ManifestStore, storageFactory: any ManagedWeVaultStorageClientFactory = STSObjectStorageClientFactory()) async throws -> Bool {
         let matches = try await api.fallback(accessToken: accessToken, deviceId: deviceID, sha256: snapshot.object.sha256)
         guard matches.contains(where: { $0.objectId == snapshot.object.cloudObjectID && $0.sha256 == snapshot.archivedFile.sha256 && $0.sizeBytes == snapshot.archivedFile.sizeBytes }) else { return false }
+        let authorization = try await api.downloadAuthorization(accessToken: accessToken, objectId: snapshot.object.cloudObjectID, deviceId: deviceID)
+        try ManagedCloudContractPipeline.assertUsable(credentials: authorization.credentials)
+        let head = try await storageFactory.makeClient(credentials: authorization.credentials).headObject(objectKey: authorization.credentials.objectKey)
+        guard head.sizeBytes == snapshot.archivedFile.sizeBytes,
+              head.metadata["sha256"] == snapshot.archivedFile.sha256 else {
+            throw WeVaultError.cloud("释放前云端对象不可验证；保留本地副本")
+        }
         try store.workPut(scope: "managed-binding-owner", key: snapshot.binding.bindingID, value: deviceID)
         return true
     }

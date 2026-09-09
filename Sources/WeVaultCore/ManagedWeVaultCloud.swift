@@ -6,6 +6,7 @@ public struct WeVaultAPIFailure: Error, Equatable, Sendable, LocalizedError {
     public let code: String
     public let statusCode: Int
     public let message: String
+    public init(code: String, statusCode: Int, message: String) { self.code = code; self.statusCode = statusCode; self.message = message }
     public var errorDescription: String? { "\(code): \(message)" }
 }
 

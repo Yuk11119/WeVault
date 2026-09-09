@@ -24,29 +24,53 @@ public final class KeychainManifestKeyProvider: ManifestKeyProvider, @unchecked 
     public static let shared = KeychainManifestKeyProvider()
     private let service = "com.wevault.manifest.master-key"
     private let account = "default"
+    private let lock = NSLock()
+    private var cachedKey: Data?
+    private let readItem: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>) -> OSStatus
 
-    public init() {}
+    public init() { readItem = { SecItemCopyMatching($0, $1) } }
+
+    // Injection keeps regression tests away from the user's real Keychain.
+    init(readItem: @escaping (CFDictionary, UnsafeMutablePointer<CFTypeRef?>) -> OSStatus) {
+        self.readItem = readItem
+    }
 
     public func existingKey() throws -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return try existingKeyLocked()
+    }
+
+    private func existingKeyLocked() throws -> Data? {
+        // All manifest connections share this provider. Authorize once per process,
+        // including when background workers open connections concurrently.
+        if let cachedKey { return cachedKey }
         let query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service,
                                       kSecAttrAccount: account, kSecReturnData: true, kSecMatchLimit: kSecMatchLimitOne]
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        let status = readItem(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = result as? Data else { throw ManifestFailure.keychainUnavailable }
         guard data.count == 32 else { throw ManifestFailure.invalidKey }
+        cachedKey = data
         return data
     }
 
     public func createKey() throws -> Data {
-        if let existing = try existingKey() { return existing }
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = try existingKeyLocked() { return existing }
         let data = Data((0..<32).map { _ in UInt8.random(in: .min ... .max) })
         let attributes: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service,
                                             kSecAttrAccount: account, kSecValueData: data,
                                             kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
         let status = SecItemAdd(attributes as CFDictionary, nil)
-        if status == errSecDuplicateItem { return try existingKey().flatMap { $0 } ?? data }
+        if status == errSecDuplicateItem {
+            guard let existing = try existingKeyLocked() else { throw ManifestFailure.keyMissing }
+            return existing
+        }
         guard status == errSecSuccess else { throw ManifestFailure.keychainUnavailable }
+        cachedKey = data
         return data
     }
 }

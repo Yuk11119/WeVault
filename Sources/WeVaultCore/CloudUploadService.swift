@@ -54,6 +54,7 @@ public final class CloudUploadService: Sendable {
         families: [FamilyRecord] = [],
         config: S3CompatibleStorageConfig,
         store: ManifestStore,
+        includeAllSnapshots: Bool = true,
         progress: (@Sendable (CloudUploadProgress) async -> Void)? = nil
     ) async throws -> [String: CloudArchiveSnapshot] {
         let client = clientFactory(config)
@@ -64,6 +65,7 @@ public final class CloudUploadService: Sendable {
         var uploadedBySHA: [String: CloudObject] = [:]
 
         for file in uploadable {
+            try Task.checkCancellation()
             guard let digest = file.sha256 else { continue }
             let objectKey = Self.objectKey(forSHA256: digest)
             let existing = try store.verifiedCloudObject(
@@ -113,6 +115,7 @@ public final class CloudUploadService: Sendable {
                     uploadedBySHA[digest] = cloudObject
                     try store.logOperation("VERIFY_FINISHED", detail: objectKey)
                 } catch {
+                    if AutomationFailure.isFatal(error) { throw error }
                     try store.updateFileStatus(path: file.path, status: .uploadFailed)
                     try store.logOperation("UPLOAD_FAILED", detail: "\(file.path): \(error.localizedDescription)")
                     await progress?(CloudUploadProgress(filePath: file.path, status: .uploadFailed, message: error.localizedDescription))
@@ -126,7 +129,7 @@ public final class CloudUploadService: Sendable {
             await progress?(CloudUploadProgress(filePath: file.path, status: .verified))
         }
 
-        return try store.cloudArchiveSnapshots()
+        return includeAllSnapshots ? try store.cloudArchiveSnapshots() : [:]
     }
 
     public static func objectKey(forSHA256 sha256: String) -> String {

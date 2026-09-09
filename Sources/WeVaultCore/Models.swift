@@ -461,3 +461,45 @@ extension ScanSummary {
         ScanSummary(ordinaryCount: ordinaryCount + other.ordinaryCount, ordinaryBytes: ordinaryBytes + other.ordinaryBytes, largeOrdinaryCount: largeOrdinaryCount + other.largeOrdinaryCount, largeOrdinaryBytes: largeOrdinaryBytes + other.largeOrdinaryBytes, imageHighCandidateCount: imageHighCandidateCount + other.imageHighCandidateCount, imageHighCandidateBytes: imageHighCandidateBytes + other.imageHighCandidateBytes, videoRawCandidateCount: videoRawCandidateCount + other.videoRawCandidateCount, videoRawCandidateBytes: videoRawCandidateBytes + other.videoRawCandidateBytes, videoRawDiscoveredCount: videoRawDiscoveredCount + other.videoRawDiscoveredCount, videoRawDiscoveredBytes: videoRawDiscoveredBytes + other.videoRawDiscoveredBytes, videoPlaybackDiscoveredCount: videoPlaybackDiscoveredCount + other.videoPlaybackDiscoveredCount, videoPlaybackDiscoveredBytes: videoPlaybackDiscoveredBytes + other.videoPlaybackDiscoveredBytes, duplicateReclaimableBytes: duplicateReclaimableBytes + other.duplicateReclaimableBytes)
     }
 }
+
+public extension ArchivedFileSnapshot {
+    var displayFileRecord: FileRecord {
+        let snapshot = self
+        let archived = snapshot.archivedFile
+        let status: ArchiveStatus
+        let reason: String
+        switch snapshot.binding.localState {
+        case .tombstoned:
+            status = .tombstoned
+            reason = "原件已归档，微信原路径为 tombstone 占位提示；可从详情恢复原件。"
+        case .quarantined:
+            status = .releaseEligible
+            reason = "原件已进入 WeVault quarantine，微信原路径为空；可从详情回滚或从云端恢复。"
+        case .localReleased:
+            status = .localReleased
+            reason = "本地隔离副本已确认释放；云端对象和 manifest 仍保留，可从详情恢复。"
+        default:
+            status = .verified
+            reason = "已归档，可从恢复中心恢复原件。"
+        }
+        return FileRecord(
+            path: archived.filePath,
+            relativePath: archived.relativePath,
+            objectType: archived.objectType,
+            accountHash: archived.accountHash,
+            accountName: archived.accountName,
+            filename: archived.originalFilename,
+            fileExtension: URL(fileURLWithPath: archived.originalFilename).pathExtension.lowercased(),
+            month: archived.month,
+            sizeBytes: archived.sizeBytes,
+            allocatedBytes: snapshot.binding.placeholderSize ?? 0,
+            inode: 0,
+            nlink: 0,
+            mtime: archived.mtime,
+            sha256: archived.sha256,
+            status: status,
+            candidateReason: reason
+        )
+    }
+
+}

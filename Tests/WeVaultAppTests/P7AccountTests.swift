@@ -1,0 +1,63 @@
+import Foundation
+import Testing
+@testable import WeVaultApp
+import WeVaultCore
+
+@MainActor
+struct P7AccountTests {
+    @Test("isolated login is explained and rejected before any network request")
+    func isolatedLogin() async throws {
+        let transport = RefreshProbe()
+        let account = ManagedAccount(api: WeVaultAPIClient(baseURL: URL(string: "https://fixture.invalid")!, transport: transport), memoryOnly: true, loginEnabled: false)
+        #expect(account.loginUnavailableMessage?.contains("无需登录") == true)
+        await #expect(throws: ManagedAccountLoginFailure.self) {
+            try await account.login(email: "fixture@example.test", password: "fixture")
+        }
+        #expect(await transport.requestCount == 0)
+        #expect(!account.isReady)
+    }
+
+    @Test("concurrent callers share one rotating refresh token request")
+    func refreshCoalescing() async throws {
+        let transport = RefreshProbe()
+        let account = ManagedAccount(api: WeVaultAPIClient(baseURL: URL(string: "https://fixture.invalid")!, transport: transport), memoryOnly: true)
+        try await account.login(email: "fixture@example.test", password: "fixture")
+        async let first = account.accessToken()
+        async let second = account.accessToken()
+        let tokens = try await [first, second]
+        #expect(tokens == ["new-access", "new-access"])
+        #expect(await transport.refreshCount == 1)
+    }
+
+    @Test("logging out prevents an in-flight refresh from restoring the old session")
+    func logoutDuringRefresh() async throws {
+        let transport = RefreshProbe()
+        let account = ManagedAccount(api: WeVaultAPIClient(baseURL: URL(string: "https://fixture.invalid")!, transport: transport), memoryOnly: true)
+        try await account.login(email: "fixture@example.test", password: "fixture")
+        let pending = Task { try await account.accessToken() }
+        while await transport.refreshCount == 0 { await Task.yield() }
+        await account.logout()
+        _ = try? await pending.value
+        #expect(!account.isReady)
+        await #expect(throws: WeVaultError.self) { try await account.accessToken() }
+    }
+}
+
+private actor RefreshProbe: WeVaultAPITransport {
+    private(set) var requestCount = 0
+    private(set) var refreshCount = 0
+    func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        requestCount += 1
+        let body: String
+        switch request.url!.lastPathComponent {
+        case "login": body = #"{"accessToken":"old-access","refreshToken":"one-use","expiresIn":1}"#
+        case "devices": body = #"{"deviceId":"device"}"#
+        case "refresh":
+            refreshCount += 1
+            try await Task.sleep(for: .milliseconds(50))
+            body = #"{"accessToken":"new-access","refreshToken":"new-refresh","expiresIn":900}"#
+        default: body = #"{"status":"ok"}"#
+        }
+        return (Data(body.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+}

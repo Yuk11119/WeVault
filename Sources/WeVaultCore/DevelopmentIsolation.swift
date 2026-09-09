@@ -5,12 +5,23 @@ import Foundation
 public enum DevelopmentIsolation {
     public static var root: URL? {
         #if DEBUG
-        guard let path = ProcessInfo.processInfo.environment["WEVAULT_P5_TEST_DIRECTORY"], path.hasPrefix("/"), !path.isEmpty else { return nil }
-        return URL(fileURLWithPath: path).appendingPathComponent("synthetic-wevault", isDirectory: true)
+        return fixtureRoot(
+            environmentPath: ProcessInfo.processInfo.environment["WEVAULT_P5_TEST_DIRECTORY"],
+            bundlePath: Bundle.main.object(forInfoDictionaryKey: "WeVaultDevelopmentFixtureDirectory") as? String
+        )
         #else
         return nil
         #endif
     }
+
+    #if DEBUG
+    // A dedicated smoke bundle must remain isolated when Launch Services or UI tools
+    // relaunch it without the shell's environment. Release builds ignore this key.
+    static func fixtureRoot(environmentPath: String?, bundlePath: String?) -> URL? {
+        guard let path = environmentPath ?? bundlePath, path.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: path).appendingPathComponent("synthetic-wevault", isDirectory: true)
+    }
+    #endif
 
     public static var permitsInteractiveAuthentication: Bool {
         #if DEBUG

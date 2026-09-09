@@ -12,6 +12,7 @@ struct ContentView: View {
     let runAutomationNow: () -> Void
     let openSettings: () -> Void
     @State private var selection: FileRecord.ID?
+    @State private var showsActivity = false
 
     var selectedFile: FileRecord? {
         guard let selection else { return nil }
@@ -26,11 +27,12 @@ struct ContentView: View {
     var body: some View {
         HSplitView {
             sidebar
-                .frame(minWidth: 240, idealWidth: 290, maxWidth: 360)
+                .frame(minWidth: 190, idealWidth: 210, maxWidth: 240)
                 .frame(maxHeight: .infinity, alignment: .topLeading)
             recordList
                 .frame(minWidth: 440, idealWidth: 680)
                 .frame(maxHeight: .infinity, alignment: .topLeading)
+            if selectedFile != nil {
             DetailView(
                 file: selectedFile,
                 families: viewModel.result?.families ?? [],
@@ -38,6 +40,7 @@ struct ContentView: View {
                 archivedSnapshot: selectedArchiveSnapshot,
                 isRestoring: viewModel.isRestoring,
                 isReleasing: viewModel.isReleasing,
+                onClose: { selection = nil },
                 onOpenRestoreCenter: {
                     if let selectedArchiveSnapshot {
                         AppState.shared.openRestoreCenter(bindingID: selectedArchiveSnapshot.binding.bindingID)
@@ -59,8 +62,9 @@ struct ContentView: View {
                     }
                 }
             )
-                .frame(minWidth: 280, idealWidth: 420)
+                .frame(minWidth: 280, idealWidth: 320, maxWidth: 400)
                 .frame(maxHeight: .infinity, alignment: .topLeading)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .alert("WeVault", isPresented: .constant(viewModel.alertMessage != nil), actions: {
@@ -73,131 +77,105 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("WeVault")
-                        .font(.largeTitle.bold())
-                    Text("状态中心 · 手动任务")
-                        .foregroundStyle(.secondary)
-                }
-
-                Button("打开恢复中心") { AppState.shared.openRestoreCenter() }
-                Button("打开设置", action: openSettings)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("当前扫描范围")
-                        .font(.headline)
-                    Text(viewModel.selectedRoot?.path ?? "请选择 xwechat_files 或 wxid_* 账号目录")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                    HStack {
-                        Button("开始扫描", action: viewModel.scan)
-                            .disabled(viewModel.selectedRoot == nil || viewModel.isScanning || isAutomationRunning)
-                        Button("修改设置", action: openSettings)
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("当前策略")
-                        .font(.headline)
-                    Text("大文件 ≥ \(settings.largeFileThresholdMB) MB · 每 \(settings.runIntervalHours) 小时 · 冷却 \(settings.coolingPeriodDays) 天 · quarantine \(settings.quarantineRetentionDays) 天")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text("对象：\(settings.archiveOrdinaryFiles ? "普通文件" : "")\(settings.archiveImageHighLayers ? " 图片高清层" : "")\(settings.archiveVideoRawLayers ? " 视频 Raw 层" : "")")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if viewModel.isScanning {
-                    ProgressView("只读扫描中...")
-                }
-
-                if viewModel.isAutomaticPage {
-                    HStack {
-                        Button("上一页") { viewModel.loadAutomaticPage(previous: true) }.disabled(viewModel.automaticPageNumber <= 1)
-                        Text("第 \(viewModel.automaticPageNumber) / \(viewModel.automaticTotalPages) 页")
-                        Button("下一页") { viewModel.loadAutomaticPage(next: true) }.disabled(!viewModel.hasNextAutomaticPage)
-                    }
-                }
-                activitySection
-
-                automationSection
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("云端连接")
-                        .font(.headline)
-                    Text(settings.cloudMode == .weVault ? managedAccount.status : "自配 OSS/COS 高级配置使用短期 STS 凭证，不保存长期密钥。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("上传已哈希对象") { viewModel.uploadHashedCandidates(managedAccount: managedAccount, selfManagedCloud: selfManagedCloud, mode: settings.cloudMode) }
-                        .disabled(viewModel.result == nil || viewModel.isUploading || isAutomationRunning || (settings.cloudMode == .weVault && !managedAccount.isReady))
-                }
-
-                if !viewModel.restoreMessage.isEmpty || viewModel.isRestoring {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("云端恢复")
-                            .font(.headline)
-                        if viewModel.isRestoring {
-                            ProgressView("下载并校验中...")
-                        }
-                        if !viewModel.restoreMessage.isEmpty {
-                            Text(viewModel.restoreMessage)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
-
-                if !viewModel.releaseMessage.isEmpty || viewModel.isReleasing {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("本地释放")
-                            .font(.headline)
-                        if viewModel.isReleasing {
-                            ProgressView("更新本地副本状态中...")
-                        }
-                        if !viewModel.releaseMessage.isEmpty {
-                            Text(viewModel.releaseMessage)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
-
-                if let result = viewModel.result {
-                    SummaryGrid(summary: result.summary)
-                    Text("Manifest: \(viewModel.manifestURL.path)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                }
-
-                Text("默认不会自动释放本地副本；支持同类型 tombstone 的普通文件经确认释放后，会在微信原路径生成 WeVault 占位文件，占位不是原件。不支持或关闭 tombstone 时原路径为空。不修改微信数据库。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 24) {
+            Text("WeVault").font(.largeTitle.bold())
+            VStack(alignment: .leading, spacing: 12) {
+                Label("文件归档", systemImage: "archivebox.fill")
+                    .font(.headline).foregroundStyle(.tint)
+                Button { AppState.shared.openRestoreCenter() } label: {
+                    Label("恢复文件", systemImage: "arrow.down.doc")
+                }.buttonStyle(.plain)
             }
-            .padding(.top, 24)
-            .padding(.bottom, 18)
-            .padding(.leading, 28)
-            .padding(.trailing, 20)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Label(settings.automaticTasksEnabled ? "自动整理已开启" : "自动整理已暂停",
+                      systemImage: settings.automaticTasksEnabled ? "clock" : "pause.circle")
+                if isAutomationRunning {
+                    ProgressView("正在整理…")
+                } else if settings.automaticExecutionPermitted, let snapshot = automationSnapshot, !snapshot.task.isPaused {
+                    Text("下次：\(snapshot.task.nextRunAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if automationSnapshot?.latestRun?.status == .failed {
+                    Text("上次整理未完成").font(.caption).foregroundStyle(.orange)
+                }
+                Menu("管理自动整理") {
+                    Button("立即整理", action: runAutomationNow)
+                        .disabled(!settings.automaticExecutionPermitted || isAutomationRunning || viewModel.isScanning || viewModel.isUploading)
+                    Button("调整规则", action: openSettings)
+                }.menuStyle(.borderlessButton)
+            }.font(.callout)
+            Spacer()
+            Button(action: openSettings) { Label("设置", systemImage: "gearshape") }
+                .buttonStyle(.plain)
         }
-        .contentMargins(.leading, 0, for: .scrollContent)
+        .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var workflowHeader: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("文件归档").font(.title2.bold())
+                    Text("扫描文件 → 归档到云端 → 随时恢复")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if viewModel.isScanning || viewModel.isUploading {
+                    ProgressView().controlSize(.small)
+                    Button("停止", action: viewModel.cancelManualTask)
+                } else {
+                    Button(viewModel.result == nil ? "扫描文件" : "重新扫描", action: viewModel.scan)
+                        .disabled(viewModel.selectedRoot == nil || isAutomationRunning)
+                    if viewModel.result != nil {
+                        Button("归档到云端") {
+                            viewModel.uploadHashedCandidates(managedAccount: managedAccount, selfManagedCloud: selfManagedCloud, mode: settings.cloudMode)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isAutomationRunning || (settings.cloudMode == .weVault && !managedAccount.isReady))
+                    }
+                }
+            }
+            if viewModel.selectedRoot == nil {
+                Button("选择微信文件夹", action: openSettings)
+            } else {
+                Text(viewModel.selectedRoot!.lastPathComponent + " · 大于等于 \(settings.largeFileThresholdMB) MB")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .help(viewModel.selectedRoot!.path)
+            }
+            if viewModel.result != nil && settings.cloudMode == .weVault && !managedAccount.isReady {
+                Button("登录后即可归档", action: openSettings).font(.callout)
+            }
+            if !viewModel.uploadMessage.isEmpty { Text(viewModel.uploadMessage).font(.callout).textSelection(.enabled) }
+            if !viewModel.releaseMessage.isEmpty { Text(viewModel.releaseMessage).font(.callout).textSelection(.enabled) }
+            Button { showsActivity.toggle() } label: {
+                Label("最近活动", systemImage: "clock.arrow.circlepath")
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showsActivity, arrowEdge: .bottom) {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("最近活动").font(.headline)
+                        Spacer()
+                        Button { showsActivity = false } label: { Image(systemName: "xmark") }
+                            .buttonStyle(.plain).accessibilityLabel("关闭最近活动")
+                    }
+                    ScrollView {
+                        activitySection
+                        if let run = automationSnapshot?.latestRun {
+                            Text(automationRunDescription(run)).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }.padding(16).frame(width: 320, height: 280)
+            }
+        }.padding()
     }
 
     private var recordList: some View {
         VStack(spacing: 0) {
+            workflowHeader
+            Divider()
             HStack {
                 Picker("类型", selection: $viewModel.filter) {
                     ForEach(RecordFilter.allCases) { filter in
@@ -215,25 +193,13 @@ struct ContentView: View {
                     TableColumn("类型", value: \.sortTypeTitle) { file in
                         Text(file.objectType.displayName)
                     }
-                    .width(min: 90, ideal: 110)
+                    .width(min: 70, ideal: 85)
 
                     TableColumn("文件名", value: \.filename) { file in
                         Text(file.filename)
                             .lineLimit(1)
                     }
                     .width(min: 180, ideal: 260)
-
-                    TableColumn("会话/来源", value: \.sortConversationTitle) { file in
-                        Text(file.conversationName ?? "未解析")
-                            .foregroundStyle(file.conversationName == nil ? .secondary : .primary)
-                    }
-                    .width(min: 110, ideal: 150)
-
-                    TableColumn("月份", value: \.sortMonthTitle) { file in
-                        Text(file.month ?? "-")
-                            .monospacedDigit()
-                    }
-                    .width(70)
 
                     TableColumn("大小", value: \.sizeBytes) { file in
                         Text(humanBytes(file.sizeBytes))
@@ -248,16 +214,28 @@ struct ContentView: View {
                     }
                     .width(min: 100, ideal: 120)
             }
-            .frame(minWidth: 680)
+            .overlay {
+                if viewModel.filteredFiles.isEmpty && !viewModel.isScanning {
+                    ContentUnavailableView(viewModel.result == nil && !viewModel.isAutomaticPage ? "先扫描，看看哪些文件可以归档" : "没有符合条件的文件",
+                        systemImage: "doc.text.magnifyingglass")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(nsColor: .textBackgroundColor))
+                }
+            }
+            if viewModel.isAutomaticPage {
+                HStack {
+                    Button("上一页") { viewModel.loadAutomaticPage(previous: true) }.disabled(viewModel.automaticPageNumber <= 1 || viewModel.isLoadingPage)
+                    Text("第 \(viewModel.automaticPageNumber) / \(viewModel.automaticTotalPages) 页")
+                    Button("下一页") { viewModel.loadAutomaticPage(next: true) }.disabled(!viewModel.hasNextAutomaticPage || viewModel.isLoadingPage)
+                }.padding(10)
+            }
         }
     }
 
     private var activitySection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("最近任务")
-                .font(.headline)
             if viewModel.recentOperations.isEmpty {
-                Text("暂无任务记录。完成一次扫描后会在这里显示最近结果和异常。")
+                Text("暂无活动")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -266,11 +244,6 @@ struct ContentView: View {
                         Text(operation.eventTitle)
                             .font(.caption.weight(.medium))
                             .foregroundStyle(operation.isFailure ? .red : .primary)
-                        Text(operation.detail ?? "-")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
                         Text(operation.createdAt.formatted(date: .abbreviated, time: .shortened))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
@@ -281,39 +254,18 @@ struct ContentView: View {
         }
     }
 
-    private var automationSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("自动任务").font(.headline)
-                Spacer()
-                Button(isAutomationRunning ? "正在运行…" : (automationSnapshot?.latestRun?.status == .failed ? "立即重试" : "立即运行"), action: runAutomationNow)
-                    .disabled(!settings.automaticTasksEnabled || isAutomationRunning)
-            }
-            if let snapshot = automationSnapshot {
-                Text(snapshot.task.isPaused ? "已暂停" : "下次运行：\(snapshot.task.nextRunAt.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption).foregroundStyle(.secondary)
-                if let run = snapshot.latestRun {
-                    Text(automationRunDescription(run))
-                        .font(.caption).foregroundStyle(run.status == .failed ? .red : .secondary).fixedSize(horizontal: false, vertical: true)
-                }
-            } else {
-                Text("正在恢复任务状态…").font(.caption).foregroundStyle(.secondary)
-            }
-        }
-    }
-
     private func automationRunDescription(_ run: AutomationTaskRun) -> String {
         switch run.status {
         case .waitingForCloud:
-            return "\(run.failureReason ?? "等待云端条件")；未扫描、上传或释放本地副本。"
+            return "\(run.failureReason ?? "等待云端条件")"
         case .completed:
-            return "已完成：\(run.completedUnits)/\(run.totalUnits) 项处理步骤（上传校验、隔离及到期释放）。"
+            return "整理完成"
         case .failed:
             return "失败（\(run.completedUnits)/\(run.totalUnits) 已完成）：\(run.failureReason ?? "可重试错误")"
         case .running:
             return "\(run.stage.displayName)：\(run.completedUnits)/\(run.totalUnits)"
-        default:
-            return run.failureReason ?? run.status.rawValue
+        case .scheduled: return "等待下次整理"
+        case .paused: return "自动整理已暂停"
         }
     }
 
@@ -340,7 +292,7 @@ final class ScanViewModel: ObservableObject {
     @Published var alertMessage: String?
     @Published var largeFileThresholdMB: Double = 50
     @Published var filter: RecordFilter = .all {
-        didSet { if isAutomaticPage { loadAutomaticPage(reset: true) } }
+        didSet { if isAutomaticPage || isLoadingPage { loadAutomaticPage(reset: true) } }
     }
     @Published var cloudSnapshots: [String: CloudArchiveSnapshot] = [:]
     @Published var archivedSnapshots: [String: ArchivedFileSnapshot] = [:]
@@ -352,172 +304,108 @@ final class ScanViewModel: ObservableObject {
     @Published var releaseMessage = ""
     @Published var recentOperations: [OperationRecord] = []
     @Published var sortOrder = [KeyPathComparator(\FileRecord.filename, comparator: .localizedStandard)] {
-        didSet { if isAutomaticPage { loadAutomaticPage(reset: true) } }
+        didSet { if isAutomaticPage || isLoadingPage { loadAutomaticPage(reset: true) } }
     }
 
     @Published var isAutomaticPage = false
     @Published var hasNextAutomaticPage = false
     @Published var automaticPageNumber = 1
     private var loadedScanSession: String?
-    private let archiveStoreFactory: () throws -> ManifestStore
+    private let archiveStoreFactory: @Sendable () throws -> ManifestStore
     @Published private(set) var automaticFilteredCount = 0
     var automaticTotalPages: Int { max(1, (automaticFilteredCount + 49) / 50) }
     private var automaticCursors: [FileRecord?] = [nil]
 
-    private func matchesFilter(_ file: FileRecord) -> Bool {
-        switch filter {
-        case .all: return true
-        case .ordinary: return file.objectType == .ordinaryFile
-        case .image: return file.objectType == .imageHighLayer
-        case .video: return file.objectType == .videoRawLayer
-        case .duplicates: return file.duplicateGroupID != nil
-        }
-    }
+    private var pageTask: Task<Void, Never>?
+    private var pageGeneration = 0
+    @Published private(set) var isLoadingPage = false
 
-    private func precedes(_ lhs: FileRecord, _ rhs: FileRecord) -> Bool {
-        for comparator in sortOrder {
-            let result = comparator.compare(lhs, rhs)
-            if result != .orderedSame { return result == .orderedAscending }
-        }
-        return lhs.path < rhs.path
-    }
+    func waitForPage() async { await pageTask?.value }
 
     func loadAutomaticPage(reset: Bool = false, next: Bool = false, previous: Bool = false) {
         guard let root = selectedRoot else { return }
-        do {
-            let store = try archiveStoreFactory()
-            try store.readTransaction {
-            guard let session = try store.currentScanSession(),
-                  try store.workGet(String.self, scope: session + ".metadata", key: "root") == root.standardizedFileURL.path else { return }
-            if reset || loadedScanSession != session { automaticCursors = [nil]; automaticPageNumber = 1; loadedScanSession = session; hasNextAutomaticPage = false }
-            if next, hasNextAutomaticPage { automaticPageNumber += 1 }
-            if previous, automaticPageNumber > 1 { automaticPageNumber -= 1 }
-            // Decrypt in bounded batches: keep only the next 51 globally ordered
-            // matches, never the full scan or plaintext sort keys on disk.
-            let boundary = automaticCursors[automaticPageNumber - 1]
-            var rows: [FileRecord] = []
-            var cursor: Int64 = 0
-            var count = 0
-            while true {
-                let batch = try store.workPage(FileRecord.self, scope: session + ".files", after: cursor)
-                guard let last = batch.last else { break }
-                cursor = last.id
-                for row in batch where matchesFilter(row.value) {
-                    count += 1
-                    if let boundary, !precedes(boundary, row.value) { continue }
-                    let index = rows.firstIndex { precedes(row.value, $0) } ?? rows.endIndex
-                    if index < 51 {
-                        rows.insert(row.value, at: index)
-                        if rows.count > 51 { rows.removeLast() }
-                    }
+        pageGeneration += 1
+        let generation = pageGeneration
+        pageTask?.cancel()
+        let pageNumber = reset ? 1 : max(1, automaticPageNumber + (next && hasNextAutomaticPage ? 1 : 0) - (previous ? 1 : 0))
+        let boundary = reset ? nil : automaticCursors.indices.contains(pageNumber - 1) ? automaticCursors[pageNumber - 1] : nil
+        let oldSession = loadedScanSession
+        let sort = sortOrder, selectedFilter = filter
+        let factory = archiveStoreFactory
+        let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
+        isLoadingPage = true
+        pageTask = Task {
+            defer { if generation == pageGeneration { isLoadingPage = false } }
+            do {
+                let worker = Task.detached(priority: .utility) {
+                    try ScanPageReader.load(store: factory().reopen(), root: root, previousSession: oldSession,
+                        boundary: boundary, filter: selectedFilter, sort: sort, threshold: threshold)
                 }
-            }
-            automaticFilteredCount = count
-            hasNextAutomaticPage = rows.count > 50
-            if let last = rows.prefix(50).last, automaticCursors.count == automaticPageNumber { automaticCursors.append(last) }
-            var visible: [FileRecord] = [], families: [FamilyRecord] = []
-            archivedSnapshots = [:]; cloudSnapshots = [:]
-            for row in rows.prefix(50) {
-                var file = row
-                if let snapshot = try store.archivedSnapshot(path: file.path), snapshot.archivedFile.sha256 == file.sha256 {
-                    archivedSnapshots[file.path] = snapshot
-                    cloudSnapshots[file.path] = CloudArchiveSnapshot(object: snapshot.object, binding: snapshot.binding)
-                    file = Self.displayRecord(for: snapshot)
-                    file.duplicateGroupID = row.duplicateGroupID
-                }
-                if let family = try store.workGet(FamilyRecord.self, scope: session + ".families", key: file.path) { families.append(family) }
-                visible.append(file)
-            }
-            let summary = try store.workGet(ScanSummary.self, scope: session + ".metadata", key: "summary") ?? .zero
-            isAutomaticPage = true
-            result = ScanResult(rootPath: root.path, scannedAt: Date(), largeFileThresholdBytes: Int64(largeFileThresholdMB * 1024 * 1024), files: visible, families: families, duplicateGroups: [], summary: summary)
-            }
-        } catch { alertMessage = error.localizedDescription }
+                let page = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+                guard !Task.isCancelled, generation == pageGeneration, selectedRoot == root, let page else { return }
+                if reset || page.session != loadedScanSession { automaticCursors = [nil]; automaticPageNumber = 1 }
+                else { automaticPageNumber = pageNumber }
+                loadedScanSession = page.session
+                hasNextAutomaticPage = page.hasNext
+                if let last = page.lastBoundary, automaticCursors.count == automaticPageNumber { automaticCursors.append(last) }
+                automaticFilteredCount = page.count
+                archivedSnapshots = page.archived
+                cloudSnapshots = page.cloud
+                isAutomaticPage = true
+                result = page.result
+            } catch is CancellationError { }
+              catch { if generation == pageGeneration { alertMessage = UserFacingFailure.describe(error).description } }
+        }
     }
 
     let manifestURL = ManifestStore.defaultDatabaseURL()
 
-    init(archiveStoreFactory: @escaping () throws -> ManifestStore = { try ManifestStore() }) {
+    init(archiveStoreFactory: @escaping @Sendable () throws -> ManifestStore = { try ManifestStore() }) {
         self.archiveStoreFactory = archiveStoreFactory
         selectedRoot = nil
     }
 
     func apply(_ settings: ProductSettings) {
+        pageGeneration += 1
+        pageTask?.cancel()
+        isLoadingPage = false
+        if Int(largeFileThresholdMB) != settings.largeFileThresholdMB { cancelManualTask() }
+        if selectedRoot?.path != settings.scanRootPath { cancelManualTask(); result = nil; isAutomaticPage = false }
         largeFileThresholdMB = Double(settings.largeFileThresholdMB)
         selectedRoot = settings.scanRootPath.map { URL(fileURLWithPath: $0) }
         restorePersistedArchiveView()
     }
 
     var activitySummary: String {
-        if isScanning { return "正在执行手动扫描" }
+        if isScanning { return "正在扫描文件" }
         if let latest = recentOperations.first {
             return latest.isFailure ? "最近任务出现异常：\(latest.event)" : "最近任务：\(latest.event)"
         }
         return "尚无任务记录"
     }
 
+    private var activityTask: Task<Void, Never>?
     func reloadActivity() {
-        recentOperations = (try? ManifestStore().recentOperations()) ?? []
+        activityTask?.cancel()
+        let factory = archiveStoreFactory
+        activityTask = Task {
+            let worker = Task.detached(priority: .utility) { try factory().reopen().recentOperations() }
+            do {
+                let operations = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+                if !Task.isCancelled { recentOperations = operations }
+            } catch is CancellationError { }
+              catch { if !Task.isCancelled { alertMessage = UserFacingFailure.describe(error).description } }
+        }
     }
 
     /// Restores verified manifest bindings immediately after launch, so a completed
     /// background task remains visible without forcing another filesystem scan.
     private func restorePersistedArchiveView() {
-        guard let selectedRoot else {
-            result = nil
-            cloudSnapshots = [:]
-            archivedSnapshots = [:]
+        guard selectedRoot != nil else {
+            result = nil; cloudSnapshots = [:]; archivedSnapshots = [:]
             return
         }
-        do {
-            let store = try archiveStoreFactory()
-            if let session = try store.currentScanSession(),
-               try store.workGet(String.self, scope: session + ".metadata", key: "root") == selectedRoot.standardizedFileURL.path {
-                loadAutomaticPage(reset: true); return
-            }
-            let cloud: [String: CloudArchiveSnapshot] = [:]
-            let archived = Dictionary(try store.archivedFilePage().map { ($0.archivedFile.filePath, $0) }, uniquingKeysWith: { first, _ in first })
-            let rootPath = selectedRoot.standardizedFileURL.path
-            let visible = archived.values.filter { snapshot in
-                let path = URL(fileURLWithPath: snapshot.archivedFile.filePath).standardizedFileURL.path
-                return path == rootPath || path.hasPrefix(rootPath + "/")
-            }
-            let files = visible.map(Self.displayRecord(for:)).sorted { $0.relativePath < $1.relativePath }
-            let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
-            let ordinary = files.filter { $0.objectType == .ordinaryFile }
-            let largeOrdinary = ordinary.filter { $0.sizeBytes >= threshold }
-            let images = files.filter { $0.objectType == .imageHighLayer }
-            let videos = files.filter { $0.objectType == .videoRawLayer }
-            let summary = ScanSummary(
-                ordinaryCount: ordinary.count,
-                ordinaryBytes: ordinary.reduce(0) { $0 + $1.sizeBytes },
-                largeOrdinaryCount: largeOrdinary.count,
-                largeOrdinaryBytes: largeOrdinary.reduce(0) { $0 + $1.sizeBytes },
-                imageHighCandidateCount: images.count,
-                imageHighCandidateBytes: images.reduce(0) { $0 + $1.sizeBytes },
-                videoRawCandidateCount: videos.count,
-                videoRawCandidateBytes: videos.reduce(0) { $0 + $1.sizeBytes },
-                videoRawDiscoveredCount: videos.count,
-                videoRawDiscoveredBytes: videos.reduce(0) { $0 + $1.sizeBytes },
-                videoPlaybackDiscoveredCount: 0,
-                videoPlaybackDiscoveredBytes: 0,
-                duplicateReclaimableBytes: 0
-            )
-            cloudSnapshots = cloud
-            archivedSnapshots = archived
-            result = ScanResult(
-                rootPath: rootPath,
-                scannedAt: visible.map(\.archivedFile.updatedAt).max() ?? Date(),
-                largeFileThresholdBytes: threshold,
-                files: files,
-                families: [],
-                duplicateGroups: [],
-                summary: summary
-            )
-        } catch {
-            result = nil
-            alertMessage = error.localizedDescription
-        }
+        loadAutomaticPage(reset: true)
     }
 
     /// Publishes a completed background scan into the same state used by the
@@ -569,103 +457,84 @@ final class ScanViewModel: ObservableObject {
     }
 
     var uploadScopeSummary: String {
+        if isAutomaticPage { return "上传前会分批刷新整个扫描范围；处理达到阈值的普通文件、重复文件及媒体候选，不限于当前页。" }
         guard let files = result?.files else {
             return "扫描后可上传已有 SHA 的可归档对象；上传前会按当前阈值刷新扫描，普通大文件和重复文件会计算 SHA，重复对象云端只保存一份。"
         }
         let uploadable = uploadableFiles(from: files)
         guard !uploadable.isEmpty else {
-            return "当前没有可上传对象。普通文件需达到当前大文件阈值或进入重复识别；图片高清层和视频 Raw 候选会计算 SHA。"
+            return "当前没有可上传对象。普通文件需达到当前大文件阈值或进入重复识别；高清图片和视频 Raw 候选会计算 SHA。"
         }
         let ordinary = uploadable.filter { $0.objectType == .ordinaryFile }.count
         let image = uploadable.filter { $0.objectType == .imageHighLayer }.count
         let video = uploadable.filter { $0.objectType == .videoRawLayer }.count
         let uniqueObjects = Dictionary(grouping: uploadable, by: { $0.sha256 ?? $0.path }).values.compactMap(\.first)
         let uniqueBytes = uniqueObjects.reduce(Int64(0)) { $0 + $1.sizeBytes }
-        return "将上传本次扫描中已有 SHA 且可归档的对象：普通文件 \(ordinary) 项、图片高清层 \(image) 项、视频 Raw 层 \(video) 项；按 SHA 去重后云端对象 \(uniqueObjects.count) 个，约 \(humanBytes(uniqueBytes))。上传前会按当前阈值刷新扫描；不会上传无 SHA、不可归档项，也不会移动或删除本地文件。"
+        return "将上传本次扫描中已有 SHA 且可归档的对象：普通文件 \(ordinary) 项、高清图片 \(image) 项、原画视频 \(video) 项；按 SHA 去重后云端对象 \(uniqueObjects.count) 个，约 \(humanBytes(uniqueBytes))。上传前会按当前阈值刷新扫描；不会上传无 SHA、不可归档项，也不会移动或删除本地文件。"
     }
 
+    private var manualTask: Task<Void, Never>?
+
+    func cancelManualTask() { manualTask?.cancel() }
+
     func scan() {
-        guard let selectedRoot else { return }
+        guard let root = selectedRoot, !isScanning, !isUploading else { return }
         do { try OperationCoordinator.shared.acquire(OperationCoordinator.pipelineKey()) }
-        catch { alertMessage = error.localizedDescription; return }
+        catch { alertMessage = UserFacingFailure.describe(error).description; return }
         isScanning = true
-        isAutomaticPage = false
         alertMessage = nil
         let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
-
-        Task {
-            defer { OperationCoordinator.shared.release(OperationCoordinator.pipelineKey()) }
+        manualTask = Task {
+            defer { isScanning = false; manualTask = nil; OperationCoordinator.shared.release(OperationCoordinator.pipelineKey()) }
             do {
-                let scanResult = try await Task.detached(priority: .userInitiated) {
-                    let scanner = WeChatScanner()
+                let worker = Task.detached(priority: .utility) {
                     let store = try ManifestStore()
-                    let knownPlaceholders = try store.archivedFileSnapshots().values.compactMap(\.binding.placeholderPath)
-                    let scanned = try scanner.scan(root: selectedRoot, options: ScanOptions(largeFileThresholdBytes: threshold, knownPlaceholderPaths: Set(knownPlaceholders)))
-                    try store.save(scanResult: scanned)
-                    let snapshots = try store.cloudArchiveSnapshots()
-                    let archived = try store.archivedFileSnapshots()
-                    let result = Self.scanResultByAddingArchivedDisplayRecords(scanned, archived: archived, under: selectedRoot)
-                    return (result, snapshots, archived)
-                }.value
-                result = scanResult.0
-                cloudSnapshots = scanResult.1
-                archivedSnapshots = scanResult.2
+                    return try await ManualArchivePipeline.scan(root: root, threshold: threshold, store: store)
+                }
+                _ = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+                if selectedRoot == root { loadAutomaticPage(reset: true) }
                 reloadActivity()
-            } catch {
-                alertMessage = error.localizedDescription
-            }
-            isScanning = false
+            } catch { alertMessage = UserFacingFailure.describe(error).description }
         }
     }
 
     func uploadHashedCandidates(managedAccount: ManagedAccount, selfManagedCloud: SelfManagedCloud, mode: ProductSettings.CloudMode) {
-        guard let selectedRoot else { return }
+        guard let root = selectedRoot, !isScanning, !isUploading else { return }
         do { try OperationCoordinator.shared.acquire(OperationCoordinator.pipelineKey()) }
-        catch { alertMessage = error.localizedDescription; return }
+        catch { alertMessage = UserFacingFailure.describe(error).description; return }
         isUploading = true
         alertMessage = nil
-        uploadMessage = "按当前阈值刷新扫描..."
+        uploadMessage = "正在检查文件并归档…"
         let threshold = Int64(largeFileThresholdMB * 1024 * 1024)
-
-        Task {
-            defer { OperationCoordinator.shared.release(OperationCoordinator.pipelineKey()) }
+        manualTask = Task {
+            defer { isUploading = false; manualTask = nil; OperationCoordinator.shared.release(OperationCoordinator.pipelineKey()) }
             do {
-                let refreshed = try await Task.detached(priority: .userInitiated) {
-                    let scanner = WeChatScanner()
+                let config = mode == .selfManaged ? try selfManagedCloud.storageConfig() : nil
+                let initialAuthorization = mode == .weVault ? try await managedAccount.withAuthorizedDevice() : nil
+                let worker = Task.detached(priority: .utility) {
                     let store = try ManifestStore()
-                    let knownPlaceholders = try store.archivedFileSnapshots().values.compactMap(\.binding.placeholderPath)
-                    let scanned = try scanner.scan(root: selectedRoot, options: ScanOptions(largeFileThresholdBytes: threshold, knownPlaceholderPaths: Set(knownPlaceholders)))
-                    try store.save(scanResult: scanned)
-                    let cloudSnapshots = try store.cloudArchiveSnapshots()
-                    let archivedSnapshots = try store.archivedFileSnapshots()
-                    let scanResult = Self.scanResultByAddingArchivedDisplayRecords(scanned, archived: archivedSnapshots, under: selectedRoot)
-                    return (scanResult, cloudSnapshots, archivedSnapshots)
-                }.value
-                result = refreshed.0
-                cloudSnapshots = refreshed.1
-                archivedSnapshots = refreshed.2
-                uploadMessage = "准备上传：\(uploadableFiles(from: refreshed.0.files).count) 项绑定"
-
-                let store = try ManifestStore()
-                let snapshots: [String: CloudArchiveSnapshot]
-                if mode == .weVault {
-                    let authorization = try await managedAccount.withAuthorizedDevice()
-                    snapshots = try await ManagedCloudArchiveService().upload(files: refreshed.0.files, families: refreshed.0.families, api: authorization.api, accessToken: authorization.accessToken, deviceId: authorization.deviceID, store: store) { [weak self] progress in
-                        await MainActor.run { self?.apply(progress) }
-                    }
-                } else {
-                    snapshots = try await CloudUploadService().upload(files: refreshed.0.files, families: refreshed.0.families, config: try selfManagedCloud.storageConfig(), store: store) { [weak self] progress in
-                        await MainActor.run { self?.apply(progress) }
-                    }
+                    let session = try await ManualArchivePipeline.scan(root: root, threshold: threshold, store: store)
+                    return try await ManualArchivePipeline.upload(session: session, root: root, threshold: threshold, store: store,
+                        progress: { summary in
+                            await MainActor.run { self.uploadMessage = "已处理 \(summary.attempted) 项：校验成功 \(summary.verified)，失败 \(summary.failed)" }
+                        }) { files, families, connection in
+                            if let initialAuthorization {
+                                let authorization = try await managedAccount.withAuthorizedDevice()
+                                guard authorization.deviceID == initialAuthorization.deviceID else { throw CancellationError() }
+                                _ = try await ManagedCloudArchiveService().uploadBatch(files: files, families: families, api: authorization.api, accessToken: authorization.accessToken, deviceID: authorization.deviceID, store: connection)
+                            } else if let config {
+                                _ = try await CloudUploadService().upload(files: files, families: families, config: config, store: connection, includeAllSnapshots: false)
+                            }
+                        }
                 }
-                cloudSnapshots = snapshots
-                archivedSnapshots = try store.archivedFileSnapshots()
-                reloadActivity()
-                uploadMessage = "上传完成：已校验 \(snapshots.values.filter { $0.object.verifyStatus == .verified }.count) 项绑定"
+                let summary = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+                uploadMessage = "归档完成 \(summary.verified) 项，未完成 \(summary.failed) 项。"
             } catch {
-                alertMessage = error.localizedDescription
+                alertMessage = UserFacingFailure.describe(error).description
+                uploadMessage = UserFacingFailure.describe(error).description
             }
-            isUploading = false
+            if selectedRoot == root { loadAutomaticPage(reset: true) }
+            reloadActivity()
         }
     }
 
@@ -692,12 +561,28 @@ final class ScanViewModel: ObservableObject {
                     restoreMessage += snapshot.archivedFile.objectType == .imageHighLayer ? "\n请回微信保存高清/原图。" : "\n请回微信执行高质量保存/导出。"
                 } else { NSWorkspace.shared.activateFileViewerSelecting([result.destinationURL]) }
             } catch {
-                restoreMessage = "恢复失败：\(error.localizedDescription)"
+                restoreMessage = "恢复失败：\(UserFacingFailure.describe(error).description)"
                 if let store = try? ManifestStore() {
                     try? refreshArchiveSnapshots(store: store)
                 }
             }
             isRestoring = false
+        }
+    }
+
+    private func checkCloudBeforeRelease(_ snapshot: ArchivedFileSnapshot, store: ManifestStore) async throws {
+        if snapshot.object.storageProvider == "WeVault Managed Cloud" {
+            let authorization = try await AppState.shared.managedAccount.withAuthorizedDevice()
+            guard try await ManagedCloudArchiveService().isAuthorizedArchive(snapshot, api: authorization.api, accessToken: authorization.accessToken, deviceID: authorization.deviceID, store: store) else {
+                throw WeVaultAPIFailure(code: "ARCHIVE_UNAVAILABLE", statusCode: 404, message: "Archive unavailable")
+            }
+        } else {
+            let config = try AppState.shared.selfManagedCloud.storageConfig()
+            guard config.provider == snapshot.object.storageProvider, config.bucket == snapshot.object.bucketOrContainer else {
+                throw WeVaultError.cloud("自配云端与归档不匹配")
+            }
+            let head = try await S3CompatibleObjectStorageClient(config: config).headObject(objectKey: snapshot.object.objectKey)
+            guard head.sizeBytes == snapshot.object.sizeBytes, head.metadata["sha256"] == snapshot.object.sha256 else { throw WeVaultError.cloud("释放前云端校验失败") }
         }
     }
 
@@ -710,6 +595,7 @@ final class ScanViewModel: ObservableObject {
         Task {
             do {
                 let store = try ManifestStore()
+                try await checkCloudBeforeRelease(snapshot, store: store)
                 let releaseService = LocalReleaseService()
                 let result: LocalReleaseResult
                 result = try await Task.detached(priority: .utility) {
@@ -718,19 +604,19 @@ final class ScanViewModel: ObservableObject {
                 try refreshArchiveSnapshots(store: store)
                 reloadActivity()
                 if snapshot.archivedFile.objectType == .imageHighLayer {
-                    releaseMessage = "图片高清层已进入隔离区，原高清路径为空；普通查看层仍在本地，高清/原图需要时可从云端恢复。"
+                    releaseMessage = "高清原件已暂存，普通图片仍可查看。"
                 } else if snapshot.archivedFile.objectType == .videoRawLayer {
-                    releaseMessage = "视频 Raw 层已进入隔离区，原 Raw 路径为空；普通播放版本仍在本地，保存/导出高质量版本前请从云端恢复 Raw 层。"
-                } else if let placeholder = result.placeholderURL {
-                    releaseMessage = "原件已进入隔离区，微信原路径已写入 tombstone：\(placeholder.path)"
+                    releaseMessage = "原画视频已暂存，普通版本仍可播放。"
+                } else if result.placeholderURL != nil {
+                    releaseMessage = "原件已暂存，原位置保留了恢复提示。"
                 } else if createTombstone {
-                    releaseMessage = "原件已进入隔离区；当前文件类型未生成同类型 tombstone，微信原路径为空。"
+                    releaseMessage = "原件已暂存，该类型不支持恢复提示，原位置为空。"
                 } else {
-                    releaseMessage = "原件已进入隔离区；tombstone 已关闭，微信原路径为空。"
+                    releaseMessage = "原件已暂存，原位置为空。"
                 }
             } catch {
-                alertMessage = error.localizedDescription
-                releaseMessage = "隔离失败：\(error.localizedDescription)"
+                alertMessage = UserFacingFailure.describe(error).description
+                releaseMessage = "隔离失败：\(UserFacingFailure.describe(error).description)"
                 if let store = try? ManifestStore() {
                     try? refreshArchiveSnapshots(store: store)
                 }
@@ -759,8 +645,8 @@ final class ScanViewModel: ObservableObject {
                 releaseMessage = "已回滚并通过 SHA-256 校验：\(result.originalURL.path)"
                 NSWorkspace.shared.activateFileViewerSelecting([result.originalURL])
             } catch {
-                alertMessage = error.localizedDescription
-                releaseMessage = "回滚失败：\(error.localizedDescription)"
+                alertMessage = UserFacingFailure.describe(error).description
+                releaseMessage = "回滚失败：\(UserFacingFailure.describe(error).description)"
                 if let store = try? ManifestStore() {
                     try? refreshArchiveSnapshots(store: store)
                 }
@@ -778,15 +664,16 @@ final class ScanViewModel: ObservableObject {
         Task {
             do {
                 let store = try ManifestStore()
+                try await checkCloudBeforeRelease(snapshot, store: store)
                 _ = try await Task.detached(priority: .utility) {
                     try LocalReleaseService().finalizeSafely(snapshot: snapshot, store: store, authorization: .manual(confirmed: true, skipRestoreTest: true))
                 }.value
                 try refreshArchiveSnapshots(store: store)
                 reloadActivity()
-                releaseMessage = "已删除隔离副本；云端对象和 manifest 仍保留，可从云端恢复。"
+                releaseMessage = "空间已释放，需要时可从云端恢复。"
             } catch {
-                alertMessage = error.localizedDescription
-                releaseMessage = "确认释放失败：\(error.localizedDescription)"
+                alertMessage = UserFacingFailure.describe(error).description
+                releaseMessage = "确认释放失败：\(UserFacingFailure.describe(error).description)"
                 if let store = try? ManifestStore() {
                     try? refreshArchiveSnapshots(store: store)
                 }
@@ -859,62 +746,36 @@ final class ScanViewModel: ObservableObject {
         return merged
     }
 
-    nonisolated private static func displayRecord(for snapshot: ArchivedFileSnapshot) -> FileRecord {
-        let archived = snapshot.archivedFile
-        let status: ArchiveStatus
-        let reason: String
-        switch snapshot.binding.localState {
-        case .tombstoned:
-            status = .tombstoned
-            reason = "原件已归档，微信原路径为 tombstone 占位提示；可从详情恢复原件。"
-        case .quarantined:
-            status = .releaseEligible
-            reason = "原件已进入 WeVault quarantine，微信原路径为空；可从详情回滚或从云端恢复。"
-        case .localReleased:
-            status = .localReleased
-            reason = "本地隔离副本已确认释放；云端对象和 manifest 仍保留，可从详情恢复。"
-        default:
-            status = .verified
-            reason = "已归档普通文件。"
-        }
-        return FileRecord(
-            path: archived.filePath,
-            relativePath: archived.relativePath,
-            objectType: archived.objectType,
-            accountHash: archived.accountHash,
-            accountName: archived.accountName,
-            filename: archived.originalFilename,
-            fileExtension: URL(fileURLWithPath: archived.originalFilename).pathExtension.lowercased(),
-            month: archived.month,
-            sizeBytes: archived.sizeBytes,
-            allocatedBytes: snapshot.binding.placeholderSize ?? 0,
-            inode: 0,
-            nlink: 0,
-            mtime: archived.mtime,
-            sha256: archived.sha256,
-            status: status,
-            candidateReason: reason
-        )
-    }
+    nonisolated static func displayRecord(for snapshot: ArchivedFileSnapshot) -> FileRecord { snapshot.displayFileRecord }
 
 }
 
-private extension OperationRecord {
+extension OperationRecord {
     var eventTitle: String {
         switch event {
-        case "SCAN_STARTED": "扫描开始"
-        case "SCAN_FINISHED": "扫描完成"
-        case "UPLOAD_FINISHED": "上传完成"
-        case "VERIFY_FINISHED": "云端校验完成"
-        case "RESTORE_FINISHED": "恢复完成"
-        case "RELEASE_QUARANTINE_FINISHED", "IMAGE_HIGH_RELEASE_QUARANTINE_FINISHED", "VIDEO_RAW_RELEASE_QUARANTINE_FINISHED": "已进入 quarantine"
-        case "RELEASE_DELETE_QUARANTINE_FINISHED": "已确认释放空间"
-        default: event
+        case "SCAN_STARTED": return "扫描开始"
+        case "SCAN_FINISHED": return "扫描完成"
+        case "MANAGED_UPLOAD_VERIFIED", "UPLOAD_FINISHED": return "上传完成"
+        case "VERIFY_FINISHED": return "云端校验完成"
+        case "RESTORE_FINISHED": return "恢复完成"
+        case "RELEASE_QUARANTINE_FINISHED", "IMAGE_HIGH_RELEASE_QUARANTINE_FINISHED", "VIDEO_RAW_RELEASE_QUARANTINE_FINISHED": return "已移入暂存区"
+        case "RELEASE_DELETE_QUARANTINE_FINISHED": return "已确认释放空间"
+        case "AUTOMATION_ISOLATED": return "已移入暂存区"
+        case "AUTOMATION_FINALIZED": return "已释放空间"
+        default:
+            if event.contains("FAILED") { return "操作未完成，请重试" }
+            if event.contains("CANCELLED") { return "操作已停止" }
+            if event.contains("ROLLBACK") { return "还原本地文件" }
+            if event.contains("RESTORE") { return "恢复文件" }
+            if event.contains("UPLOAD") { return "归档文件" }
+            if event.contains("VERIFY") { return "检查云端文件" }
+            if event.contains("RELEASE") { return "整理本地文件" }
+            return "整理记录已更新"
         }
     }
 }
 
-enum RecordFilter: String, CaseIterable, Identifiable {
+enum RecordFilter: String, CaseIterable, Identifiable, Sendable {
     case all
     case ordinary
     case image
@@ -927,8 +788,8 @@ enum RecordFilter: String, CaseIterable, Identifiable {
         switch self {
         case .all: "全部"
         case .ordinary: "普通文件"
-        case .image: "图片高清层"
-        case .video: "视频 Raw 层"
+        case .image: "高清图片"
+        case .video: "原画视频"
         case .duplicates: "重复"
         }
     }
@@ -938,8 +799,8 @@ extension ArchiveObjectType {
     var displayName: String {
         switch self {
         case .ordinaryFile: "普通文件"
-        case .imageHighLayer: "图片高清层"
-        case .videoRawLayer: "视频 Raw 层"
+        case .imageHighLayer: "高清图片"
+        case .videoRawLayer: "原画视频"
         }
     }
 }

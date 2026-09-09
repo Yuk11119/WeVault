@@ -74,6 +74,7 @@ private struct StatusCenter: View {
             guard requestID != nil else { return }
             appState.scanViewModel.scan()
         }
+        .sheet(isPresented: $appState.isSupportPresented) { BetaSupportView() }
         .sheet(isPresented: $appState.isSettingsPresented) {
             SettingsSheet(settings: appState.settings, managedAccount: appState.managedAccount, selfManagedCloud: appState.selfManagedCloud, onSave: appState.save)
         }
@@ -104,6 +105,10 @@ private struct MenuBarView: View {
         Button("设置") {
             appState.isSettingsPresented = true
             openWindow(id: "status")
+        }
+        Button("帮助、反馈与更新") {
+            openWindow(id: "status")
+            appState.isSupportPresented = true
         }
         Divider()
         Button("退出 WeVault") { NSApplication.shared.terminate(nil) }

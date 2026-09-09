@@ -113,6 +113,7 @@ public actor AutomationScheduler {
     private let now: @Sendable () -> Date
     private var activeTaskIDs: Set<String> = []
     private var checkedInterruptedRun = false
+    private var immediateTaskIDs: Set<String> = []
     private var runningPipelines: [String: Task<AutomationPipelineResult, Error>] = [:]
 
     public func cancelActiveRun() { for task in runningPipelines.values { task.cancel() } }
@@ -142,26 +143,25 @@ public actor AutomationScheduler {
         else if current!.isPaused || current!.intervalHours != settings.runIntervalHours { next = date }
         else { next = current!.nextRunAt }
         let task = AutomationTask(id: taskID, isPaused: paused, intervalHours: settings.runIntervalHours, nextRunAt: next, lastRunAt: current?.lastRunAt)
+        if paused { immediateTaskIDs.remove(taskID) }
         if current != task { try store.saveAutomationTask(task) }
         return task
     }
 
-    /// Makes the next enabled run immediately due. Used by an explicit user action.
+    /// Queue an extra run without moving the persistent periodic schedule.
     @discardableResult public func makeDueNow() throws -> AutomationTask? {
         guard let task = try store.automationTask(id: taskID), !task.isPaused,
               !activeTaskIDs.contains(taskID) else { return nil }
-        let updated = AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: now(), lastRunAt: task.lastRunAt)
-        try store.saveAutomationTask(updated)
-        return updated
+        immediateTaskIDs.insert(taskID)
+        return task
     }
 
-    /// Wakes only a task whose latest durable run is waiting for prerequisites.
+    public func hasImmediateRunRequest() -> Bool { immediateTaskIDs.contains(taskID) }
+
+    /// Retry prerequisites without changing the periodic schedule.
     @discardableResult public func wakeWaitingTask() throws -> AutomationTask? {
-        guard let task = try store.automationTask(id: taskID), !task.isPaused,
-              try store.latestAutomationRun(taskID: taskID)?.status == .waitingForCloud else { return nil }
-        let updated = AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: now(), lastRunAt: task.lastRunAt)
-        try store.saveAutomationTask(updated)
-        return updated
+        guard try store.latestAutomationRun(taskID: taskID)?.status == .waitingForCloud else { return nil }
+        return try makeDueNow()
     }
 
     /// Processes only due scheduling records. An unavailable cloud gate never invokes a
@@ -174,9 +174,19 @@ public actor AutomationScheduler {
     ) async throws -> [AutomationTaskRun] {
         let date = now()
         var runs: [AutomationTaskRun] = []
-        for task in try store.dueAutomationTasks(at: date) {
+        var tasks = try store.dueAutomationTasks(at: date)
+        for id in immediateTaskIDs.sorted() {
+            if let task = try store.automationTask(id: id), !task.isPaused,
+               !tasks.contains(where: { $0.id == id }) { tasks.append(task) }
+        }
+        for task in tasks {
             guard !activeTaskIDs.contains(task.id) else { continue }
-            let next = date.addingTimeInterval(TimeInterval(task.intervalHours * 3600))
+            immediateTaskIDs.remove(task.id)
+            // Advance from the scheduled slot, not the time the user clicked or
+            // the app woke up. An early manual run leaves the next slot intact.
+            let interval = TimeInterval(max(1, task.intervalHours)) * 3600
+            let missedSlots = floor(max(0, date.timeIntervalSince(task.nextRunAt)) / interval) + 1
+            let next = task.nextRunAt > date ? task.nextRunAt : task.nextRunAt.addingTimeInterval(missedSlots * interval)
             let latest = try store.latestAutomationRun(taskID: task.id)
             let retryOf = latest?.status == .failed ? latest?.id : nil
             // Claim before awaiting. Actor methods are re-entrant at suspension points,
@@ -227,7 +237,7 @@ public actor AutomationScheduler {
                         }
                     } catch {
                         let latestProgress = try store.latestAutomationRun(taskID: task.id)
-                        let failed = AutomationTaskRun(id: running.id, taskID: task.id, status: error is CancellationError ? .paused : .failed, stage: latestProgress?.stage ?? .uploading, completedUnits: latestProgress?.completedUnits ?? 0, totalUnits: latestProgress?.totalUnits ?? 0, failureReason: error is CancellationError ? "任务已暂停，可重新检查并继续" : error.localizedDescription, retryOfRunID: retryOf, startedAt: date, finishedAt: now())
+                        let failed = AutomationTaskRun(id: running.id, taskID: task.id, status: error is CancellationError ? .paused : .failed, stage: latestProgress?.stage ?? .uploading, completedUnits: latestProgress?.completedUnits ?? 0, totalUnits: latestProgress?.totalUnits ?? 0, failureReason: error is CancellationError ? "任务已暂停，可重新检查并继续" : UserFacingFailure.describe(error).description, retryOfRunID: retryOf, startedAt: date, finishedAt: now())
                         try store.saveAutomationRun(failed)
                         try store.logAutomation(runID: failed.id, event: "AUTOMATION_FAILED", detail: failed.failureReason)
                         runs.append(failed)

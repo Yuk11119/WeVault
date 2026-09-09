@@ -3,92 +3,102 @@ import SwiftUI
 import WeVaultCore
 
 struct SetupWizard: View {
+    @State private var risksAccepted = false
     @State private var draft: ProductSettings
     let onFinish: (ProductSettings) -> Void
 
     init(initial: ProductSettings = .default, onFinish: @escaping (ProductSettings) -> Void) {
         _draft = State(initialValue: initial)
+        _risksAccepted = State(initialValue: initial.riskAcknowledgementVersion == 1)
         self.onFinish = onFinish
     }
 
+    var managedAccount: ManagedAccount? = nil
+    var selfManagedCloud: SelfManagedCloud? = nil
+    @State private var showSupport = false
+
     var body: some View {
-        Form {
-            Section("欢迎使用 WeVault") {
-                Text("WeVault 按规则扫描、上传并校验微信大对象，冷却期后隔离原件，隔离期到期后删除本地副本。默认不额外下载恢复测试副本。")
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            policySections
-            Section {
-                Button("完成设置并打开状态中心") {
+        VStack(spacing: 0) {
+            Form {
+                if !draft.onboardingCompleted {
+                    Section { Text("选择微信文件夹，开始整理大文件。") }
+                }
+                Section("文件") {
+                    LabeledContent("微信文件夹") {
+                        HStack {
+                            Text(draft.scanRootPath ?? "尚未选择").lineLimit(1).truncationMode(.middle)
+                            Button("选择…", action: chooseDirectory)
+                        }
+                    }
+                    NumberSettingRow(title: "大文件起点", value: $draft.largeFileThresholdMB, range: 1...500, unit: "MB")
+                    HStack {
+                        Toggle("普通文件", isOn: $draft.archiveOrdinaryFiles)
+                        Toggle("高清图片", isOn: $draft.archiveImageHighLayers)
+                        Toggle("原画视频", isOn: $draft.archiveVideoRawLayers)
+                    }.toggleStyle(.checkbox)
+                }
+                Section("自动整理") {
+                    Toggle("定时归档并释放本地空间", isOn: $draft.automaticTasksEnabled)
+                    if draft.automaticTasksEnabled {
+                        NumberSettingRow(title: "运行间隔", value: $draft.runIntervalHours, range: 1...720, unit: "小时")
+                        Text("归档 \(draft.coolingPeriodDays) 天后移入暂存区，再保留 \(draft.quarantineRetentionDays) 天后释放空间。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if draft.cloudMode == .selfManaged {
+                            Text("自动整理需要使用 WeVault 云端。").font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                }
+                Section("账户") {
+                    Picker("存储位置", selection: $draft.cloudMode) {
+                        Text("WeVault 云端").tag(ProductSettings.CloudMode.weVault)
+                        Text("自备云存储").tag(ProductSettings.CloudMode.selfManaged)
+                    }
+                    if draft.cloudMode == .weVault, let managedAccount {
+                        ManagedLoginSection(account: managedAccount)
+                    } else if draft.cloudMode == .selfManaged, let selfManagedCloud {
+                        DisclosureGroup("配置 OSS / COS") { SelfManagedCloudSection(cloud: selfManagedCloud) }
+                    } else if draft.cloudMode == .weVault {
+                        Text("完成后可在设置中登录。").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Section {
+                    DisclosureGroup("高级选项") {
+                        NumberSettingRow(title: "原件保留", value: $draft.coolingPeriodDays, range: 0...365, unit: "天")
+                        NumberSettingRow(title: "暂存保留", value: $draft.quarantineRetentionDays, range: 1...365, unit: "天")
+                        Text("上传 → 保留原件 → 暂存 → 释放空间")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Toggle("在原位置保留恢复提示", isOn: $draft.createTombstones)
+                        TextField("仅归档这些扩展名", text: Binding(
+                            get: { draft.allowedExtensions.joined(separator: ", ") },
+                            set: { draft.allowedExtensions = $0.split(separator: ",").map(String.init) }
+                        ))
+                        Text("逗号分隔，留空表示全部类型。").font(.caption).foregroundStyle(.secondary)
+                    }
+                    DisclosureGroup("归档与恢复说明") {
+                        Text("释放后，转发文件或保存高清图片、原画视频前需先恢复原件；关闭恢复提示会使原路径留空。")
+                        Text("暂存期间可撤回，但不会立即腾出空间。到期释放后，恢复需要联网。请保留本机索引与钥匙串。")
+                        Text("上传内容未在客户端加密，云存储和下载可能产生费用。应用关闭后不运行自动整理；热点或低电量时可手动暂停。")
+                    }.font(.callout)
+                    if draft.riskAcknowledgementVersion != 1 && draft.automaticTasksEnabled {
+                        Text("自动整理会在暂存期结束后删除本地原件，之后需从云端恢复。").font(.callout)
+                        Toggle("我已了解归档与恢复的影响", isOn: $risksAccepted)
+                    }
+                }
+            }.formStyle(.grouped)
+            HStack {
+                if draft.onboardingCompleted { Button("帮助与反馈") { showSupport = true } }
+                Spacer()
+                Button(draft.onboardingCompleted ? "保存" : "开始使用") {
+                    if risksAccepted { draft.riskAcknowledgementVersion = 1 }
+                    draft.normalize()
                     onFinish(draft)
                 }
-                .disabled(draft.scanRootPath == nil)
-            }
+                .buttonStyle(.borderedProminent)
+                .disabled(draft.scanRootPath == nil || (draft.automaticTasksEnabled && !risksAccepted))
+            }.padding()
         }
-        .formStyle(.grouped)
-        .padding()
-        .frame(minWidth: 620, minHeight: 620)
-    }
-
-    var policySections: some View {
-        Group {
-            scanRootSection
-            scheduleSection
-            archiveSection
-            cloudSection
-        }
-    }
-
-    var scanRootSection: some View {
-        Section("微信目录与阈值") {
-            LabeledContent("扫描目录") {
-                HStack {
-                    Text(draft.scanRootPath ?? "尚未选择")
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Button("选择目录", action: chooseDirectory)
-                }
-            }
-            Stepper("大文件阈值：\(draft.largeFileThresholdMB) MB", value: $draft.largeFileThresholdMB, in: 1...500)
-        }
-    }
-
-    var scheduleSection: some View {
-        Section("自动化策略") {
-            Toggle("启用自动归档、隔离及到期释放", isOn: $draft.automaticTasksEnabled)
-            Text("自动任务仅支持 WeVault 托管云端；释放依据云端校验、本地 SHA 和当前规则，不额外下载恢复测试副本。暂停将停止派发新任务，正在提交的文件操作会先安全完成。")
-                .font(.caption).foregroundStyle(.secondary)
-            Stepper("运行频率：每 \(draft.runIntervalHours) 小时", value: $draft.runIntervalHours, in: 1...720)
-            Stepper("自动释放冷却期：\(draft.coolingPeriodDays) 天", value: $draft.coolingPeriodDays, in: 0...365)
-            Stepper("quarantine 保留：\(draft.quarantineRetentionDays) 天", value: $draft.quarantineRetentionDays, in: 1...365)
-            Toggle("后台运行优先", isOn: $draft.preferBackgroundExecution)
-            Toggle("限制受限网络上传", isOn: $draft.limitUploadsOnMeteredNetwork)
-        }
-    }
-
-    var archiveSection: some View {
-        Section("归档范围") {
-            Toggle("普通大文件", isOn: $draft.archiveOrdinaryFiles)
-            Toggle("图片高清层", isOn: $draft.archiveImageHighLayers)
-            Toggle("视频 Raw 层", isOn: $draft.archiveVideoRawLayers)
-            Toggle("普通文件生成 tombstone", isOn: $draft.createTombstones)
-            TextField("允许扩展名（逗号分隔；留空为不限制）", text: Binding(
-                get: { draft.allowedExtensions.joined(separator: ", ") },
-                set: { draft.allowedExtensions = $0.split(separator: ",").map(String.init) }
-            ))
-        }
-    }
-
-    var cloudSection: some View {
-        Section("云端模式") {
-            Picker("模式", selection: $draft.cloudMode) {
-                Text("WeVault 云端").tag(ProductSettings.CloudMode.weVault)
-                Text("自配 OSS/COS（手动操作）").tag(ProductSettings.CloudMode.selfManaged)
-            }
-            Text("此版本不输入或保存长期 AccessKey / Secret。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        .frame(minWidth: 580, minHeight: 580)
+        .sheet(isPresented: $showSupport) { BetaSupportView() }
     }
 
     private func chooseDirectory() {
@@ -97,7 +107,9 @@ struct SetupWizard: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "选择"
-        if let defaultURL = WeChatDirectory.defaultXWeChatFilesURL() {
+        if let isolationRoot = DevelopmentIsolation.root {
+            panel.directoryURL = isolationRoot.deletingLastPathComponent().appendingPathComponent("synthetic-input", isDirectory: true)
+        } else if let defaultURL = WeChatDirectory.defaultXWeChatFilesURL() {
             panel.directoryURL = defaultURL
         }
         if panel.runModal() == .OK {
@@ -121,27 +133,62 @@ struct SettingsSheet: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Text("WeVault 设置").font(.title2.bold())
-                    Spacer()
-                    Button("关闭设置") { dismiss() }
-                }.padding(.horizontal)
-                if DevelopmentIsolation.permitsInteractiveAuthentication {
-                    Text("隔离验收：自动任务关闭，凭证只保留在内存；请使用测试账号。")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                SetupWizard(initial: draft) { updated in
-                    onSave(updated)
-                    dismiss()
-                }
-                ManagedLoginSection(account: managedAccount)
-                SelfManagedCloudSection(cloud: selfManagedCloud)
+        VStack(spacing: 0) {
+            HStack {
+                Text("设置").font(.title2.bold())
+                Spacer()
+                Button("取消") { dismiss() }
+            }.padding()
+            SetupWizard(initial: draft) { updated in
+                onSave(updated)
+                dismiss()
             }
-            .padding(.vertical)
+            .withAccounts(managedAccount, selfManagedCloud)
         }
-        .frame(minWidth: 650, minHeight: 680)
+        .frame(width: 650, height: 720)
+    }
+}
+
+extension SetupWizard {
+    func withAccounts(_ account: ManagedAccount, _ cloud: SelfManagedCloud) -> SetupWizard {
+        var view = self
+        view.managedAccount = account
+        view.selfManagedCloud = cloud
+        return view
+    }
+}
+
+struct NumberSettingRow: View {
+    let title: String
+    @Binding var value: Int
+    let range: ClosedRange<Int>
+    let unit: String
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack(spacing: 8) {
+                TextField(title, text: $text)
+                    .labelsHidden().textFieldStyle(.roundedBorder).frame(width: 72)
+                    .multilineTextAlignment(.trailing).focused($focused)
+                    .onChange(of: text) { _, newValue in
+                        if let number = Int(newValue), range.contains(number) { value = number }
+                    }
+                    .onSubmit { commit() }
+                    .onChange(of: focused) { _, active in if !active { commit() } }
+                Text(unit).foregroundStyle(.secondary).frame(width: 32, alignment: .leading)
+                Stepper(title, value: $value, in: range).labelsHidden()
+            }
+        }
+        .onAppear { text = String(value) }
+        .onChange(of: value) { _, number in if Int(text) != number { text = String(number) } }
+        .help("\(range.lowerBound)–\(range.upperBound) \(unit)")
+    }
+
+    private func commit() {
+        if let number = Int(text) { value = min(max(number, range.lowerBound), range.upperBound) }
+        text = String(value)
     }
 }
 
@@ -156,7 +203,7 @@ private struct SelfManagedCloudSection: View {
             Picker("提供商", selection: $config.provider) { Text("阿里云 OSS").tag("Aliyun OSS (STS)"); Text("腾讯云 COS").tag("Tencent COS (STS)") }
             TextField("Endpoint", text: $config.endpoint); TextField("Bucket", text: $config.bucket); TextField("Region", text: $config.region)
             TextField("临时 AccessKey ID", text: $config.accessKeyID); SecureField("临时 AccessKey Secret", text: $config.secretAccessKey); SecureField("Security Token", text: $config.securityToken); TextField("过期时间（ISO-8601）", text: $config.expiration)
-            HStack { Button("保存短期凭证") { do { try cloud.save(config); error = nil } catch { self.error = error.localizedDescription } }; if let error { Text(error).foregroundStyle(.red) } }
+            HStack { Button("保存短期凭证") { do { try cloud.save(config); error = nil } catch { self.error = UserFacingFailure.describe(error).description } }; if let error { Text(error).foregroundStyle(.red) } }
         }.padding(.horizontal)
     }
 }
@@ -171,8 +218,11 @@ private struct ManagedLoginSection: View {
     @FocusState private var focusedField: Field?
 
     var body: some View {
-        GroupBox("WeVault 云端账户") {
-            if account.isReady {
+        VStack(alignment: .leading, spacing: 10) {
+            if let notice = account.loginUnavailableMessage {
+                Text(notice)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if account.isReady {
                 HStack { Text(account.status); Spacer(); Button("退出登录") { Task { await account.logout() } } }
             } else {
                 TextField("邮箱", text: $email)
@@ -180,12 +230,10 @@ private struct ManagedLoginSection: View {
                     .focused($focusedField, equals: .email)
                 SecureField("密码", text: $password)
                     .focused($focusedField, equals: .password)
-                HStack { Button("登录并注册本机") { Task { do { try await account.login(email: email, password: password) } catch { self.error = error.localizedDescription } } }; if let error { Text(error).foregroundStyle(.red) } }
+                HStack { Button("登录") { Task { do { try await account.login(email: email, password: password); self.error = nil; password = "" } catch let failure as ManagedAccountLoginFailure { self.error = failure.localizedDescription } catch { self.error = UserFacingFailure.describe(error).description } } }; if let error { Text(error).foregroundStyle(.red) } }
             }
         }
         .padding(.horizontal)
-        .onAppear {
-            if !account.isReady { focusedField = .email }
-        }
+
     }
 }

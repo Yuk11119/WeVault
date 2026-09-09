@@ -8,6 +8,7 @@ public struct ProductSettings: Codable, Equatable, Sendable {
         case selfManaged
     }
 
+    public var riskAcknowledgementVersion: Int? = nil
     public var onboardingCompleted: Bool
     public var scanRootPath: String?
     public var largeFileThresholdMB: Int
@@ -57,6 +58,8 @@ public struct ProductSettings: Codable, Equatable, Sendable {
         self.preferBackgroundExecution = preferBackgroundExecution
         self.cloudMode = cloudMode
     }
+
+    public var automaticExecutionPermitted: Bool { onboardingCompleted && riskAcknowledgementVersion == 1 && automaticTasksEnabled }
 
     public static let `default` = ProductSettings()
 

@@ -41,6 +41,7 @@ final class AppState: ObservableObject {
 
     @Published private(set) var settings: ProductSettings
     @Published var isSettingsPresented = false
+    @Published var isSupportPresented = false
     @Published var manualScanRequestID: UUID?
     @Published private(set) var automationSnapshot: AutomationTaskSnapshot?
     @Published private(set) var isAutomationRunning = false
@@ -71,7 +72,7 @@ final class AppState: ObservableObject {
             settings = ProductSettings(onboardingCompleted: true, automaticTasksEnabled: false)
         }
         do { scheduler = try AutomationScheduler(store: ManifestStore()) }
-        catch { scheduler = nil; scanViewModel.alertMessage = error.localizedDescription }
+        catch { scheduler = nil; scanViewModel.alertMessage = UserFacingFailure.describe(error).description }
         // Restore the persisted root before the first due-task evaluation.
         scanViewModel.apply(settings)
         accountReadinessCancellable = managedAccount.$isReady
@@ -88,7 +89,8 @@ final class AppState: ObservableObject {
         refreshAutomation(wakeWaiting: prerequisitesAppearReady)
         automationLoop = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                let delay: UInt64 = self?.isAutomationRunning == true ? 1_000_000_000 : 15_000_000_000
+                try? await Task.sleep(nanoseconds: delay)
                 guard !Task.isCancelled else { return }
                 self?.refreshAutomation()
             }
@@ -129,6 +131,7 @@ final class AppState: ObservableObject {
     }
 
     var automationSummary: String {
+        if settings.riskAcknowledgementVersion != 1 { return "请在设置中阅读并确认归档风险，自动任务尚未启用" }
         guard let snapshot = automationSnapshot else { return "自动任务准备中" }
         if snapshot.task.isPaused { return "自动任务已暂停" }
         if let run = snapshot.latestRun, run.status == .running { return "\(run.stage.displayName)：\(run.completedUnits)/\(run.totalUnits)" }
@@ -138,7 +141,7 @@ final class AppState: ObservableObject {
     }
 
     var canRunAutomationNow: Bool {
-        settings.automaticTasksEnabled && !isAutomationRunning
+        settings.automaticExecutionPermitted && !isAutomationRunning
     }
 
     func runAutomationNow() {
@@ -194,11 +197,13 @@ final class AppState: ObservableObject {
         }
         beginAutomationRefresh()
         defer { endAutomationRefresh() }
-        let settings = settings
+        var settings = settings
+        if !settings.automaticExecutionPermitted { settings.automaticTasksEnabled = false }
         let generation = configurationGeneration
         do {
             let configured = try await scheduler.configure(settings: settings)
-            if configured.isPaused || configured.nextRunAt > Date() {
+            let hasImmediateRequest = await scheduler.hasImmediateRunRequest()
+            if configured.isPaused || (configured.nextRunAt > Date() && !hasImmediateRequest) {
                 automationSnapshot = try await scheduler.snapshot()
                 return
             }
@@ -229,7 +234,7 @@ final class AppState: ObservableObject {
                 } catch {
                     gate = .unavailable
                     pipeline = nil
-                    waitingReason = "云端授权不可用：\(error.localizedDescription)"
+                    waitingReason = "云端授权不可用：\(UserFacingFailure.describe(error).description)"
                     _ = try await scheduler.runDueTasks(cloudGate: gate, contextPipeline: pipeline, waitingReason: waitingReason)
                     automationSnapshot = try await scheduler.snapshot()
                     scanViewModel.reloadActivity()
@@ -240,9 +245,13 @@ final class AppState: ObservableObject {
                 pipeline = { [root, authorization, settings] context in
                     let store = try ManifestStore()
                     return try await AutomaticArchivePipeline(store: store).run(root: root, settings: settings, context: context, authorizeArchive: { snapshot, connection in
-                        try await ManagedCloudArchiveService().isAuthorizedArchive(snapshot, api: authorization.api, accessToken: authorization.accessToken, deviceID: authorization.deviceID, store: connection)
+                        let refreshed = try await self.managedAccount.withAuthorizedDevice()
+                        guard refreshed.deviceID == authorization.deviceID else { throw CancellationError() }
+                        return try await ManagedCloudArchiveService().isAuthorizedArchive(snapshot, api: refreshed.api, accessToken: refreshed.accessToken, deviceID: refreshed.deviceID, store: connection)
                     }) { files, families, connection in
-                        try await ManagedCloudArchiveService().uploadBatch(files: files, families: families, api: authorization.api, accessToken: authorization.accessToken, deviceID: authorization.deviceID, store: connection)
+                        let refreshed = try await self.managedAccount.withAuthorizedDevice()
+                        guard refreshed.deviceID == authorization.deviceID else { throw CancellationError() }
+                        return try await ManagedCloudArchiveService().uploadBatch(files: files, families: families, api: refreshed.api, accessToken: refreshed.accessToken, deviceID: refreshed.deviceID, store: connection)
                     }
                 }
             } else {
@@ -255,7 +264,7 @@ final class AppState: ObservableObject {
             scanViewModel.loadAutomaticPage(reset: true)
             scanViewModel.reloadActivity()
         } catch {
-            scanViewModel.alertMessage = error.localizedDescription
+            scanViewModel.alertMessage = UserFacingFailure.describe(error).description
         }
     }
 

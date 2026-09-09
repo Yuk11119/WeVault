@@ -96,8 +96,8 @@ public actor AutomaticArchivePipeline {
     private func recordFailure(_ error: Error, context: AutomationExecutionContext) throws {
         if AutomationFailure.isFatal(error) { throw error }
         failed += 1
-        if firstFailure == nil { firstFailure = error.localizedDescription }
-        try store.logAutomation(runID: context.runID, event: "AUTOMATION_OBJECT_FAILED", detail: error.localizedDescription)
+        if firstFailure == nil { firstFailure = UserFacingFailure.describe(error).description }
+        try store.logAutomation(runID: context.runID, event: "AUTOMATION_OBJECT_FAILED", detail: UserFacingFailure.describe(error).description)
     }
 }
 

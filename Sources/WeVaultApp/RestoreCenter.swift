@@ -30,7 +30,7 @@ final class RestoreCenterModel: ObservableObject {
             }
         } catch {
             selected = nil; records = []; hasNext = false
-            self.error = "无法读取归档索引：\(error.localizedDescription)"
+            self.error = "无法读取归档索引：\(UserFacingFailure.describe(error).description)"
         }
     }
 
@@ -42,7 +42,7 @@ final class RestoreCenterModel: ObservableObject {
         do {
             let link = try RestoreLink(lookupText: lookup)
             load(bindingID: link.bindingID)
-        } catch { rejectLink(error.localizedDescription) }
+        } catch { rejectLink(UserFacingFailure.describe(error).description) }
     }
 }
 
@@ -50,6 +50,9 @@ struct RestoreCenterView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var model: RestoreCenterModel
     @ObservedObject var operations: ScanViewModel
+    @StateObject private var preview = ArchivePreviewModel()
+    @State private var previewTask: Task<Void, Never>?
+    @State private var selectedBindingID: String?
     @State private var showSettings = false
     @State private var confirmOriginal = false
     @State private var pendingOriginal: ArchivedFileSnapshot?
@@ -61,24 +64,26 @@ struct RestoreCenterView: View {
             HStack {
                 Text("恢复中心").font(.title.bold())
                 Spacer()
-                Button("云端登录与设置") { showSettings = true }
+                Button("设置") { showSettings = true }
                 Button("刷新") { model.load() }.disabled(busy)
             }
-            HStack {
-                TextField("粘贴恢复链接或归档编号", text: $model.lookup).onSubmit { model.find() }
-                Button("定位") { model.find() }
+            DisclosureGroup("使用恢复链接") {
+                HStack {
+                    TextField("粘贴恢复链接或归档编号", text: $model.lookup).onSubmit { model.find() }
+                    Button("查找") { model.find() }
+                }
             }
             if let error = model.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
             HSplitView {
                 VStack {
-                    List(model.records, id: \.binding.bindingID) { record in
-                        Button { model.load(bindingID: record.binding.bindingID) } label: {
+                    List(model.records, id: \.binding.bindingID, selection: $selectedBindingID) { record in
                             VStack(alignment: .leading) {
                                 Text(record.archivedFile.originalFilename).lineLimit(1)
                                 Text("\(record.archivedFile.objectType.displayName) · \(humanBytes(record.archivedFile.sizeBytes))")
                                     .font(.caption).foregroundStyle(.secondary)
                             }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 4)
-                        }.buttonStyle(.plain)
+                            .contentShape(Rectangle())
+                            .tag(record.binding.bindingID)
                     }
                     HStack {
                         Button("上一页") { model.offset = max(0, model.offset - 50); model.load() }.disabled(model.offset == 0)
@@ -92,8 +97,8 @@ struct RestoreCenterView: View {
                             Text(record.archivedFile.originalFilename).font(.title2.bold()).textSelection(.enabled)
                             Text("\(record.archivedFile.objectType.displayName) · \(humanBytes(record.archivedFile.sizeBytes))")
                             Text("归档状态：\(archiveLabel(record.binding.archiveState))\n微信原路径状态：\(localLabel(record.binding.localState))")
-                            Text(record.archivedFile.filePath).font(.caption).textSelection(.enabled)
-                            Text(record.archivedFile.objectType == .ordinaryFile ? "默认恢复到下载目录。转发或导出前，请先恢复原件。" : "恢复到微信原路径后，可回微信保存高清图片或导出高质量视频。")
+                            previewSection(record)
+
                             Button(record.archivedFile.objectType == .ordinaryFile ? "恢复到下载目录" : "恢复到微信原路径") {
                                 if record.archivedFile.objectType == .ordinaryFile { restore(record, to: .defaultDownloads) }
                                 else { requestOriginal(record) }
@@ -102,7 +107,7 @@ struct RestoreCenterView: View {
                                 if record.archivedFile.objectType != .ordinaryFile {
                                     Button("恢复到下载目录") { restore(record, to: .defaultDownloads) }
                                 } else {
-                                    Button("受控恢复到微信原路径") { requestOriginal(record) }
+                                    Button("恢复到微信原位置") { requestOriginal(record) }
                                 }
                                 Button("选择目录恢复") {
                                     let panel = NSOpenPanel()
@@ -112,21 +117,30 @@ struct RestoreCenterView: View {
                                     if panel.runModal() == .OK, let url = panel.url { restore(record, to: .directory(url)) }
                                 }
                             }.disabled(busy || record.object.verifyStatus != .verified)
-                            DisclosureGroup("校验与归档编号") {
+                            DisclosureGroup("文件详情") {
+                                Text(record.archivedFile.filePath).font(.caption).textSelection(.enabled)
                                 Text("SHA-256：\(record.archivedFile.sha256)\n\(record.binding.bindingID)").textSelection(.enabled)
                             }
                         }.frame(maxWidth: .infinity, alignment: .leading).padding()
                     } else {
-                        ContentUnavailableView("选择归档记录", systemImage: "archivebox", description: Text("可选择列表中的文件，或粘贴 tombstone 中的恢复编号。"))
+                        ContentUnavailableView("选择归档记录", systemImage: "archivebox", description: Text("选择文件，预览内容后恢复。"))
                     }
                 }.frame(minWidth: 400)
             }
             if operations.isRestoring { ProgressView("正在恢复并校验…") }
             if !operations.restoreMessage.isEmpty { Text(operations.restoreMessage).textSelection(.enabled).font(.callout) }
         }.padding(20).frame(minWidth: 780, minHeight: 520)
-        .onChange(of: model.selected?.binding.bindingID) { _, _ in
-            confirmOriginal = false; pendingOriginal = nil
+        .onChange(of: selectedBindingID) { _, id in
+            if let id, id != model.selected?.binding.bindingID { model.load(bindingID: id) }
         }
+        .task(id: model.selected?.binding.bindingID) {
+            selectedBindingID = model.selected?.binding.bindingID
+            previewTask?.cancel()
+            confirmOriginal = false; pendingOriginal = nil
+            if let record = model.selected { await preview.loadLocal(record) }
+            else { preview.clear() }
+        }
+        .onDisappear { previewTask?.cancel(); preview.clear() }
         .onChange(of: operations.isRestoring) { _, running in if !running { model.load() } }
         .sheet(isPresented: $showSettings, onDismiss: { model.load() }) {
             SettingsSheet(settings: appState.settings, managedAccount: appState.managedAccount, selfManagedCloud: appState.selfManagedCloud, onSave: appState.save)
@@ -136,6 +150,26 @@ struct RestoreCenterView: View {
             Button("确认恢复") { if let record = pendingOriginal { restore(record, to: .originalPath) }; pendingOriginal = nil }
         } message: {
             Text("将恢复：\(pendingOriginal?.archivedFile.originalFilename ?? "")\n微信运行时写回可能影响当前文件访问，建议暂时停止相关操作。仅允许写入空路径或替换绑定与 SHA 匹配的 WeVault 占位文件，其他文件不会被覆盖。")
+        }
+    }
+
+    @ViewBuilder
+    private func previewSection(_ record: ArchivedFileSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let url = preview.url {
+                ArchiveQuickLook(url: url).frame(height: 280)
+            } else if preview.isLoading {
+                ProgressView("正在准备预览…").frame(maxWidth: .infinity, minHeight: 180)
+            } else {
+                Image(systemName: "doc.richtext").font(.system(size: 40)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 100)
+            }
+            Text(preview.message).font(.caption).foregroundStyle(.secondary)
+            if preview.url == nil && !record.archivedFile.originalFilename.lowercased().hasSuffix(".dat") {
+                Button("下载预览 · \(humanBytes(record.archivedFile.sizeBytes))") {
+                    previewTask = Task { await preview.download(record, account: appState.managedAccount, cloud: appState.selfManagedCloud) }
+                }.disabled(preview.isLoading || busy || record.object.verifyStatus != .verified)
+            }
         }
     }
 
@@ -154,7 +188,7 @@ struct RestoreCenterView: View {
         switch state {
         case .localPresent: return "本地原件保留"
         case .tombstoned: return "原路径为占位提示"
-        case .quarantined: return "原件在隔离区"
+        case .quarantined: return "原件在暂存区"
         case .localReleased: return "本地原件已释放"
         case .restored: return "已恢复原件"
         case .restoreFailed, .releaseFailed: return "需要重新检查本地状态"

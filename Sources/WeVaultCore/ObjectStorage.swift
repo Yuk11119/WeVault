@@ -49,6 +49,8 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
             let normalized = header.lowercased()
             if normalized.hasPrefix("x-oss-meta-") {
                 metadata[String(header.dropFirst("x-oss-meta-".count))] = String(describing: value)
+            } else if normalized.hasPrefix("x-cos-meta-") {
+                metadata[String(header.dropFirst("x-cos-meta-".count))] = String(describing: value)
             } else if normalized.hasPrefix("x-amz-meta-") {
                 metadata[String(header.dropFirst("x-amz-meta-".count))] = String(describing: value)
             }
@@ -59,11 +61,10 @@ public final class S3CompatibleObjectStorageClient: ObjectStorageClient {
     public func getObject(objectKey: String, destinationURL: URL) async throws {
         let request = try signedRequest(method: "GET", objectKey: objectKey, payloadHash: Self.emptyPayloadHash, metadata: [:])
         let (temporaryURL, response) = try await session.download(for: request)
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        try Task.checkCancellation()
         try validate(response: response, acceptedStatusCodes: 200...299)
         try FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            try FileManager.default.removeItem(at: destinationURL)
-        }
         try FileManager.default.moveItem(at: temporaryURL, to: destinationURL)
     }
 

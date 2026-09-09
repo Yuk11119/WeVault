@@ -107,15 +107,16 @@ struct AutomationTests {
         _ = try await scheduler.runDueTasks(waitingReason: "扫描目录不可用")
         #expect((try await scheduler.snapshot())?.task.nextRunAt == now.addingTimeInterval(86_400))
         let woken = try #require(try await scheduler.wakeWaitingTask())
-        #expect(woken.nextRunAt == now)
+        #expect(woken.nextRunAt == now.addingTimeInterval(86_400))
+        #expect(await scheduler.hasImmediateRunRequest())
         let run = try #require(try await scheduler.runDueTasks(cloudGate: .available) {
             AutomationPipelineResult(completedUnits: 1, totalUnits: 1)
         }.first)
         #expect(run.status == .completed)
     }
 
-    @Test("run now overrides a future schedule")
-    func runNowOverridesFutureSchedule() async throws {
+    @Test("run now preserves a future schedule")
+    func runNowPreservesFutureSchedule() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wevault-automation-now-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let now = Date(timeIntervalSince1970: 1_700_000_000)
@@ -123,8 +124,54 @@ struct AutomationTests {
         try store.saveAutomationTask(AutomationTask(isPaused: false, intervalHours: 24, nextRunAt: now.addingTimeInterval(10_000)))
         let scheduler = AutomationScheduler(store: store, now: { now })
         #expect(try await scheduler.runDueTasks().isEmpty)
-        #expect(try await scheduler.makeDueNow()?.nextRunAt == now)
+        #expect(try await scheduler.makeDueNow()?.nextRunAt == now.addingTimeInterval(10_000))
         #expect(try await scheduler.runDueTasks(cloudGate: .available) { AutomationPipelineResult(completedUnits: 0, totalUnits: 0) }.count == 1)
+        #expect(try await scheduler.snapshot()?.task.nextRunAt == now.addingTimeInterval(10_000))
+        #expect(!(await scheduler.hasImmediateRunRequest()))
+        #expect(try await scheduler.runDueTasks().isEmpty)
+        // Reopening the scheduler retains the original slot too.
+        let reopened = AutomationScheduler(store: store, now: { now })
+        #expect(try await reopened.snapshot()?.task.nextRunAt == now.addingTimeInterval(10_000))
+    }
+
+    @Test("late polls and manual runs at a due slot stay on the original cadence")
+    func lateRunPreservesCadence() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = try ManifestStore(databaseURL: directory.appendingPathComponent("archive.sqlite"))
+        let scheduled = now.addingTimeInterval(-2 * 86_400 - 3600)
+        try store.saveAutomationTask(AutomationTask(isPaused: false, intervalHours: 24, nextRunAt: scheduled))
+        let scheduler = AutomationScheduler(store: store, now: { now })
+        _ = try await scheduler.makeDueNow()
+        #expect(try await scheduler.runDueTasks().count == 1)
+        #expect(try await scheduler.snapshot()?.task.nextRunAt == scheduled.addingTimeInterval(3 * 86_400))
+        #expect(try await scheduler.runDueTasks().isEmpty)
+    }
+
+    @Test("failed and waiting manual runs do not move the next automatic run")
+    func unsuccessfulManualRunsPreserveSchedule() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let future = now.addingTimeInterval(43_200)
+        let store = try ManifestStore(databaseURL: directory.appendingPathComponent("archive.sqlite"))
+        try store.saveAutomationTask(AutomationTask(isPaused: false, intervalHours: 24, nextRunAt: future))
+        let scheduler = AutomationScheduler(store: store, now: { now })
+        _ = try await scheduler.makeDueNow()
+        _ = try await scheduler.runDueTasks()
+        #expect(try await scheduler.snapshot()?.task.nextRunAt == future)
+        _ = try await scheduler.wakeWaitingTask()
+        let runs = try await scheduler.runDueTasks(cloudGate: .available) {
+            throw WeVaultError.cloud("fixture failure")
+        }
+        #expect(runs.first?.status == .failed)
+        #expect(try await scheduler.snapshot()?.task.nextRunAt == future)
+        _ = try await scheduler.makeDueNow()
+        var paused = ProductSettings(); paused.automaticTasksEnabled = false
+        _ = try await scheduler.configure(settings: paused)
+        #expect(!(await scheduler.hasImmediateRunRequest()))
+        #expect(try await scheduler.runDueTasks().isEmpty)
     }
 
     @Test("a claimed run cannot be duplicated while its pipeline is suspended")

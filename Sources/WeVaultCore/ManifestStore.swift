@@ -708,42 +708,48 @@ public final class ManifestStore: @unchecked Sendable {
 
     // Encrypted disk-backed work records. Scope names never contain user paths.
     public func workPut<T: Encodable>(scope: String, key: String, value: T, group: String? = nil) throws {
-        let token = cipher.token(key, domain: scope)
-        let json = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
-        try withStatement("INSERT INTO pipeline_records(scope,token,grouping,payload) VALUES(?,?,?,?) ON CONFLICT(scope,token) DO UPDATE SET payload=excluded.payload,grouping=excluded.grouping") { stmt in
-            bindText(stmt, 1, scope); bindText(stmt, 2, token)
-            bindOptionalText(stmt, 3, group.map { cipher.token($0, domain: scope + ".group") })
-            bindData(stmt, 4, try encrypted(json, table: scope, column: "payload", token: token)); try stepDone(stmt)
+        try autoreleasepool {
+            let token = cipher.token(key, domain: scope)
+            let json = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
+            try withStatement("INSERT INTO pipeline_records(scope,token,grouping,payload) VALUES(?,?,?,?) ON CONFLICT(scope,token) DO UPDATE SET payload=excluded.payload,grouping=excluded.grouping") { stmt in
+                bindText(stmt, 1, scope); bindText(stmt, 2, token)
+                bindOptionalText(stmt, 3, group.map { cipher.token($0, domain: scope + ".group") })
+                bindData(stmt, 4, try encrypted(json, table: scope, column: "payload", token: token)); try stepDone(stmt)
+            }
         }
     }
 
     public func workGet<T: Decodable>(_ type: T.Type, scope: String, key: String) throws -> T? {
-        var value: T?
-        let token = cipher.token(key, domain: scope)
-        try withStatement("SELECT payload FROM pipeline_records WHERE scope=? AND token=?") { stmt in
-            bindText(stmt, 1, scope); bindText(stmt, 2, token)
-            let status = sqlite3_step(stmt)
-            if status == SQLITE_ROW {
-                let json = try decryptColumn(stmt, 0, table: scope, column: "payload", token: token)
-                value = try JSONDecoder().decode(T.self, from: Data(json.utf8))
-            } else if status != SQLITE_DONE { throw WeVaultError.sqlite(lastError) }
+        return try autoreleasepool {
+            var value: T?
+            let token = cipher.token(key, domain: scope)
+            try withStatement("SELECT payload FROM pipeline_records WHERE scope=? AND token=?") { stmt in
+                bindText(stmt, 1, scope); bindText(stmt, 2, token)
+                let status = sqlite3_step(stmt)
+                if status == SQLITE_ROW {
+                    let json = try decryptColumn(stmt, 0, table: scope, column: "payload", token: token)
+                    value = try JSONDecoder().decode(T.self, from: Data(json.utf8))
+                } else if status != SQLITE_DONE { throw WeVaultError.sqlite(lastError) }
+            }
+            return value
         }
-        return value
     }
 
     public func workPage<T: Decodable>(_ type: T.Type, scope: String, after: Int64 = 0, limit: Int = 50) throws -> [(id: Int64, value: T)] {
-        var rows: [(Int64, T)] = []
-        try withStatement("SELECT id,token,payload FROM pipeline_records WHERE scope=? AND id>? ORDER BY id LIMIT ?") { stmt in
-            bindText(stmt, 1, scope); sqlite3_bind_int64(stmt, 2, after); sqlite3_bind_int(stmt, 3, Int32(min(100, max(1, limit))))
-            var status = sqlite3_step(stmt)
-            while status == SQLITE_ROW {
-                let json = try decryptColumn(stmt, 2, table: scope, column: "payload", token: columnText(stmt, 1))
-                rows.append((sqlite3_column_int64(stmt, 0), try JSONDecoder().decode(T.self, from: Data(json.utf8))))
-                status = sqlite3_step(stmt)
+        return try autoreleasepool {
+            var rows: [(Int64, T)] = []
+            try withStatement("SELECT id,token,payload FROM pipeline_records WHERE scope=? AND id>? ORDER BY id LIMIT ?") { stmt in
+                bindText(stmt, 1, scope); sqlite3_bind_int64(stmt, 2, after); sqlite3_bind_int(stmt, 3, Int32(min(100, max(1, limit))))
+                var status = sqlite3_step(stmt)
+                while status == SQLITE_ROW {
+                    let json = try decryptColumn(stmt, 2, table: scope, column: "payload", token: columnText(stmt, 1))
+                    rows.append((sqlite3_column_int64(stmt, 0), try JSONDecoder().decode(T.self, from: Data(json.utf8))))
+                    status = sqlite3_step(stmt)
+                }
+                guard status == SQLITE_DONE else { throw WeVaultError.sqlite(lastError) }
             }
-            guard status == SQLITE_DONE else { throw WeVaultError.sqlite(lastError) }
+            return rows
         }
-        return rows
     }
 
     public func workCount(scope: String, group: String) throws -> Int {
@@ -857,6 +863,52 @@ public final class ManifestStore: @unchecked Sendable {
             sqlite3_bind_double(stmt, 3, Date().timeIntervalSince1970)
             try stepDone(stmt)
         }
+    }
+
+    public func diagnosticHighWatermark(source: String) throws -> Int64 {
+        guard ["operations", "automation_task_logs", "automation_task_runs"].contains(source) else { throw WeVaultError.sqlite("Invalid diagnostic source") }
+        var result: Int64 = 0
+        try withStatement("SELECT COALESCE(MAX(rowid), 0) FROM \(source)") { stmt in
+            if sqlite3_step(stmt) == SQLITE_ROW { result = sqlite3_column_int64(stmt, 0) }
+        }
+        return result
+    }
+
+    public func diagnosticPage(source: String, after: Int64, through: Int64) throws -> [DiagnosticEntry] {
+        guard ["operations", "automation_task_logs", "automation_task_runs"].contains(source) else { throw WeVaultError.sqlite("Invalid diagnostic source") }
+        var entries: [DiagnosticEntry] = []
+        if source == "automation_task_runs" {
+            try withStatement("SELECT rowid, id, stage, status, completed_units, total_units, created_at FROM automation_task_runs WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT 100") { stmt in
+                sqlite3_bind_int64(stmt, 1, after); sqlite3_bind_int64(stmt, 2, through)
+                var status = sqlite3_step(stmt)
+                while status == SQLITE_ROW {
+                    entries.append(DiagnosticEntry(id: sqlite3_column_int64(stmt, 0), source: source, event: "AUTOMATION_RUN",
+                        createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6)), detail: nil,
+                        runID: UUID(uuidString: columnText(stmt, 1))?.uuidString,
+                        stage: AutomationStage(rawValue: columnText(stmt, 2))?.rawValue,
+                        status: AutomationRunStatus(rawValue: columnText(stmt, 3))?.rawValue,
+                        completedUnits: Int(sqlite3_column_int(stmt, 4)), totalUnits: Int(sqlite3_column_int(stmt, 5))))
+                    status = sqlite3_step(stmt)
+                }
+                guard status == SQLITE_DONE else { throw WeVaultError.sqlite("Diagnostic read failed") }
+            }
+            return entries
+        }
+        let runColumn = source == "automation_task_logs" ? "run_id" : "NULL"
+        try withStatement("SELECT id, event, created_at, detail, \(runColumn) FROM \(source) WHERE id > ? AND id <= ? ORDER BY id LIMIT 100") { stmt in
+            sqlite3_bind_int64(stmt, 1, after); sqlite3_bind_int64(stmt, 2, through)
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
+                // Encrypted prose is deliberately not decrypted for export.
+                let detail = sqlite3_column_type(stmt, 3) == SQLITE_TEXT ? optionalText(stmt, 3) : nil
+                entries.append(DiagnosticEntry(id: sqlite3_column_int64(stmt, 0), source: source,
+                    event: DiagnosticPrivacy.safeEvent(columnText(stmt, 1)), createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
+                    detail: DiagnosticPrivacy.safeDetail(detail), runID: optionalText(stmt, 4).flatMap { UUID(uuidString: $0)?.uuidString }))
+                status = sqlite3_step(stmt)
+            }
+            guard status == SQLITE_DONE else { throw WeVaultError.sqlite("Diagnostic read failed") }
+        }
+        return entries
     }
 
     public func recentOperations(limit: Int = 20) throws -> [OperationRecord] {

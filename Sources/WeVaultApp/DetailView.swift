@@ -10,6 +10,7 @@ struct DetailView: View {
     let archivedSnapshot: ArchivedFileSnapshot?
     let isRestoring: Bool
     let isReleasing: Bool
+    let onClose: () -> Void
     let onOpenRestoreCenter: () -> Void
     let onQuarantineLocal: (Bool) -> Void
     let onRollbackLocal: () -> Void
@@ -61,14 +62,17 @@ struct DetailView: View {
             if let file {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        Text(file.filename)
-                            .font(.title2.bold())
-                            .textSelection(.enabled)
+                        HStack(alignment: .top) {
+                            Text(file.filename).font(.title2.bold()).textSelection(.enabled)
+                            Spacer()
+                            Button(action: onClose) { Image(systemName: "xmark") }
+                                .buttonStyle(.plain)
+                                .help("关闭详情").accessibilityLabel("关闭详情")
+                        }
 
-                        detailSection("对象") {
+                        detailSection("文件信息") {
                             row("类型", file.objectType.displayName)
                             row("上传状态", uploadStatus?.title ?? "未上传")
-                            row("候选说明", file.candidateReason ?? family?.reason ?? "-")
                             row("会话/来源", file.conversationName ?? "未解析")
                             row("月份", file.month ?? "-")
                         }
@@ -105,7 +109,7 @@ struct DetailView: View {
                         }
 
                         if let family {
-                            detailSection("Family") {
+                            DisclosureGroup("关联文件") {
                                 row("prefix", family.prefix)
                                 row("候选", family.isCandidate ? "是" : "否")
                                 row("高清/Raw 层", family.highOrRawPath)
@@ -121,13 +125,13 @@ struct DetailView: View {
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
-                                Button("打开恢复中心", action: onOpenRestoreCenter)
+                                Button("预览与恢复", action: onOpenRestoreCenter)
                                     .disabled(isRestoring || isReleasing)
                             }
                         }
 
                         if archivedSnapshot != nil {
-                            detailSection("本地释放") {
+                            DisclosureGroup("管理本地副本") {
                                 releaseCopy(for: file.objectType)
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
@@ -135,44 +139,35 @@ struct DetailView: View {
                                 switch file.objectType {
                                 case .ordinaryFile:
                                     HStack {
-                                        Button("释放本地原件") {
+                                        Button("移入暂存区") {
                                             onQuarantineLocal(createTombstone)
                                         }
                                             .disabled(!canQuarantineLocal)
-                                        Button("从隔离区回滚", action: onRollbackLocal)
+                                        Button("撤回到原位置", action: onRollbackLocal)
                                             .disabled(!canRollbackLocal)
                                     }
-                                    Toggle("在微信原路径生成 tombstone 占位提示", isOn: $createTombstone)
+                                    Toggle("在原位置保留恢复提示", isOn: $createTombstone)
                                         .disabled(!canQuarantineLocal)
                                     Button("确认释放空间", action: onFinalizeLocalRelease)
                                         .disabled(!canFinalizeLocalRelease)
-                                    Text("默认会把原件移动到工具 quarantine；支持同类型 tombstone 的文件会在微信原路径写入 WeVault 占位文件。微信中直接转发或导出该附件时，可能得到占位提示，不是原件。确认释放只删除隔离副本，不删除云端对象或 manifest。")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
                                 case .imageHighLayer:
                                     HStack {
-                                        Button("受控释放高清层") {
+                                        Button("暂存高清原件") {
                                             onQuarantineLocal(false)
                                         }
                                             .disabled(!canQuarantineLocal)
-                                        Button("从隔离区回滚", action: onRollbackLocal)
+                                        Button("撤回到原位置", action: onRollbackLocal)
                                             .disabled(!canRollbackLocal)
                                     }
-                                    Text("只移动 _h.dat / _h_M.dat 高清层到工具 quarantine；原高清路径保持为空，不生成 tombstone。普通查看层和气泡/缩略层必须继续留在本地。")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
                                 case .videoRawLayer:
                                     HStack {
-                                        Button("受控释放 Raw 层") {
+                                        Button("暂存原画视频") {
                                             onQuarantineLocal(false)
                                         }
                                             .disabled(!canQuarantineLocal)
-                                        Button("从隔离区回滚", action: onRollbackLocal)
+                                        Button("撤回到原位置", action: onRollbackLocal)
                                             .disabled(!canRollbackLocal)
                                     }
-                                    Text("只移动 _raw.mp4 到工具 quarantine；Raw 原路径保持为空，不生成 tombstone。普通播放 .mp4 和封面/缩略图必须继续留在本地；保存/导出会降级为普通播放版，高质量导出前请先恢复 Raw 层。")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
                                 }
                             }
                         }
@@ -215,22 +210,19 @@ struct DetailView: View {
     private func restoreHint(for objectType: ArchiveObjectType) -> String {
         switch objectType {
         case .ordinaryFile:
-            return "默认恢复到工具下载目录，并以 SHA-256 一致作为成功标准。"
+            return "查看内容，或恢复到指定位置。"
         case .imageHighLayer:
             return "高清版本已归档；如需保存高清/原图，请先恢复高清版本。"
         case .videoRawLayer:
-            return "视频可正常播放；高质量导出版本已归档，如需保存/导出高清版本，请先恢复 Raw 层。"
+            return "需要原画视频时，可从云端恢复。"
         }
     }
 
     private func releaseCopy(for objectType: ArchiveObjectType) -> Text {
         switch objectType {
-        case .ordinaryFile:
-            return Text("仅对已校验普通文件执行受控本地释放；支持同类型 tombstone 的文件默认在微信原路径生成强标识占位文件，占位不是原件。")
-        case .imageHighLayer:
-            return Text("图片高清层受控释放：普通查看版本保留在本地，高清/原图需要时从云端恢复；不会生成 tombstone，也不会移动 .dat / _M.dat / _b.dat / _t.dat。")
-        case .videoRawLayer:
-            return Text("视频 Raw 层受控释放：普通播放版本、封面或缩略图保留在本地；保存/导出高质量版本前需要从云端恢复 _raw.mp4。")
+        case .ordinaryFile: Text("暂存后可撤回；释放空间后需联网恢复。转发前请恢复原件。")
+        case .imageHighLayer: Text("保留普通查看版本，保存高清图片前需恢复原件。")
+        case .videoRawLayer: Text("保留普通播放版本，导出原画视频前需恢复原件。")
         }
     }
 }

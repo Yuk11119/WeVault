@@ -2,6 +2,14 @@ import Foundation
 import Security
 import WeVaultCore
 
+enum ManagedAccountLoginFailure: LocalizedError {
+    case disabledForIsolation
+
+    var errorDescription: String? {
+        "隔离验收模式不连接真实云端。本次设置验收无需登录，请保持自动化关闭。"
+    }
+}
+
 private struct ManagedAccountRecord: Codable {
     var session: WeVaultSession
     var accessExpiresAt: Date
@@ -24,32 +32,53 @@ final class ManagedAccount: ObservableObject {
     private let memoryOnly: Bool
     private let permitsLogin: Bool
     private var record: ManagedAccountRecord?
+    private var refreshTask: Task<WeVaultSession, Error>?
+    private var accountGeneration = 0
 
-    init(api: WeVaultAPIClient? = nil, memoryOnly: Bool = false) {
+    var loginUnavailableMessage: String? {
+        permitsLogin ? nil : ManagedAccountLoginFailure.disabledForIsolation.errorDescription
+    }
+
+    init(api: WeVaultAPIClient? = nil, memoryOnly: Bool = false, loginEnabled: Bool = true) {
         self.api = api ?? WeVaultAPIClient(baseURL: URL(string: "https://api.wevault.online")!)
         self.memoryOnly = memoryOnly || DevelopmentIsolation.root != nil
-        self.permitsLogin = DevelopmentIsolation.root == nil || DevelopmentIsolation.permitsInteractiveAuthentication || api != nil
+        self.permitsLogin = loginEnabled && (DevelopmentIsolation.root == nil || DevelopmentIsolation.permitsInteractiveAuthentication || api != nil)
         if !self.memoryOnly { load() }
     }
 
     func login(email: String, password: String, displayName: String = Host.current().localizedName ?? "Mac") async throws {
-        guard permitsLogin else { throw WeVaultError.cloud("隔离测试模式不连接真实云端") }
+        guard permitsLogin else { throw ManagedAccountLoginFailure.disabledForIsolation }
+        accountGeneration += 1
+        let generation = accountGeneration
+        refreshTask?.cancel(); refreshTask = nil
         let session = try await api.login(email: email, password: password)
         let clientDeviceID = record?.clientDeviceID ?? UUID().uuidString
         let device = try await api.registerDevice(accessToken: session.accessToken, clientDeviceId: clientDeviceID, displayName: displayName)
+        guard generation == accountGeneration else { throw CancellationError() }
         try save(ManagedAccountRecord(session: session, accessExpiresAt: Date().addingTimeInterval(TimeInterval(session.expiresIn)), clientDeviceID: clientDeviceID, deviceID: device.deviceId, email: email))
         status = "已登录"
     }
 
     func logout() async {
-        if let token = try? await accessToken() { try? await api.logout(accessToken: token) }
+        let token = record?.session.accessToken
         remove(); status = "已退出登录"
+        if let token { try? await api.logout(accessToken: token) }
     }
 
     func accessToken() async throws -> String {
         guard var current = record, let deviceID = current.deviceID else { throw WeVaultError.cloud("请先登录 WeVault 云端") }
         if current.accessExpiresAt <= Date().addingTimeInterval(60) {
-            let refreshed = try await api.refresh(refreshToken: current.session.refreshToken)
+            let generation = accountGeneration
+            let task: Task<WeVaultSession, Error>
+            if let existing = refreshTask { task = existing }
+            else {
+                let token = current.session.refreshToken
+                task = Task { try await api.refresh(refreshToken: token) }
+                refreshTask = task
+            }
+            defer { if generation == accountGeneration { refreshTask = nil } }
+            let refreshed = try await task.value
+            guard generation == accountGeneration, record?.deviceID == deviceID else { throw CancellationError() }
             current.session = refreshed
             current.accessExpiresAt = Date().addingTimeInterval(TimeInterval(refreshed.expiresIn))
             try save(current)
@@ -74,6 +103,8 @@ final class ManagedAccount: ObservableObject {
     }
 
     private func remove() {
+        accountGeneration += 1
+        refreshTask?.cancel(); refreshTask = nil
         if !memoryOnly { SecItemDelete([kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: account] as CFDictionary) }
         record = nil; email = nil; isReady = false
     }
