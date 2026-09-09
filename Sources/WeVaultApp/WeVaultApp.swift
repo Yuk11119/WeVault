@@ -90,15 +90,18 @@ private struct MenuBarView: View {
         Text(appState.automationSummary)
         Button("打开状态中心") { openWindow(id: "status") }
         Button("打开恢复中心") { appState.openRestoreCenter() }
-        Button("立即扫描") {
-            openWindow(id: "status")
-            appState.requestManualScan()
-        }
-        Button(appState.isAutomationRunning ? "自动任务运行中…" : "立即运行自动任务") {
+        Button(appState.isAutomationRunning ? "正在整理…" : "立即整理") {
             openWindow(id: "status")
             appState.runAutomationNow()
         }
         .disabled(!appState.canRunAutomationNow)
+        Menu("更多操作") {
+            Button("仅扫描") {
+                openWindow(id: "status")
+                appState.requestManualScan()
+            }
+            .disabled(viewModel.selectedRoot == nil || appState.isAutomationRunning || viewModel.isScanning || viewModel.isUploading)
+        }
         Button(appState.settings.automaticTasksEnabled ? "暂停自动化" : "恢复自动化") {
             appState.toggleAutomation()
         }

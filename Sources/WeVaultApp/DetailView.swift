@@ -60,16 +60,18 @@ struct DetailView: View {
     var body: some View {
         Group {
             if let file {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        HStack(alignment: .top) {
+                VStack(spacing: 0) {
+                    HStack(alignment: .top) {
                             Text(file.filename).font(.title2.bold()).textSelection(.enabled)
                             Spacer()
                             Button(action: onClose) { Image(systemName: "xmark") }
                                 .buttonStyle(.plain)
                                 .help("关闭详情").accessibilityLabel("关闭详情")
                         }
-
+                    .padding()
+                    Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
                         detailSection("文件信息") {
                             row("类型", file.objectType.displayName)
                             row("上传状态", uploadStatus?.title ?? "未上传")
@@ -174,6 +176,7 @@ struct DetailView: View {
                     }
                     .padding()
                     .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 }
             } else {
                 ContentUnavailableView("请选择一项", systemImage: "doc.text.magnifyingglass", description: Text("选择文件后可查看是否已上传及恢复选项。"))

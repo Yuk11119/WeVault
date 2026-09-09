@@ -14,15 +14,7 @@ struct ContentView: View {
     @State private var selection: FileRecord.ID?
     @State private var showsActivity = false
 
-    var selectedFile: FileRecord? {
-        guard let selection else { return nil }
-        return viewModel.displayFiles.first { $0.id == selection }
-    }
-
-    var selectedArchiveSnapshot: ArchivedFileSnapshot? {
-        guard let selection else { return nil }
-        return viewModel.archivedSnapshots[selection]
-    }
+    @State private var detail: FileDetailContext?
 
     var body: some View {
         HSplitView {
@@ -32,41 +24,22 @@ struct ContentView: View {
             recordList
                 .frame(minWidth: 440, idealWidth: 680)
                 .frame(maxHeight: .infinity, alignment: .topLeading)
-            if selectedFile != nil {
-            DetailView(
-                file: selectedFile,
-                families: viewModel.result?.families ?? [],
-                cloudSnapshot: selectedFile.flatMap { viewModel.cloudSnapshots[$0.path] },
-                archivedSnapshot: selectedArchiveSnapshot,
-                isRestoring: viewModel.isRestoring,
-                isReleasing: viewModel.isReleasing,
-                onClose: { selection = nil },
-                onOpenRestoreCenter: {
-                    if let selectedArchiveSnapshot {
-                        AppState.shared.openRestoreCenter(bindingID: selectedArchiveSnapshot.binding.bindingID)
-                    }
-                },
-                onQuarantineLocal: {
-                    if let selectedArchiveSnapshot {
-                        viewModel.quarantineLocal(snapshot: selectedArchiveSnapshot, createTombstone: $0)
-                    }
-                },
-                onRollbackLocal: {
-                    if let selectedArchiveSnapshot {
-                        viewModel.rollbackLocal(snapshot: selectedArchiveSnapshot)
-                    }
-                },
-                onFinalizeLocalRelease: {
-                    if let selectedArchiveSnapshot {
-                        viewModel.finalizeLocalRelease(snapshot: selectedArchiveSnapshot)
-                    }
-                }
-            )
-                .frame(minWidth: 280, idealWidth: 320, maxWidth: 400)
-                .frame(maxHeight: .infinity, alignment: .topLeading)
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onChange(of: selection) { _, id in
+            guard let id, let file = viewModel.displayFiles.first(where: { $0.id == id }) else { return }
+            detail = FileDetailContext(file: file, families: viewModel.result?.families ?? [],
+                cloud: viewModel.cloudSnapshots[id], archive: viewModel.archivedSnapshots[id])
+        }
+        .onReceive(viewModel.$result) { result in
+            detail?.refresh(files: result?.files ?? [], families: result?.families ?? [])
+        }
+        .onReceive(viewModel.$archivedSnapshots) { snapshots in
+            if let id = detail?.file.id, let snapshot = snapshots[id] { detail?.archive = snapshot }
+        }
+        .onReceive(viewModel.$cloudSnapshots) { snapshots in
+            if let id = detail?.file.id, let snapshot = snapshots[id] { detail?.cloud = snapshot }
+        }
         .alert("WeVault", isPresented: .constant(viewModel.alertMessage != nil), actions: {
             Button("OK") {
                 viewModel.alertMessage = nil
@@ -74,6 +47,38 @@ struct ContentView: View {
         }, message: {
             Text(viewModel.alertMessage ?? "")
         })
+    }
+
+    private var detailPanel: some View {
+        Group {
+            if let detail {
+                DetailView(file: detail.file, families: detail.families,
+                    cloudSnapshot: detail.cloud, archivedSnapshot: detail.archive,
+                    isRestoring: viewModel.isRestoring, isReleasing: viewModel.isReleasing,
+                    onClose: { self.detail = nil; selection = nil },
+                    onOpenRestoreCenter: {
+                        if let archive = detail.archive { AppState.shared.openRestoreCenter(bindingID: archive.binding.bindingID) }
+                    },
+                    onQuarantineLocal: { createPlaceholder in
+                        if let archive = detail.archive { viewModel.quarantineLocal(snapshot: archive, createTombstone: createPlaceholder) }
+                    },
+                    onRollbackLocal: {
+                        if let archive = detail.archive { viewModel.rollbackLocal(snapshot: archive) }
+                    },
+                    onFinalizeLocalRelease: {
+                        if let archive = detail.archive { viewModel.finalizeLocalRelease(snapshot: archive) }
+                    })
+                    .id(detail.file.id)
+                    .frame(width: 380)
+                    .frame(maxHeight: .infinity)
+                    .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(.separator, lineWidth: 1))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .shadow(color: .black.opacity(0.14), radius: 12, x: -3, y: 3)
+                    .padding(12)
+                    .padding(.top, 30)
+            }
+        }
     }
 
     private var sidebar: some View {
@@ -88,22 +93,17 @@ struct ContentView: View {
             }
             Divider()
             VStack(alignment: .leading, spacing: 8) {
-                Label(settings.automaticTasksEnabled ? "自动整理已开启" : "自动整理已暂停",
+                Label(settings.cloudMode == .selfManaged ? "手动上传模式" : (settings.automaticTasksEnabled ? "自动整理已开启" : "自动整理已暂停"),
                       systemImage: settings.automaticTasksEnabled ? "clock" : "pause.circle")
                 if isAutomationRunning {
                     ProgressView("正在整理…")
-                } else if settings.automaticExecutionPermitted, let snapshot = automationSnapshot, !snapshot.task.isPaused {
+                } else if settings.cloudMode == .weVault, settings.automaticExecutionPermitted, let snapshot = automationSnapshot, !snapshot.task.isPaused {
                     Text("下次：\(snapshot.task.nextRunAt.formatted(date: .abbreviated, time: .shortened))")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if automationSnapshot?.latestRun?.status == .failed {
                     Text("上次整理未完成").font(.caption).foregroundStyle(.orange)
                 }
-                Menu("管理自动整理") {
-                    Button("立即整理", action: runAutomationNow)
-                        .disabled(!settings.automaticExecutionPermitted || isAutomationRunning || viewModel.isScanning || viewModel.isUploading)
-                    Button("调整规则", action: openSettings)
-                }.menuStyle(.borderlessButton)
             }.font(.callout)
             Spacer()
             Button(action: openSettings) { Label("设置", systemImage: "gearshape") }
@@ -113,39 +113,71 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
+    private var isBusy: Bool {
+        isAutomationRunning || viewModel.isScanning || viewModel.isUploading || viewModel.isRestoring || viewModel.isReleasing
+    }
+
+    private var canUpload: Bool {
+        viewModel.selectedRoot != nil && (settings.cloudMode == .weVault ? managedAccount.isReady : (try? selfManagedCloud.storageConfig()) != nil)
+    }
+
+    private var primaryAction: ArchivePrimaryAction {
+        ArchivePrimaryAction.resolve(settings: settings, hasRoot: viewModel.selectedRoot != nil,
+            accountReady: managedAccount.isReady, storageReady: (try? selfManagedCloud.storageConfig()) != nil)
+    }
+
+    private func uploadFiles() {
+        viewModel.uploadHashedCandidates(managedAccount: managedAccount, selfManagedCloud: selfManagedCloud, mode: settings.cloudMode)
+    }
+
+    private func performPrimaryAction() {
+        switch primaryAction {
+        case .organize: runAutomationNow()
+        case .upload: uploadFiles()
+        default: openSettings()
+        }
+    }
+
     private var workflowHeader: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("文件归档").font(.title2.bold())
-                    Text("扫描文件 → 归档到云端 → 随时恢复")
+                    Text("按规则整理文件，需要时恢复")
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if viewModel.isScanning || viewModel.isUploading {
+                if isAutomationRunning || viewModel.isScanning || viewModel.isUploading {
                     ProgressView().controlSize(.small)
-                    Button("停止", action: viewModel.cancelManualTask)
-                } else {
-                    Button(viewModel.result == nil ? "扫描文件" : "重新扫描", action: viewModel.scan)
-                        .disabled(viewModel.selectedRoot == nil || isAutomationRunning)
-                    if viewModel.result != nil {
-                        Button("归档到云端") {
-                            viewModel.uploadHashedCandidates(managedAccount: managedAccount, selfManagedCloud: selfManagedCloud, mode: settings.cloudMode)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(isAutomationRunning || (settings.cloudMode == .weVault && !managedAccount.isReady))
+                    if isAutomationRunning {
+                        Text("正在整理…").font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        Button("停止", action: viewModel.cancelManualTask)
                     }
+                } else {
+                    Button(primaryAction.title, action: performPrimaryAction)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(viewModel.isRestoring || viewModel.isReleasing)
+                        .help(primaryAction.hint)
                 }
+                Menu {
+                    Button("仅扫描", action: viewModel.scan)
+                        .disabled(viewModel.selectedRoot == nil || isBusy)
+                    if primaryAction != .upload {
+                        Button("仅上传", action: uploadFiles)
+                            .disabled(!canUpload || isBusy)
+                    }
+                    Divider()
+                    Button("整理设置…", action: openSettings)
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .menuStyle(.borderlessButton).fixedSize()
+                .accessibilityLabel("更多操作").help("更多操作")
             }
-            if viewModel.selectedRoot == nil {
-                Button("选择微信文件夹", action: openSettings)
-            } else {
-                Text(viewModel.selectedRoot!.lastPathComponent + " · 大于等于 \(settings.largeFileThresholdMB) MB")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .help(viewModel.selectedRoot!.path)
-            }
-            if viewModel.result != nil && settings.cloudMode == .weVault && !managedAccount.isReady {
-                Button("登录后即可归档", action: openSettings).font(.callout)
+            if let root = viewModel.selectedRoot {
+                Text(root.lastPathComponent + " · 大于等于 \(settings.largeFileThresholdMB) MB")
+                    .font(.caption).foregroundStyle(.secondary).help(root.path)
             }
             if !viewModel.uploadMessage.isEmpty { Text(viewModel.uploadMessage).font(.callout).textSelection(.enabled) }
             if !viewModel.releaseMessage.isEmpty { Text(viewModel.releaseMessage).font(.callout).textSelection(.enabled) }
@@ -216,12 +248,13 @@ struct ContentView: View {
             }
             .overlay {
                 if viewModel.filteredFiles.isEmpty && !viewModel.isScanning {
-                    ContentUnavailableView(viewModel.result == nil && !viewModel.isAutomaticPage ? "先扫描，看看哪些文件可以归档" : "没有符合条件的文件",
+                    ContentUnavailableView(viewModel.result == nil && !viewModel.isAutomaticPage ? "从这里开始整理微信文件" : "没有符合条件的文件",
                         systemImage: "doc.text.magnifyingglass")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color(nsColor: .textBackgroundColor))
                 }
             }
+            .overlay(alignment: .trailing) { detailPanel }
             if viewModel.isAutomaticPage {
                 HStack {
                     Button("上一页") { viewModel.loadAutomaticPage(previous: true) }.disabled(viewModel.automaticPageNumber <= 1 || viewModel.isLoadingPage)
@@ -857,5 +890,19 @@ enum UserUploadStatus {
         case .failed: .red
         case .notUploaded: .secondary
         }
+    }
+}
+
+/// The inspector owns its content independently of the visible table page/selection.
+struct FileDetailContext {
+    var file: FileRecord
+    var families: [FamilyRecord]
+    var cloud: CloudArchiveSnapshot?
+    var archive: ArchivedFileSnapshot?
+
+    mutating func refresh(files: [FileRecord], families: [FamilyRecord]) {
+        guard let updated = files.first(where: { $0.id == file.id }) else { return }
+        file = updated
+        self.families = families
     }
 }

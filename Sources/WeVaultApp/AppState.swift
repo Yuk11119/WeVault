@@ -141,7 +141,9 @@ final class AppState: ObservableObject {
     }
 
     var canRunAutomationNow: Bool {
-        settings.automaticExecutionPermitted && !isAutomationRunning
+        settings.automaticExecutionPermitted && settings.cloudMode == .weVault && managedAccount.isReady &&
+            scanViewModel.selectedRoot != nil && !isAutomationRunning && !scanViewModel.isScanning &&
+            !scanViewModel.isUploading && !scanViewModel.isRestoring && !scanViewModel.isReleasing
     }
 
     func runAutomationNow() {
