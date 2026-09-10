@@ -18,6 +18,7 @@ class LocalSigningTests(unittest.TestCase):
                 (base / 'Scripts/configure-bundle.py').write_text('')
                 (base / 'Packaging').mkdir()
                 (base / 'Packaging/Info.plist').write_text('fixture')
+                (base / 'Packaging/AppIcon.icns').write_bytes(b'fixture icon')
                 (base / 'bin').mkdir()
                 (base / 'bin/WeVault').write_text('fixture executable')
                 fake_home = base / 'user'

@@ -21,9 +21,11 @@ esac
 swift build "${build_args[@]}"
 binary_dir="$(swift build "${build_args[@]}" --show-bin-path)"
 app_path="${WEVAULT_APP_OUTPUT:-$project_root/.build/app/WeVault.app}"
-mkdir -p "$app_path/Contents/MacOS"
+mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources"
 cp "$binary_dir/WeVault" "$app_path/Contents/MacOS/WeVault"
 cp Packaging/Info.plist "$app_path/Contents/Info.plist"
+cp Packaging/AppIcon.icns "$app_path/Contents/Resources/AppIcon.icns"
+touch "$app_path"
 python3 Scripts/configure-bundle.py "$app_path/Contents/Info.plist"
 plutil -lint "$app_path/Contents/Info.plist"
 # Reuse a certificate across local rebuilds so Keychain can recognize the app.
