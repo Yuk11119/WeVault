@@ -101,7 +101,9 @@ struct ContentView: View {
                     Text("下次：\(snapshot.task.nextRunAt.formatted(date: .abbreviated, time: .shortened))")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                if automationSnapshot?.latestRun?.status == .failed {
+                if automationSnapshot?.latestRun?.needsNetworkRetry == true {
+                    Text("等待联网后重试").font(.caption).foregroundStyle(.orange)
+                } else if automationSnapshot?.latestRun?.status == .failed {
                     Text("上次整理未完成").font(.caption).foregroundStyle(.orange)
                 }
             }.font(.callout)
@@ -272,12 +274,15 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(viewModel.recentOperations.prefix(5)) { operation in
+                Text("连续文件操作会合并显示")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                ForEach(RecentActivityItem.items(from: viewModel.recentOperations).prefix(5)) { item in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(operation.eventTitle)
+                        Text(item.title)
                             .font(.caption.weight(.medium))
-                            .foregroundStyle(operation.isFailure ? .red : .primary)
-                        Text(operation.createdAt.formatted(date: .abbreviated, time: .shortened))
+                            .foregroundStyle(item.isFailure ? .red : .primary)
+                        Text(item.subtitle)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -411,8 +416,8 @@ final class ScanViewModel: ObservableObject {
 
     var activitySummary: String {
         if isScanning { return "正在扫描文件" }
-        if let latest = recentOperations.first {
-            return latest.isFailure ? "最近任务出现异常：\(latest.event)" : "最近任务：\(latest.event)"
+        if let latest = RecentActivityItem.items(from: recentOperations).first {
+            return latest.isFailure ? "最近操作出现异常：\(latest.title)" : "最近操作：\(latest.title)"
         }
         return "尚无任务记录"
     }
@@ -783,7 +788,63 @@ final class ScanViewModel: ObservableObject {
 
 }
 
+
+private struct RecentActivityItem: Identifiable, Hashable {
+    let id: Int64
+    let event: String
+    let title: String
+    let subtitle: String
+    let isFailure: Bool
+
+    static func items(from operations: [OperationRecord], calendar: Calendar = .current) -> [RecentActivityItem] {
+        var result: [RecentActivityItem] = []
+        var index = operations.startIndex
+        while index < operations.endIndex {
+            let first = operations[index]
+            var count = 1
+            var next = operations.index(after: index)
+            if first.isFileLevelActivity {
+                let minute = calendar.dateInterval(of: .minute, for: first.createdAt)
+                while next < operations.endIndex {
+                    let candidate = operations[next]
+                    guard candidate.event == first.event,
+                          candidate.isFailure == first.isFailure,
+                          let minute,
+                          minute.contains(candidate.createdAt) else { break }
+                    count += 1
+                    next = operations.index(after: next)
+                }
+            }
+            result.append(RecentActivityItem(operation: first, count: count))
+            index = next
+        }
+        return result
+    }
+
+    private init(operation: OperationRecord, count: Int) {
+        id = operation.id
+        event = operation.event
+        isFailure = operation.isFailure
+        if count > 1, operation.isFileLevelActivity {
+            title = "\(count) 个文件\(operation.eventTitle)"
+            subtitle = "同一分钟内的连续文件操作 · " + operation.createdAt.formatted(date: .abbreviated, time: .shortened)
+        } else {
+            title = operation.isFileLevelActivity ? "1 个文件\(operation.eventTitle)" : operation.eventTitle
+            subtitle = operation.isFileLevelActivity ? "单个文件操作 · " + operation.createdAt.formatted(date: .abbreviated, time: .shortened) : operation.createdAt.formatted(date: .abbreviated, time: .shortened)
+        }
+    }
+}
+
 extension OperationRecord {
+    var isFileLevelActivity: Bool {
+        switch event {
+        case "RELEASE_QUARANTINE_FINISHED", "IMAGE_HIGH_RELEASE_QUARANTINE_FINISHED", "VIDEO_RAW_RELEASE_QUARANTINE_FINISHED", "AUTOMATION_ISOLATED", "RELEASE_DELETE_QUARANTINE_FINISHED", "AUTOMATION_FINALIZED", "RESTORE_FINISHED":
+            return true
+        default:
+            return event.contains("UPLOAD") || event.contains("VERIFY") || event.contains("RESTORE") || event.contains("RELEASE")
+        }
+    }
+
     var eventTitle: String {
         switch event {
         case "SCAN_STARTED": return "扫描开始"

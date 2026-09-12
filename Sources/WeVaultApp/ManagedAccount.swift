@@ -59,6 +59,21 @@ final class ManagedAccount: ObservableObject {
         status = "已登录"
     }
 
+    func register(email: String, password: String, invitationCode: String) async throws {
+        guard permitsLogin else { throw ManagedAccountLoginFailure.disabledForIsolation }
+        try await api.register(email: email, password: password, invitationCode: invitationCode)
+    }
+
+    func verifyEmail(email: String, code: String) async throws {
+        guard permitsLogin else { throw ManagedAccountLoginFailure.disabledForIsolation }
+        try await api.verifyEmail(email: email, code: code)
+    }
+
+    func resendVerification(email: String) async throws {
+        guard permitsLogin else { throw ManagedAccountLoginFailure.disabledForIsolation }
+        try await api.resendVerification(email: email)
+    }
+
     func logout() async {
         let token = record?.session.accessToken
         remove(); status = "已退出登录"

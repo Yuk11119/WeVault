@@ -5,12 +5,15 @@ import SwiftUI
 /// the terminal (or another app) as a non-key window.
 @MainActor
 final class WeVaultAppDelegate: NSObject, NSApplicationDelegate {
+    private var openedRestoreLink = false
+
     func application(_ application: NSApplication, open urls: [URL]) {
+        openedRestoreLink = true
         for url in urls { AppState.shared.openRestoreURL(url) }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        activateStatusWindow()
+        activateStatusWindow(unlessRestoreLinkOpened: true)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -18,11 +21,12 @@ final class WeVaultAppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private func activateStatusWindow() {
+    private func activateStatusWindow(unlessRestoreLinkOpened: Bool = false) {
         DispatchQueue.main.async {
+            if unlessRestoreLinkOpened && self.openedRestoreLink { return }
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
-            (NSApp.windows.first(where: { $0.title == "WeVault 恢复中心" }) ?? NSApp.windows.first(where: { $0.canBecomeKey }))?.makeKeyAndOrderFront(nil)
+            NSApp.windows.first(where: { $0.title == "WeVault 状态中心" })?.makeKeyAndOrderFront(nil)
         }
     }
 }

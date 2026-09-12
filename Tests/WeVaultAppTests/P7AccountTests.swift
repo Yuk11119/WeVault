@@ -13,8 +13,22 @@ struct P7AccountTests {
         await #expect(throws: ManagedAccountLoginFailure.self) {
             try await account.login(email: "fixture@example.test", password: "fixture")
         }
+        await #expect(throws: ManagedAccountLoginFailure.self) {
+            try await account.register(email: "fixture@example.test", password: "fixture-password", invitationCode: "wv_fixture")
+        }
         #expect(await transport.requestCount == 0)
         #expect(!account.isReady)
+    }
+
+    @Test("registration verification calls invite-gated endpoints without storing a session")
+    func registrationFlow() async throws {
+        let transport = RegistrationProbe()
+        let account = ManagedAccount(api: WeVaultAPIClient(baseURL: URL(string: "https://fixture.invalid")!, transport: transport), memoryOnly: true)
+        try await account.register(email: "fixture@example.test", password: "fixture-password", invitationCode: "wv_fixture")
+        try await account.verifyEmail(email: "fixture@example.test", code: "123456")
+        try await account.resendVerification(email: "fixture@example.test")
+        #expect(!account.isReady)
+        #expect(await transport.paths == ["/v1/auth/register", "/v1/auth/verify-email", "/v1/auth/resend-verification"])
     }
 
     @Test("concurrent callers share one rotating refresh token request")
@@ -58,6 +72,15 @@ private actor RefreshProbe: WeVaultAPITransport {
             body = #"{"accessToken":"new-access","refreshToken":"new-refresh","expiresIn":900}"#
         default: body = #"{"status":"ok"}"#
         }
+        return (Data(body.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+}
+
+private actor RegistrationProbe: WeVaultAPITransport {
+    private(set) var paths: [String] = []
+    func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        paths.append(request.url!.path)
+        let body = request.url!.lastPathComponent == "verify-email" ? #"{"status":"VERIFIED"}"# : #"{"status":"VERIFICATION_REQUIRED"}"#
         return (Data(body.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
     }
 }

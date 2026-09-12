@@ -59,8 +59,9 @@ class WebsiteTests(unittest.TestCase):
             self.assertEqual(feed['build'], 8)
             self.assertEqual(feed['downloadURL'], 'https://wevault.online/download/')
             download = (output / 'download/index.html').read_text()
-            self.assertIn('未公证', download)
-            self.assertIn('需邀请', download)
+            self.assertIn('下载 WeVault Beta', download)
+            self.assertIn('邀请码注册', download)
+            self.assertNotIn('未公证', download)
             self.assertIn('support@example.test', download)
             with self.assertRaises(FileExistsError):
                 site.build(source, output)

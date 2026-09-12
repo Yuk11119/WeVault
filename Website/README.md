@@ -6,15 +6,15 @@
 
 ## 当前发布记录
 
-- 版本：0.7.2 / build 9，macOS 14+，arm64 + x86_64。
-- 文件：`WeVault-0.7.2-9-macos-universal.zip`。
-- SHA-256：`530a6b446dc916928a2c0be131847cd8cadda7bbc653de7084016e34210c2f7e`。
+- 版本：0.7.3 / build 10，macOS 14+，arm64 + x86_64。
+- 文件：`WeVault-0.7.3-10-macos-universal.zip`。
+- SHA-256：`bbf403869fe0dc463dec68b20e70cceaf835004d831d771d0560bab7f3fa6dfd`。
 - 渠道：`public-unnotarized-beta`，ad-hoc 签名，没有 Developer ID 或 Apple 公证。独立于工程预览和正式公证流程。
 - DNS：阿里云 `wevault.online`，新增 `@ A 8.133.187.255`，默认线路，TTL 10 分钟。原有 9 条 API/邮件记录保留，共 10 条。
 - 服务：独立 Nginx 站点 `/etc/nginx/sites-available/wevault-site`，不变更 API 服务或数据库。
-- 站点目录：`/var/www/wevault-site/releases/0.7.2-9`，`/var/www/wevault-site/current` 指向该目录。
+- 站点目录：`/var/www/wevault-site/releases/0.7.3-10`，`/var/www/wevault-site/current` 指向该目录。
 - HTTPS：独立 Let's Encrypt 证书，签发时到期日 2026-12-08；`certbot.timer` 已启用。续期使用 `/var/www/certbot`，站点证书续期后 hook 检查并 reload Nginx。
-- 本地静态产物：`.build/website-0.7.2-9`。只部署该目录内容，源码、私钥、应用索引和测试夹具不上传。
+- 本地静态产物：`.build/website-0.7.3-10`。只部署该目录内容，源码、私钥、应用索引和测试夹具不上传。
 
 ## 已验证与未验证
 
@@ -31,11 +31,11 @@
 使用新的单调递增 build，并先更新 `release-notes.txt`。Python 3.11+；在 macOS 安装 Swift/Xcode 工具后：
 
 ```sh
-WEVAULT_VERSION=0.7.3 WEVAULT_BUILD=10 \
+WEVAULT_VERSION=0.7.4 WEVAULT_BUILD=11 \
 WEVAULT_FEEDBACK_EMAIL=yuk11119yx@gmail.com \
 WEVAULT_UPDATE_FEED_URL=https://wevault.online/updates/beta.json \
 Scripts/package-public-beta.sh
-python3 Website/build.py --release .build/public-beta/0.7.3-10 --output .build/website-0.7.3-10
+python3 Website/build.py --release .build/public-beta/0.7.4-11 --output .build/website-0.7.4-11
 python3 -m unittest discover -s Tests/WebsiteTests -v
 python3 -m unittest discover -s Tests/PackagingTests -v
 ```

@@ -4,6 +4,69 @@ import Testing
 
 @Suite("Automation scheduler")
 struct AutomationTests {
+    @Test("recovered prerequisites retry interrupted and auth failed runs without moving schedule")
+    func recoveredPrerequisites() async throws {
+        for status in [AutomationRunStatus.paused, .waitingForCloud, .failed] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let now = Date(timeIntervalSince1970: 1_700_000_000)
+            let next = now.addingTimeInterval(3600)
+            let store = try ManifestStore(databaseURL: directory.appendingPathComponent("archive.sqlite"))
+            try store.saveAutomationTask(AutomationTask(isPaused: false, intervalHours: 24, nextRunAt: next))
+            try store.saveAutomationRun(AutomationTaskRun(taskID: "default-automation", status: status, stage: .uploading, failureReason: "登录过期（AUTH_EXPIRED）", finishedAt: now.addingTimeInterval(-61)))
+            let scheduler = AutomationScheduler(store: store, now: { now })
+            #expect(try await scheduler.wakeRecoverableTask() != nil)
+            let runs = try await scheduler.runDueTasks(cloudGate: .available) {
+                AutomationPipelineResult(completedUnits: 1, totalUnits: 1)
+            }
+            #expect(runs.first?.status == .completed)
+            #expect(try await scheduler.snapshot()?.task.nextRunAt == next)
+            #expect(try await scheduler.wakeRecoverableTask() == nil)
+            try store.saveAutomationRun(AutomationTaskRun(taskID: "default-automation", status: status, stage: .uploading, failureReason: "登录过期（AUTH_EXPIRED）", finishedAt: now.addingTimeInterval(-61)))
+            try store.saveAutomationTask(AutomationTask(isPaused: true, intervalHours: 24, nextRunAt: next))
+            #expect(try await scheduler.wakeRecoverableTask() == nil)
+        }
+    }
+
+    @Test("network retry survives restart, respects cooldown and preserves the fixed schedule")
+    func networkRetryPreservesSchedule() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wevault-reconnect-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = try ManifestStore(databaseURL: directory.appendingPathComponent("archive.sqlite"))
+        let next = now.addingTimeInterval(3600)
+        try store.saveAutomationTask(AutomationTask(isPaused: false, intervalHours: 24, nextRunAt: next))
+        let failure = UserFacingFailure.describe(URLError(.notConnectedToInternet)).description
+        try store.saveAutomationRun(AutomationTaskRun(id: "offline", taskID: "default-automation", status: .failed, stage: .uploading, failureReason: failure, startedAt: now, finishedAt: now))
+        let early = AutomationScheduler(store: store, now: { now.addingTimeInterval(30) })
+        #expect(try await early.wakeNetworkRetry() == nil)
+        let restarted = AutomationScheduler(store: store, now: { now.addingTimeInterval(61) })
+        #expect(try await restarted.wakeNetworkRetry() != nil)
+        let runs = try await restarted.runDueTasks(cloudGate: .available) {
+            AutomationPipelineResult(completedUnits: 1, totalUnits: 1)
+        }
+        #expect(runs.first?.status == .completed)
+        #expect(runs.first?.retryOfRunID == "offline")
+        #expect(try await restarted.snapshot()?.task.nextRunAt == next)
+        #expect(try await restarted.wakeNetworkRetry() == nil)
+        #expect(try await restarted.runDueTasks().isEmpty)
+    }
+
+    @Test("network retry honors pause and does not retry unrelated failures")
+    func networkRetryGuards() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wevault-retry-guards-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = try ManifestStore(databaseURL: directory.appendingPathComponent("archive.sqlite"))
+        let scheduler = AutomationScheduler(store: store, now: { now })
+        try store.saveAutomationTask(AutomationTask(isPaused: false, intervalHours: 24, nextRunAt: now.addingTimeInterval(3600)))
+        try store.saveAutomationRun(AutomationTaskRun(taskID: "default-automation", status: .failed, stage: .uploading, failureReason: "权限不足", finishedAt: now.addingTimeInterval(-120)))
+        #expect(try await scheduler.wakeNetworkRetry() == nil)
+        try store.saveAutomationTask(AutomationTask(isPaused: true, intervalHours: 24, nextRunAt: now.addingTimeInterval(3600)))
+        try store.saveAutomationRun(AutomationTaskRun(taskID: "default-automation", status: .waitingForCloud, stage: .waitingForCloud, failureReason: UserFacingFailure.describe(URLError(.timedOut)).description, startedAt: now, finishedAt: now.addingTimeInterval(-120)))
+        #expect(try await scheduler.wakeNetworkRetry() == nil)
+    }
+
     @Test("unavailable cloud creates a durable waiting run without file work")
     func unavailableCloudCreatesWaitingRun() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wevault-automation-\(UUID().uuidString)", isDirectory: true)

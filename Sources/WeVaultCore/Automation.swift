@@ -44,6 +44,12 @@ public struct AutomationTaskRun: Codable, Hashable, Sendable, Identifiable {
     public let startedAt: Date?
     public let finishedAt: Date?
 
+    // The stable error code is already persisted in failureReason, including old runs.
+    public var needsNetworkRetry: Bool {
+        (status == .failed || status == .waitingForCloud) &&
+            failureReason?.contains("（NETWORK_UNAVAILABLE）") == true
+    }
+
     public init(id: String = UUID().uuidString, taskID: String, status: AutomationRunStatus, stage: AutomationStage, completedUnits: Int = 0, totalUnits: Int = 0, failureReason: String? = nil, retryOfRunID: String? = nil, startedAt: Date? = nil, finishedAt: Date? = nil) {
         self.id = id; self.taskID = taskID; self.status = status; self.stage = stage; self.completedUnits = completedUnits; self.totalUnits = totalUnits; self.failureReason = failureReason; self.retryOfRunID = retryOfRunID; self.startedAt = startedAt; self.finishedAt = finishedAt
     }
@@ -164,6 +170,24 @@ public actor AutomationScheduler {
         return try makeDueNow()
     }
 
+    /// Reconnects and timeout retries are extra runs; they preserve the periodic slot.
+    /// Reading the durable latest run also restores pending retries after app restart.
+    @discardableResult public func wakeNetworkRetry() throws -> AutomationTask? {
+        guard let run = try store.latestAutomationRun(taskID: taskID), run.needsNetworkRetry,
+              now().timeIntervalSince(run.finishedAt ?? run.startedAt ?? .distantPast) >= 60 else { return nil }
+        return try makeDueNow()
+    }
+
+    /// Polling recovers missed readiness notifications and cancellation during settings changes.
+    /// The task pause flag remains authoritative; a paused run alone is an interruption.
+    @discardableResult public func wakeRecoverableTask() throws -> AutomationTask? {
+        guard let run = try store.latestAutomationRun(taskID: taskID),
+              run.needsNetworkRetry || run.status == .waitingForCloud || run.status == .paused ||
+                (run.status == .failed && run.failureReason?.contains("（AUTH_EXPIRED）") == true),
+              now().timeIntervalSince(run.finishedAt ?? run.startedAt ?? .distantPast) >= 60 else { return nil }
+        return try makeDueNow()
+    }
+
     /// Processes only due scheduling records. An unavailable cloud gate never invokes a
     /// scanner, uploader, release service, or file API. Enabled pipelines apply the saved release policy.
     @discardableResult public func runDueTasks(
@@ -188,7 +212,7 @@ public actor AutomationScheduler {
             let missedSlots = floor(max(0, date.timeIntervalSince(task.nextRunAt)) / interval) + 1
             let next = task.nextRunAt > date ? task.nextRunAt : task.nextRunAt.addingTimeInterval(missedSlots * interval)
             let latest = try store.latestAutomationRun(taskID: task.id)
-            let retryOf = latest?.status == .failed ? latest?.id : nil
+            let retryOf = (latest?.status == .failed || latest?.needsNetworkRetry == true) ? latest?.id : nil
             // Claim before awaiting. Actor methods are re-entrant at suspension points,
             // so this durable schedule update prevents poll/manual duplicate runs.
             try store.saveAutomationTask(AutomationTask(id: task.id, isPaused: false, intervalHours: task.intervalHours, nextRunAt: next, lastRunAt: date))

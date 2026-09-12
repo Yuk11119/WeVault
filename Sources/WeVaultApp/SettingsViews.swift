@@ -209,12 +209,19 @@ private struct SelfManagedCloudSection: View {
 }
 
 private struct ManagedLoginSection: View {
-    private enum Field: Hashable { case email, password }
+    private enum Field: Hashable { case email, password, invitation, code }
+    private enum Mode: String, CaseIterable { case login = "登录", register = "注册" }
 
     @ObservedObject var account: ManagedAccount
+    @State private var mode: Mode = .login
     @State private var email = ""
     @State private var password = ""
+    @State private var invitationCode = ""
+    @State private var verificationCode = ""
+    @State private var awaitingVerification = false
+    @State private var message: String?
     @State private var error: String?
+    @State private var busy = false
     @FocusState private var focusedField: Field?
 
     var body: some View {
@@ -225,15 +232,87 @@ private struct ManagedLoginSection: View {
             } else if account.isReady {
                 HStack { Text(account.status); Spacer(); Button("退出登录") { Task { await account.logout() } } }
             } else {
+                Picker("云端账号", selection: $mode) {
+                    ForEach(Mode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
                 TextField("邮箱", text: $email)
                     .textContentType(.emailAddress)
                     .focused($focusedField, equals: .email)
                 SecureField("密码", text: $password)
                     .focused($focusedField, equals: .password)
-                HStack { Button("登录") { Task { do { try await account.login(email: email, password: password); self.error = nil; password = "" } catch let failure as ManagedAccountLoginFailure { self.error = failure.localizedDescription } catch { self.error = UserFacingFailure.describe(error).description } } }; if let error { Text(error).foregroundStyle(.red) } }
+                if mode == .register {
+                    SecureField("邀请码", text: $invitationCode)
+                        .focused($focusedField, equals: .invitation)
+                    if awaitingVerification {
+                        TextField("邮箱验证码", text: $verificationCode)
+                            .focused($focusedField, equals: .code)
+                        Text("验证码已发送到邮箱。完成验证后，可以直接用邮箱和密码登录。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                HStack {
+                    if mode == .login {
+                        Button("登录") { Task { await login() } }
+                            .disabled(busy || email.isEmpty || password.isEmpty)
+                    } else {
+                        Button(awaitingVerification ? "完成验证" : "创建账号") { Task { awaitingVerification ? await verify() : await register() } }
+                            .disabled(busy || email.isEmpty || password.isEmpty || (awaitingVerification ? verificationCode.isEmpty : invitationCode.isEmpty))
+                        if awaitingVerification {
+                            Button("重发验证码") { Task { await resendVerification() } }
+                                .disabled(busy || email.isEmpty)
+                        }
+                    }
+                    if busy { ProgressView().controlSize(.small) }
+                    if let error { Text(error).foregroundStyle(.red) }
+                    else if let message { Text(message).foregroundStyle(.secondary) }
+                }
             }
         }
         .padding(.horizontal)
 
+    }
+
+    private func login() async {
+        await perform {
+            try await account.login(email: email, password: password)
+            password = ""; message = "已登录"
+        }
+    }
+
+    private func register() async {
+        await perform {
+            try await account.register(email: email, password: password, invitationCode: invitationCode)
+            awaitingVerification = true
+            verificationCode = ""
+            invitationCode = ""
+            message = "验证码已发送"
+        }
+    }
+
+    private func verify() async {
+        await perform {
+            try await account.verifyEmail(email: email, code: verificationCode)
+            verificationCode = ""
+            awaitingVerification = false
+            mode = .login
+            message = "邮箱已验证，请登录"
+        }
+    }
+
+    private func resendVerification() async {
+        await perform {
+            try await account.resendVerification(email: email)
+            message = "验证码已重新发送"
+        }
+    }
+
+    private func perform(_ action: @escaping () async throws -> Void) async {
+        guard !busy else { return }
+        busy = true; error = nil; message = nil
+        defer { busy = false }
+        do { try await action() }
+        catch let failure as ManagedAccountLoginFailure { error = failure.localizedDescription }
+        catch let caught { error = UserFacingFailure.describe(caught).description }
     }
 }

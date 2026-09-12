@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import Network
 import SwiftUI
 import WeVaultCore
 
@@ -30,6 +31,7 @@ final class AppState: ObservableObject {
             window.setContentSize(NSSize(width: 960, height: 640))
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.isReleasedWhenClosed = false
+            window.isRestorable = false
             window.center()
             restoreWindow = NSWindowController(window: window)
         }
@@ -52,6 +54,8 @@ final class AppState: ObservableObject {
     private let defaults: UserDefaults
     private let settingsKey = "product-settings-v1"
     private let scheduler: AutomationScheduler?
+    private let networkMonitor = NWPathMonitor()
+    private var networkAvailable = false
     private var automationLoop: Task<Void, Never>?
     private var accountReadinessCancellable: AnyCancellable?
     private var activeAutomationRefreshes = 0
@@ -82,10 +86,19 @@ final class AppState: ObservableObject {
                 Task { [weak self] in
                     guard let self else { return }
                     self.configurationGeneration += 1
-                    await self.scheduler?.cancelActiveRun()
+                    if !ready { await self.scheduler?.cancelActiveRun() }
                     self.refreshAutomation(wakeWaiting: ready)
                 }
             }
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            let available = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.networkAvailable = available
+                if available { self.refreshAutomation() }
+            }
+        }
+        networkMonitor.start(queue: DispatchQueue(label: "online.wevault.network"))
         refreshAutomation(wakeWaiting: prerequisitesAppearReady)
         automationLoop = Task { [weak self] in
             while !Task.isCancelled {
@@ -101,6 +114,7 @@ final class AppState: ObservableObject {
         var normalized = newSettings
         normalized.normalize()
         if DevelopmentIsolation.root != nil { normalized.automaticTasksEnabled = false; normalized.scanRootPath = nil }
+        guard normalized != settings else { return }
         configurationGeneration += 1
         settings = normalized
         scanViewModel.apply(normalized)
@@ -204,6 +218,9 @@ final class AppState: ObservableObject {
         let generation = configurationGeneration
         do {
             let configured = try await scheduler.configure(settings: settings)
+            if networkAvailable && prerequisitesAppearReady {
+                _ = try await scheduler.wakeRecoverableTask()
+            }
             let hasImmediateRequest = await scheduler.hasImmediateRunRequest()
             if configured.isPaused || (configured.nextRunAt > Date() && !hasImmediateRequest) {
                 automationSnapshot = try await scheduler.snapshot()
@@ -270,5 +287,5 @@ final class AppState: ObservableObject {
         }
     }
 
-    deinit { automationLoop?.cancel() }
+    deinit { automationLoop?.cancel(); networkMonitor.cancel() }
 }

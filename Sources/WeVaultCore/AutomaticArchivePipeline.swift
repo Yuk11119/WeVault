@@ -84,7 +84,9 @@ public actor AutomaticArchivePipeline {
         try await context.progress(.uploading, completed: completed, total: total + candidates.count)
         let report = try await upload(candidates, families, store)
         completed += report.verifiedCount; total += report.attemptedCount; failed += report.failures.count
-        if firstFailure == nil { firstFailure = report.failures.first?.reason }
+        if let networkFailure = report.failures.first(where: { $0.reason.contains("（NETWORK_UNAVAILABLE）") }) {
+            firstFailure = networkFailure.reason
+        } else if firstFailure == nil { firstFailure = report.failures.first?.reason }
         let failures = Set(report.failures.map(\.filePath))
         for var file in files where candidates.contains(where: { $0.path == file.path }) {
             file.status = failures.contains(file.path) ? .uploadFailed : .verified
@@ -96,7 +98,8 @@ public actor AutomaticArchivePipeline {
     private func recordFailure(_ error: Error, context: AutomationExecutionContext) throws {
         if AutomationFailure.isFatal(error) { throw error }
         failed += 1
-        if firstFailure == nil { firstFailure = UserFacingFailure.describe(error).description }
+        let failure = UserFacingFailure.describe(error)
+        if firstFailure == nil || failure.code == "NETWORK_UNAVAILABLE" { firstFailure = failure.description }
         try store.logAutomation(runID: context.runID, event: "AUTOMATION_OBJECT_FAILED", detail: UserFacingFailure.describe(error).description)
     }
 }
