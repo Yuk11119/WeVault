@@ -6,6 +6,34 @@ import WeVaultCore
 @Suite("Restore window state")
 @MainActor
 struct RestoreCenterModelTests {
+    @Test("filename search spans archive pages and keeps selection")
+    func filenameSearch() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try ManifestStore(databaseURL: directory.appendingPathComponent("archive.sqlite"), keyProvider: InMemoryManifestKeyProvider())
+        for i in 0..<105 {
+            let name = i < 52 ? "报告-Report-\(i).pdf" : "Other-\(i).txt"
+            let file = ArchivedFile(filePath: "/fixture/\(name)", objectType: .ordinaryFile, originalFilename: name, relativePath: name, accountHash: "fixture", accountName: "fixture", month: nil, sizeBytes: 1, sha256: "sha", mtime: Date(), familyID: nil, displayOrPlaybackPath: nil, bubbleOrThumbPath: nil, archivedAt: Date(timeIntervalSince1970: Double(i)), updatedAt: Date())
+            let object = CloudObject(cloudObjectID: "object", sha256: "sha", sizeBytes: 1, storageProvider: "fixture", bucketOrContainer: "fixture", objectKey: "fixture", uploadedAt: Date(), verifiedAt: Date(), verifyStatus: .verified, refCount: 1)
+            try store.saveCloudObject(object, binding: ArchiveBinding(bindingID: "binding-\(i)", filePath: file.filePath, cloudObjectID: "object", archiveState: .verified, localState: .localReleased), archivedFile: file)
+        }
+        let model = RestoreCenterModel { store }
+        model.load(bindingID: "binding-0")
+        model.search = "  report  "
+        model.load()
+        #expect(model.records.count == 50)
+        #expect(model.hasNext)
+        #expect(model.records.allSatisfy { $0.archivedFile.originalFilename.contains("报告") })
+        model.offset = 50; model.load()
+        #expect(model.records.count == 2)
+        #expect(!model.hasNext)
+        #expect(model.selected?.binding.bindingID == "binding-0")
+        model.search = "no match"; model.offset = 0; model.load()
+        #expect(model.records.isEmpty)
+        model.search = ""; model.load()
+        #expect(model.records.count == 50)
+    }
+
     @Test("selection survives reload and repeated links without a scan root")
     func selectionSurvivesReload() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("WeVaultWindow-\(UUID().uuidString)")

@@ -38,7 +38,7 @@ public actor AutomaticArchivePipeline {
             }
         }
         let session = UUID().uuidString
-        _ = try await WeChatScanner().scanBatches(root: root, options: ScanOptions(largeFileThresholdBytes: Int64(settings.largeFileThresholdMB) * 1024 * 1024), store: store, session: session,
+        _ = try await WeChatScanner().scanBatches(root: root, options: ScanOptions(largeFileThresholdBytes: Int64(settings.largeFileThresholdMB) * 1024 * 1024), store: store, session: session, includeArchivedRecords: true,
             progress: { stage, count in try await context.progress(stage, completed: count, total: count) },
             consume: { [self] files, families in try await self.uploadBatch(files, families: families, settings: settings, session: session, context: context, upload: upload) })
         for finalizing in [false, true] {
@@ -53,7 +53,8 @@ public actor AutomaticArchivePipeline {
                           LocalReleaseService.isUnderRoot(snapshot.archivedFile.filePath, root: root),
                           snapshot.object.storageProvider == "WeVault Managed Cloud" else { continue }
                     let engine = AutomaticReleaseRuleEngine()
-                    let decision = finalizing ? engine.quarantineIsDue(snapshot, settings: settings, now: now()) : engine.decision(for: snapshot, settings: settings, now: now())
+                    let duplicate = try store.isArchivedDuplicate(snapshot, root: root)
+                    let decision = finalizing ? engine.quarantineIsDue(snapshot, settings: settings, now: now(), isDuplicate: duplicate) : engine.decision(for: snapshot, settings: settings, now: now(), isDuplicate: duplicate)
                     guard decision == .eligible else {
                         if case .ineligible(let reason) = decision {
                             try store.logAutomation(runID: context.runID, event: "AUTOMATION_OBJECT_SKIPPED", detail: "\(snapshot.archivedFile.filePath)：\(reason)")

@@ -312,7 +312,7 @@ public enum AutomaticReleaseDecision: Equatable, Sendable {
 public struct AutomaticReleaseRuleEngine: Sendable {
     public init() {}
 
-    public func decision(for snapshot: ArchivedFileSnapshot, settings: ProductSettings, now: Date = Date(), fileExists: @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> AutomaticReleaseDecision {
+    public func decision(for snapshot: ArchivedFileSnapshot, settings: ProductSettings, now: Date = Date(), isDuplicate: Bool = false, fileExists: @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> AutomaticReleaseDecision {
         guard snapshot.object.verifyStatus == .verified, [.verified, .restored, .restoreFailed].contains(snapshot.binding.archiveState) else { return .ineligible("云端对象或归档绑定未校验") }
         guard snapshot.binding.localState == .localPresent else { return .ineligible("本地对象不是可隔离状态") }
         guard fileExists(snapshot.archivedFile.filePath) else { return .ineligible("本地对象不存在") }
@@ -322,7 +322,7 @@ public struct AutomaticReleaseRuleEngine: Sendable {
         switch snapshot.archivedFile.objectType {
         case .ordinaryFile:
             guard settings.archiveOrdinaryFiles else { return .ineligible("普通文件自动归档已关闭") }
-            guard snapshot.archivedFile.sizeBytes >= Int64(settings.largeFileThresholdMB) * 1024 * 1024 else { return .ineligible("普通文件未达到当前大小阈值") }
+            guard isDuplicate || snapshot.archivedFile.sizeBytes >= Int64(settings.largeFileThresholdMB) * 1024 * 1024 else { return .ineligible("普通文件未达到当前大小阈值") }
         case .imageHighLayer:
             guard settings.archiveImageHighLayers, let display = snapshot.archivedFile.displayOrPlaybackPath, let thumb = snapshot.archivedFile.bubbleOrThumbPath, fileExists(display), fileExists(thumb) else { return .ineligible("图片保留层不完整或已关闭") }
         case .videoRawLayer:
@@ -331,12 +331,12 @@ public struct AutomaticReleaseRuleEngine: Sendable {
         return .eligible
     }
 
-    public func quarantineIsDue(_ snapshot: ArchivedFileSnapshot, settings: ProductSettings, now: Date = Date()) -> AutomaticReleaseDecision {
+    public func quarantineIsDue(_ snapshot: ArchivedFileSnapshot, settings: ProductSettings, now: Date = Date(), isDuplicate: Bool = false) -> AutomaticReleaseDecision {
         guard snapshot.object.verifyStatus == .verified else { return .ineligible("云端对象未校验") }
         switch snapshot.archivedFile.objectType {
         case .ordinaryFile:
             guard settings.archiveOrdinaryFiles else { return .ineligible("普通文件自动归档已关闭") }
-            guard snapshot.archivedFile.sizeBytes >= Int64(settings.largeFileThresholdMB) * 1024 * 1024 else { return .ineligible("普通文件未达到当前大小阈值") }
+            guard isDuplicate || snapshot.archivedFile.sizeBytes >= Int64(settings.largeFileThresholdMB) * 1024 * 1024 else { return .ineligible("普通文件未达到当前大小阈值") }
         case .imageHighLayer: guard settings.archiveImageHighLayers else { return .ineligible("图片自动归档已关闭") }
         case .videoRawLayer: guard settings.archiveVideoRawLayers else { return .ineligible("视频自动归档已关闭") }
         }

@@ -38,7 +38,7 @@ struct ProductSettingsTests {
         #expect(settings.largeFileThresholdMB == 500)
         #expect(settings.runIntervalHours == 1)
         #expect(settings.coolingPeriodDays == 0)
-        #expect(settings.quarantineRetentionDays == 1)
+        #expect(settings.quarantineRetentionDays == 0)
         #expect(settings.allowedExtensions == ["pdf", "zip"])
     }
 

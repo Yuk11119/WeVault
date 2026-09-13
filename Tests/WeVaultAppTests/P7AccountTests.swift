@@ -5,6 +5,18 @@ import WeVaultCore
 
 @MainActor
 struct P7AccountTests {
+    @Test("logout and login preserve the device registration identity")
+    func persistentDeviceIdentity() async throws {
+        let transport = RefreshProbe()
+        let account = ManagedAccount(api: WeVaultAPIClient(baseURL: URL(string: "https://fixture.invalid")!, transport: transport), memoryOnly: true)
+        try await account.login(email: "fixture@example.test", password: "fixture")
+        await account.logout()
+        try await account.login(email: "fixture@example.test", password: "fixture")
+        let ids = await transport.clientIDs
+        #expect(ids.count == 2)
+        #expect(ids[0] == ids[1])
+    }
+
     @Test("isolated login is explained and rejected before any network request")
     func isolatedLogin() async throws {
         let transport = RefreshProbe()
@@ -58,10 +70,14 @@ struct P7AccountTests {
 }
 
 private actor RefreshProbe: WeVaultAPITransport {
+    private(set) var clientIDs: [String] = []
     private(set) var requestCount = 0
     private(set) var refreshCount = 0
     func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
         requestCount += 1
+        if request.url?.path == "/v1/devices", let data = request.httpBody,
+           let body = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let id = body["clientDeviceId"] as? String { clientIDs.append(id) }
         let body: String
         switch request.url!.lastPathComponent {
         case "login": body = #"{"accessToken":"old-access","refreshToken":"one-use","expiresIn":1}"#

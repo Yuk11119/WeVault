@@ -4,6 +4,43 @@ import Testing
 
 @Suite("P4 bounded pipeline")
 struct P4PipelineTests {
+    @Test("zero quarantine days releases in the same automatic run")
+    func zeroDayQuarantine() async throws {
+        let f = try P4Fixture(); defer { f.remove() }
+        let archived = try f.snapshot()
+        var settings = f.settings
+        settings.quarantineRetentionDays = 0
+        let pipeline = AutomaticArchivePipeline(store: f.store, releaseService: LocalReleaseService(quarantineRoot: f.quarantine), now: { f.now })
+        let report = try await pipeline.run(root: f.root, settings: settings) { files, _, _ in
+            ManagedCloudUploadReport(snapshots: [:], attemptedCount: files.count, verifiedCount: files.count, failures: [])
+        }
+        #expect(report.failedUnits == 0)
+        let released = try #require(try f.store.archivedFileSnapshot(bindingID: archived.binding.bindingID))
+        #expect(released.binding.releasedAt != nil)
+        #expect(released.binding.quarantinePath == nil)
+        #expect(released.localStatusTitle == "已释放")
+    }
+
+    @Test("small duplicate archives can isolate and finalize while unique files stay local")
+    func smallDuplicateRelease() throws {
+        let f = try P4Fixture(); defer { f.remove() }
+        let first = try f.snapshot(nameOverride: "msg/file/2025-01/first.txt")
+        var settings = f.settings; settings.largeFileThresholdMB = 20
+        let engine = AutomaticReleaseRuleEngine()
+        #expect(try !f.store.isArchivedDuplicate(first, root: f.root))
+        #expect(engine.decision(for: first, settings: settings, now: f.now) != .eligible)
+        _ = try f.snapshot(nameOverride: "msg/file/2025-01/second.txt")
+        #expect(try f.store.isArchivedDuplicate(first, root: f.root))
+        #expect(engine.decision(for: first, settings: settings, now: f.now, isDuplicate: true) == .eligible)
+        let service = LocalReleaseService(quarantineRoot: f.quarantine)
+        _ = try service.isolate(snapshot: first, store: f.store, authorization: .automatic(settings: settings, root: f.root, now: f.now))
+        let isolated = try #require(try f.store.archivedFileSnapshot(bindingID: first.binding.bindingID))
+        #expect(engine.quarantineIsDue(isolated, settings: settings, now: f.now, isDuplicate: true) != .eligible)
+        let later = f.now.addingTimeInterval(8 * 86400)
+        _ = try service.finalizeSafely(snapshot: isolated, store: f.store, authorization: .automatic(settings: settings, root: f.root, now: later))
+        #expect(try f.store.archivedFileSnapshot(bindingID: first.binding.bindingID)?.binding.quarantinePath == nil)
+    }
+
     @Test("batches are bounded, first consumption precedes full scan, and duplicates cross batches")
     func streaming() async throws {
         let f = try P4Fixture(); defer { f.remove() }
@@ -95,6 +132,24 @@ struct P4PipelineTests {
         let finalReport = try await later.run(root: f.root, settings: f.settings) { _, _, _ in
             Issue.record("tombstones must never be uploaded")
             return ManagedCloudUploadReport(snapshots: [:], attemptedCount: 0, verifiedCount: 0, failures: [])
+        }
+        let session = try #require(try f.store.currentScanSession())
+        var displayRows: [FileRecord] = []
+        var cursor: Int64 = 0
+        while true {
+            let page = try f.store.workPage(FileRecord.self, scope: session + ".files", after: cursor)
+            guard let last = page.last else { break }
+            cursor = last.id
+            displayRows.append(contentsOf: page.map(\.value))
+        }
+        let archives = try f.store.archivedFileSnapshots()
+        let archivedRows = displayRows.filter { archives[$0.path] != nil }
+        #expect(archivedRows.count == 112)
+        #expect(Set(displayRows.map(\.path)).count == displayRows.count)
+        for file in archivedRows {
+            let archive = try #require(archives[file.path])
+            #expect(file.sizeBytes == archive.archivedFile.sizeBytes)
+            #expect(file.filename == archive.archivedFile.originalFilename)
         }
         #expect(finalReport.completedUnits == 112)
         #expect(finalReport.failedUnits == 0)

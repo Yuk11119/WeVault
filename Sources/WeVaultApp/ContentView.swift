@@ -247,6 +247,11 @@ struct ContentView: View {
                             .foregroundStyle(status.color)
                     }
                     .width(min: 100, ideal: 120)
+
+                    TableColumn("本地状态") { file in
+                        Text(viewModel.archivedSnapshots[file.path]?.localStatusTitle ?? "在本地")
+                    }
+                    .width(min: 80, ideal: 100)
             }
             .overlay {
                 if viewModel.filteredFiles.isEmpty && !viewModel.isScanning {

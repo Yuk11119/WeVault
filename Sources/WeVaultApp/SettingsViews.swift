@@ -41,7 +41,9 @@ struct SetupWizard: View {
                     Toggle("定时归档并释放本地空间", isOn: $draft.automaticTasksEnabled)
                     if draft.automaticTasksEnabled {
                         NumberSettingRow(title: "运行间隔", value: $draft.runIntervalHours, range: 1...720, unit: "小时")
-                        Text("归档 \(draft.coolingPeriodDays) 天后移入暂存区，再保留 \(draft.quarantineRetentionDays) 天后释放空间。")
+                        Text(draft.quarantineRetentionDays == 0
+                             ? "归档 \(draft.coolingPeriodDays) 天后释放本地空间，不额外暂存。"
+                             : "归档 \(draft.coolingPeriodDays) 天后移入暂存区，再保留 \(draft.quarantineRetentionDays) 天后释放空间。")
                             .font(.caption).foregroundStyle(.secondary)
                         if draft.cloudMode == .selfManaged {
                             Text("自动整理需要使用 WeVault 云端。").font(.caption).foregroundStyle(.orange)
@@ -64,7 +66,7 @@ struct SetupWizard: View {
                 Section {
                     DisclosureGroup("高级选项") {
                         NumberSettingRow(title: "原件保留", value: $draft.coolingPeriodDays, range: 0...365, unit: "天")
-                        NumberSettingRow(title: "暂存保留", value: $draft.quarantineRetentionDays, range: 1...365, unit: "天")
+                        NumberSettingRow(title: "暂存保留", value: $draft.quarantineRetentionDays, range: 0...365, unit: "天")
                         Text("上传 → 保留原件 → 暂存 → 释放空间")
                             .font(.caption).foregroundStyle(.secondary)
                         Toggle("在原位置保留恢复提示", isOn: $draft.createTombstones)

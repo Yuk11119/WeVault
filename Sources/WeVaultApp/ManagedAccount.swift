@@ -32,6 +32,8 @@ final class ManagedAccount: ObservableObject {
     private let memoryOnly: Bool
     private let permitsLogin: Bool
     private var record: ManagedAccountRecord?
+    private var stableClientDeviceID: String?
+    private let deviceIdentityKey = "managed-client-device-id-v1"
     private var refreshTask: Task<WeVaultSession, Error>?
     private var accountGeneration = 0
 
@@ -43,7 +45,10 @@ final class ManagedAccount: ObservableObject {
         self.api = api ?? WeVaultAPIClient(baseURL: URL(string: "https://api.wevault.online")!)
         self.memoryOnly = memoryOnly || DevelopmentIsolation.root != nil
         self.permitsLogin = loginEnabled && (DevelopmentIsolation.root == nil || DevelopmentIsolation.permitsInteractiveAuthentication || api != nil)
-        if !self.memoryOnly { load() }
+        if !self.memoryOnly {
+            stableClientDeviceID = UserDefaults.standard.string(forKey: deviceIdentityKey)
+            load()
+        }
     }
 
     func login(email: String, password: String, displayName: String = Host.current().localizedName ?? "Mac") async throws {
@@ -52,7 +57,8 @@ final class ManagedAccount: ObservableObject {
         let generation = accountGeneration
         refreshTask?.cancel(); refreshTask = nil
         let session = try await api.login(email: email, password: password)
-        let clientDeviceID = record?.clientDeviceID ?? UUID().uuidString
+        let clientDeviceID = record?.clientDeviceID ?? stableClientDeviceID ?? UUID().uuidString
+        retainDeviceIdentity(clientDeviceID)
         let device = try await api.registerDevice(accessToken: session.accessToken, clientDeviceId: clientDeviceID, displayName: displayName)
         guard generation == accountGeneration else { throw CancellationError() }
         try save(ManagedAccountRecord(session: session, accessExpiresAt: Date().addingTimeInterval(TimeInterval(session.expiresIn)), clientDeviceID: clientDeviceID, deviceID: device.deviceId, email: email))
@@ -109,12 +115,18 @@ final class ManagedAccount: ObservableObject {
 
     private func load() {
         guard let data = readKeychain(), let loaded = try? JSONDecoder().decode(ManagedAccountRecord.self, from: data) else { return }
+        retainDeviceIdentity(loaded.clientDeviceID)
         record = loaded; email = loaded.email; isReady = loaded.deviceID != nil; status = isReady ? "已登录：\(loaded.email)" : "设备注册未完成"
     }
 
     private func save(_ value: ManagedAccountRecord) throws {
         let data = try JSONEncoder().encode(value)
         if !memoryOnly { try writeKeychain(data) }; record = value; email = value.email; isReady = value.deviceID != nil
+    }
+
+    private func retainDeviceIdentity(_ value: String) {
+        stableClientDeviceID = value
+        if !memoryOnly { UserDefaults.standard.set(value, forKey: deviceIdentityKey) }
     }
 
     private func remove() {

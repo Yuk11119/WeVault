@@ -24,7 +24,7 @@ extension LocalReleaseService {
         try OperationCoordinator.shared.acquire(key); defer { OperationCoordinator.shared.release(key) }
         try recoverPendingRelease(bindingID: snapshot.binding.bindingID, store: store, authorization: authorization)
         guard let current = try store.archivedFileSnapshot(bindingID: snapshot.binding.bindingID) else { throw WeVaultError.fileSystem("归档绑定不存在") }
-        try authorize(current, authorization, finalizing: false)
+        try authorize(current, authorization, store: store, finalizing: false)
         try validateReleaseLayers(current)
         let original = URL(fileURLWithPath: current.archivedFile.filePath)
         try requireRegularFile(original)
@@ -46,7 +46,7 @@ extension LocalReleaseService {
         try OperationCoordinator.shared.acquire(key); defer { OperationCoordinator.shared.release(key) }
         try recoverPendingRelease(bindingID: snapshot.binding.bindingID, store: store, authorization: authorization)
         guard let current = try store.archivedFileSnapshot(bindingID: snapshot.binding.bindingID) else { throw WeVaultError.fileSystem("归档绑定不存在") }
-        try authorize(current, authorization, finalizing: true)
+        try authorize(current, authorization, store: store, finalizing: true)
         try validateReleaseLayers(current)
         try validateOriginalForFinalization(current)
         guard let path = current.binding.quarantinePath else { throw WeVaultError.fileSystem("隔离路径缺失") }
@@ -83,7 +83,7 @@ extension LocalReleaseService {
                 : FileManager.default.fileExists(atPath: journal.quarantinePath)
             if moveHasNotStarted {
                 guard let current = try store.archivedFileSnapshot(bindingID: bindingID) else { throw WeVaultError.fileSystem("归档绑定缺失") }
-                try authorize(current, authorization, finalizing: journal.deletionPath != nil)
+                try authorize(current, authorization, store: store, finalizing: journal.deletionPath != nil)
             }
         }
         if journal.deletionPath == nil { try commitIsolation(journal, store: store) }
@@ -112,7 +112,7 @@ extension LocalReleaseService {
         try recoverPendingRelease(bindingID: bindingID, store: store)
     }
 
-    private func authorize(_ snapshot: ArchivedFileSnapshot, _ authorization: ReleaseAuthorization, finalizing: Bool) throws {
+    private func authorize(_ snapshot: ArchivedFileSnapshot, _ authorization: ReleaseAuthorization, store: ManifestStore, finalizing: Bool) throws {
         guard snapshot.object.verifyStatus == .verified,
               snapshot.object.cloudObjectID == snapshot.binding.cloudObjectID,
               snapshot.object.sha256 == snapshot.archivedFile.sha256,
@@ -125,7 +125,8 @@ extension LocalReleaseService {
             guard settings.automaticTasksEnabled, settings.cloudMode == .weVault,
                   snapshot.object.storageProvider == "WeVault Managed Cloud", Self.isUnderRoot(snapshot.archivedFile.filePath, root: root) else { throw WeVaultError.fileSystem("对象不在当前自动任务范围") }
             let engine = AutomaticReleaseRuleEngine()
-            let decision = finalizing ? engine.quarantineIsDue(snapshot, settings: settings, now: now) : engine.decision(for: snapshot, settings: settings, now: now)
+            let duplicate = try store.isArchivedDuplicate(snapshot, root: root)
+            let decision = finalizing ? engine.quarantineIsDue(snapshot, settings: settings, now: now, isDuplicate: duplicate) : engine.decision(for: snapshot, settings: settings, now: now, isDuplicate: duplicate)
             guard decision == .eligible else { throw WeVaultError.fileSystem("对象不满足当前自动释放规则：\(decision)") }
         }
         let states: [LocalArchiveState] = finalizing ? [.quarantined, .tombstoned] : [.localPresent, .restored, .quarantined]

@@ -8,6 +8,7 @@ final class RestoreCenterModel: ObservableObject {
     @Published var selected: ArchivedFileSnapshot?
     @Published var error: String?
     @Published var lookup = ""
+    @Published var search = ""
     @Published var offset = 0
     @Published var hasNext = false
     private var selectedID: String?
@@ -22,7 +23,7 @@ final class RestoreCenterModel: ObservableObject {
         error = nil
         do {
             let store = try storeFactory()
-            let page = try store.archivedFilePage(limit: 51, offset: offset)
+            let page = try store.archivedFilePage(limit: 51, offset: offset, search: search)
             records = Array(page.prefix(50)); hasNext = page.count > 50
             if let selectedID {
                 selected = try store.archivedFileSnapshot(bindingID: selectedID)
@@ -67,6 +68,22 @@ struct RestoreCenterView: View {
                 Button("设置") { showSettings = true }
                 Button("刷新") { model.load() }.disabled(busy)
             }
+            HStack {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("搜索文件名", text: $model.search)
+                    .textFieldStyle(.plain)
+                if !model.search.isEmpty {
+                    Button { model.search = "" } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain).accessibilityLabel("清除搜索")
+                }
+            }
+            .padding(8)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            .task(id: model.search) {
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                model.offset = 0
+                model.load()
+            }
             DisclosureGroup("使用恢复链接") {
                 HStack {
                     TextField("粘贴恢复链接或归档编号", text: $model.lookup).onSubmit { model.find() }
@@ -84,6 +101,10 @@ struct RestoreCenterView: View {
                             }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 4)
                             .contentShape(Rectangle())
                             .tag(record.binding.bindingID)
+                    }
+                    if model.records.isEmpty && model.error == nil {
+                        Text(model.search.isEmpty ? "暂无归档文件" : "没有找到匹配的文件")
+                            .foregroundStyle(.secondary).padding()
                     }
                     HStack {
                         Button("上一页") { model.offset = max(0, model.offset - 50); model.load() }.disabled(model.offset == 0)

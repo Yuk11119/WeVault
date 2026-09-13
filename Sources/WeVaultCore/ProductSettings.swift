@@ -67,7 +67,7 @@ public struct ProductSettings: Codable, Equatable, Sendable {
         largeFileThresholdMB = min(max(largeFileThresholdMB, 1), 500)
         runIntervalHours = min(max(runIntervalHours, 1), 24 * 30)
         coolingPeriodDays = min(max(coolingPeriodDays, 0), 365)
-        quarantineRetentionDays = min(max(quarantineRetentionDays, 1), 365)
+        quarantineRetentionDays = min(max(quarantineRetentionDays, 0), 365)
         allowedExtensions = Array(Set(allowedExtensions.map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()

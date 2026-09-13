@@ -463,6 +463,17 @@ extension ScanSummary {
 }
 
 public extension ArchivedFileSnapshot {
+    var localStatusTitle: String {
+        switch binding.localState {
+        case .localPresent, .restored: return "在本地"
+        case .quarantined: return "暂存区"
+        case .tombstoned: return binding.quarantinePath == nil ? "已释放" : "暂存区"
+        case .localReleased: return "已释放"
+        case .restoreFailed: return "恢复失败"
+        case .releaseFailed: return "释放失败"
+        }
+    }
+
     var displayFileRecord: FileRecord {
         let snapshot = self
         let archived = snapshot.archivedFile

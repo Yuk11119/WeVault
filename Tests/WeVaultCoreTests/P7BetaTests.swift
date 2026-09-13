@@ -41,6 +41,17 @@ struct P7BetaTests {
         let session = try await ManualArchivePipeline.scan(root: f.root, threshold: 1, store: f.store)
         let rows = try f.store.workPage(FileRecord.self, scope: session + ".files")
         #expect(rows.count == 1 && rows.first?.value.status == .tombstoned)
+        let displayed = try #require(rows.first?.value)
+        #expect(displayed.filename == scan.files[0].filename)
+        #expect(displayed.sizeBytes == scan.files[0].sizeBytes)
+        #expect(displayed.sha256 == scan.files[0].sha256)
+        #expect(displayed.objectType == scan.files[0].objectType)
+        let isolated = try #require(try f.store.archivedSnapshot(path: displayed.path))
+        #expect(isolated.localStatusTitle == "暂存区")
+        _ = try LocalReleaseService().finalizeRelease(snapshot: isolated, store: f.store)
+        let released = try #require(try f.store.archivedSnapshot(path: displayed.path))
+        #expect(released.localStatusTitle == "已释放")
+        #expect(released.displayFileRecord.sizeBytes == scan.files[0].sizeBytes)
         let summary = try await ManualArchivePipeline.upload(session: session, root: f.root, threshold: 1, store: f.store) { _, _, _ in Issue.record("Placeholder must not upload") }
         #expect(summary.attempted == 0)
     }

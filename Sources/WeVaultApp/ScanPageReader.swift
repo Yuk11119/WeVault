@@ -54,7 +54,17 @@ enum ScanPageReader {
                     let batch = try store.workPage(FileRecord.self, scope: session + ".files", after: cursor)
                     guard let last = batch.last else { break }
                     cursor = last.id
-                    for row in batch { include(row.value) }
+                    for row in batch {
+                        var file = row.value
+                        if let snapshot = try store.archivedSnapshot(path: file.path),
+                           snapshot.archivedFile.sha256 == file.sha256,
+                           snapshot.object.verifyStatus == .verified {
+                            file = snapshot.displayFileRecord
+                            file.duplicateGroupID = row.value.duplicateGroupID
+                        }
+                        // Sort and paginate the same original metadata that the table displays.
+                        include(file)
+                    }
                 } else {
                     let batch = try store.archiveBindingPage(after: cursor)
                     guard let last = batch.last else { break }
@@ -65,6 +75,24 @@ enum ScanPageReader {
                         let file = snapshot.displayFileRecord
                         include(file)
                         archiveSummary = archiveSummary.adding(summary(for: file, threshold: threshold))
+                    }
+                }
+            }
+            // Older automatic scans contain only files found on disk. Merge missing
+            // released originals before filtering/pagination, without duplicating paths.
+            if hasScan {
+                var archiveCursor: Int64 = 0
+                while true {
+                    try Task.checkCancellation()
+                    let batch = try store.archiveBindingPage(after: archiveCursor)
+                    guard let last = batch.last else { break }
+                    archiveCursor = last.id
+                    for row in batch {
+                        guard let snapshot = try store.archivedFileSnapshot(bindingID: row.bindingID),
+                              LocalReleaseService.isUnderRoot(snapshot.archivedFile.filePath, root: root),
+                              [.quarantined, .tombstoned, .localReleased].contains(snapshot.binding.localState),
+                              try store.workGet(FileRecord.self, scope: session + ".files", key: snapshot.archivedFile.filePath) == nil else { continue }
+                        include(snapshot.displayFileRecord)
                     }
                 }
             }

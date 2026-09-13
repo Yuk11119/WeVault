@@ -564,8 +564,25 @@ public final class ManifestStore: @unchecked Sendable {
         try readArchivedSnapshots(bindingID: bindingID).first
     }
 
-    public func archivedFilePage(limit: Int = 50, offset: Int = 0) throws -> [ArchivedFileSnapshot] {
-        try readArchivedSnapshots(limit: min(100, max(1, limit)), offset: max(0, offset))
+    public func archivedFilePage(limit: Int = 50, offset: Int = 0, search: String = "") throws -> [ArchivedFileSnapshot] {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        let limit = min(100, max(1, limit)), offset = max(0, offset)
+        if query.isEmpty { return try readArchivedSnapshots(limit: limit, offset: offset) }
+        // Names are encrypted: filter decrypted batches before applying pagination.
+        return try readTransaction {
+            var results: [ArchivedFileSnapshot] = [], scanned = 0, matched = 0
+            while true {
+                try Task.checkCancellation()
+                let batch = try readArchivedSnapshots(limit: 100, offset: scanned)
+                for record in batch where record.archivedFile.originalFilename.localizedStandardContains(query) {
+                    if matched >= offset { results.append(record) }
+                    matched += 1
+                    if results.count == limit { return results }
+                }
+                if batch.count < 100 { return results }
+                scanned += batch.count
+            }
+        }
     }
 
     private func readArchivedSnapshots(bindingID: String? = nil, limit: Int? = nil, offset: Int = 0) throws -> [ArchivedFileSnapshot] {
@@ -812,6 +829,26 @@ public final class ManifestStore: @unchecked Sendable {
             else if status != SQLITE_DONE { throw WeVaultError.sqlite(lastError) }
         }
         return try binding.flatMap { try archivedFileSnapshot(bindingID: $0) }
+    }
+
+    /// Durable archive identities preserve duplicate eligibility after originals leave disk.
+    public func isArchivedDuplicate(_ snapshot: ArchivedFileSnapshot, root: URL) throws -> Bool {
+        guard snapshot.archivedFile.objectType == .ordinaryFile else { return false }
+        var found = false
+        try withStatement("SELECT ab.binding_id, ab.binding_token FROM archive_bindings ab JOIN archived_files af ON af.file_path_token = ab.file_path_token WHERE af.size_bytes = ?") { stmt in
+            sqlite3_bind_int64(stmt, 1, snapshot.archivedFile.sizeBytes)
+            while !found && sqlite3_step(stmt) == SQLITE_ROW {
+                let id = try decryptColumn(stmt, 0, table: "archive_bindings", column: "binding_id", token: columnText(stmt, 1))
+                guard let other = try archivedFileSnapshot(bindingID: id),
+                      other.archivedFile.filePath != snapshot.archivedFile.filePath,
+                      other.archivedFile.objectType == .ordinaryFile,
+                      other.archivedFile.sha256 == snapshot.archivedFile.sha256,
+                      other.object.verifyStatus == .verified,
+                      LocalReleaseService.isUnderRoot(other.archivedFile.filePath, root: root) else { continue }
+                found = true
+            }
+        }
+        return found
     }
 
     public func archiveBindingPage(after: Int64 = 0) throws -> [(id: Int64, bindingID: String)] {
